@@ -482,6 +482,9 @@ class GPUModelRunner(
 
         # mm_hash ->  encoder_output
         self.encoder_cache: dict[str, torch.Tensor] = {}
+        # mm_hash -> encoder compute time in seconds (for cache policy)
+        self._encoder_compute_times: dict[str, float] = {}
+        self._last_encoder_batch_time: float = 0.0
 
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
@@ -2444,6 +2447,7 @@ class GPUModelRunner(
                 )
 
         encoder_outputs: list[torch.Tensor] = []
+        _encoder_start_time = time.perf_counter()
         # Track the current index in mm_kwargs/mm_lora_refs to map groups to request IDs
         current_item_idx = 0
         for modality, num_items, mm_kwargs_group in group_mm_kwargs_by_modality(
@@ -2510,11 +2514,22 @@ class GPUModelRunner(
 
             current_item_idx += num_items
 
+        self._last_encoder_batch_time = (
+            time.perf_counter() - _encoder_start_time
+        )
+
         # Cache the encoder outputs by mm_hash
         for mm_hash, output in zip(mm_hashes, encoder_outputs):
             self.encoder_cache[mm_hash] = output
             logger.debug("Finish execute for mm hash %s", mm_hash)
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
+
+        # Record per-item compute cost estimate (total time / num items)
+        if encoder_outputs and hasattr(self, '_encoder_compute_times'):
+            num_items = len(encoder_outputs)
+            avg_time = self._last_encoder_batch_time / max(num_items, 1)
+            for (mm_hash, _), _ in zip(mm_hashes, encoder_outputs):
+                self._encoder_compute_times[mm_hash] = avg_time
 
         return encoder_outputs
 

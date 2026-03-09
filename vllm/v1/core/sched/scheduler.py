@@ -33,6 +33,8 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.v1.core.encoder_cache_manager import (
+    OnlineDualEncoderCacheManager,
+    create_encoder_cache_manager,
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
@@ -203,7 +205,7 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager = (
             EncoderDecoderCacheManager(cache_size=encoder_cache_size)
             if self.is_encoder_decoder
-            else EncoderCacheManager(cache_size=encoder_cache_size)
+            else create_encoder_cache_manager(cache_size=encoder_cache_size)
         )
 
         speculative_config = vllm_config.speculative_config
