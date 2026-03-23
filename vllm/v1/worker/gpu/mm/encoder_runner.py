@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import time
 
 import numpy as np
@@ -13,6 +14,10 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 logger = init_logger(__name__)
+
+# Path for sharing encoder compute time with external profiling tools.
+# Set VLLM_ENCODE_TIME_FILE to enable; disabled by default.
+_ENCODE_TIME_FILE = os.environ.get("VLLM_ENCODE_TIME_FILE", "")
 
 
 class EncoderRunner:
@@ -73,6 +78,13 @@ class EncoderRunner:
         self.last_encode_time = elapsed
         logger.info("Encoder compute time: %.4fs (%d items)", elapsed,
                      len(mm_kwargs))
+        if _ENCODE_TIME_FILE:
+            try:
+                with open(_ENCODE_TIME_FILE, "a") as f:
+                    f.write(f"{elapsed:.6f}\n")
+                    f.flush()
+            except OSError:
+                pass
         return encoder_outputs
 
     def gather_mm_embeddings(

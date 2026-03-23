@@ -3,37 +3,32 @@
 """Profile encoder computation time (c_i) and memory cost (m_i) for each
 image type.
 
-c_i is the pure encoder computation time measured directly via GPU-
-synchronised timing in the encoder_runner.  For each iteration we:
+c_i is measured directly via GPU-synchronised timing in encoder_runner.
+The encoder worker writes each encode time to a shared file (controlled
+by VLLM_ENCODE_TIME_FILE env var).  For each iteration we:
   1. Clear the encoder cache via /reset_encoder_cache.
   2. Send the image (guaranteed cache miss, encoder runs).
-  3. Parse the encoder worker log for "Encoder compute time: X.XXXXs".
+  3. Read the latest encode time from the shared file.
 
 Usage:
     python profile_encoder.py \
         --manifest-path /tmp/encoder_cache_test_images/manifest.json \
         --server-url http://localhost:10001 \
-        --encoder-log /tmp/encoder_cache_benchmark/logs/encoder_profile_*.log \
+        --encode-time-file /tmp/encode_times.txt \
         --model Qwen/Qwen2.5-VL-3B-Instruct \
         --num-warmup 2 \
-        --num-iterations 5 \
+        --num-iterations 10 \
         --output-path /tmp/encoder_cache_test_images/profile.json
 """
 
 import argparse
 import base64
-import glob
 import json
-import re
+import os
 import statistics
 import time
 
 import requests as http_requests
-
-# Pattern matching the log line emitted by encoder_runner.py
-_ENCODE_TIME_RE = re.compile(
-    r"Encoder compute time: ([\d.]+)s \((\d+) items?\)"
-)
 
 
 def encode_image_to_base64(image_path: str) -> str:
@@ -46,39 +41,31 @@ def reset_encoder_cache(server_url: str) -> None:
     resp.raise_for_status()
 
 
-def read_last_encode_time(log_path: str) -> float | None:
-    """Read the last 'Encoder compute time' entry from the encoder log."""
-    # Resolve glob (e.g. logs/encoder_profile_*.log)
-    paths = sorted(glob.glob(log_path))
-    if not paths:
-        return None
-    # Use the latest log file
-    with open(paths[-1], "r", errors="replace") as f:
-        lines = f.readlines()
-    # Search backwards for the last occurrence
-    for line in reversed(lines):
-        m = _ENCODE_TIME_RE.search(line)
-        if m:
-            return float(m.group(1))
-    return None
-
-
-def count_encode_time_entries(log_path: str) -> int:
-    """Count total 'Encoder compute time' entries in the log."""
-    paths = sorted(glob.glob(log_path))
-    if not paths:
-        return 0
-    count = 0
-    with open(paths[-1], "r", errors="replace") as f:
+def read_encode_times(filepath: str) -> list[float]:
+    """Read all encode times from the shared file."""
+    if not os.path.exists(filepath):
+        return []
+    with open(filepath, "r") as f:
+        times = []
         for line in f:
-            if _ENCODE_TIME_RE.search(line):
-                count += 1
-    return count
+            line = line.strip()
+            if line:
+                try:
+                    times.append(float(line))
+                except ValueError:
+                    pass
+        return times
+
+
+def clear_encode_time_file(filepath: str) -> None:
+    """Clear the shared encode time file."""
+    with open(filepath, "w") as f:
+        f.truncate(0)
 
 
 def send_image_request(server_url: str, model: str, img_b64: str,
                        max_tokens: int = 10) -> float:
-    """Send a base64 image request and return TTFT in seconds."""
+    """Send a base64 image request. Returns TTFT in seconds."""
     payload = {
         "model": model,
         "messages": [
@@ -148,14 +135,14 @@ def send_image_request(server_url: str, model: str, img_b64: str,
 
 def measure_encoder_compute_time(
     server_url: str, model: str, image_path: str,
-    encoder_log: str, num_warmup: int, num_iterations: int,
+    encode_time_file: str, num_warmup: int, num_iterations: int,
 ) -> dict:
     """Measure c_i for a single image type.
 
     For each iteration:
-      1. Reset encoder cache.
-      2. Send image (cache miss -> encoder runs, logs compute time).
-      3. Parse encoder log for the GPU-synchronised compute time.
+      1. Clear the encode time file and reset encoder cache.
+      2. Send image (cache miss -> encoder runs, writes compute time to file).
+      3. Read the compute time from the file.
     """
     img_b64 = encode_image_to_base64(image_path)
 
@@ -167,34 +154,33 @@ def measure_encoder_compute_time(
     ttft_list: list[float] = []
 
     for iteration in range(num_iterations):
-        # Record how many log entries exist before this request
-        count_before = count_encode_time_entries(encoder_log)
-
-        # Clear cache -> next request is guaranteed miss
+        # Clear file + cache
+        clear_encode_time_file(encode_time_file)
         reset_encoder_cache(server_url)
 
         ttft = send_image_request(server_url, model, img_b64)
         ttft_list.append(ttft)
 
-        # Wait briefly for log flush
-        time.sleep(0.5)
+        # Read the encode time(s) written during this request
+        # Small delay to ensure file write is complete
+        time.sleep(0.2)
+        times = read_encode_times(encode_time_file)
 
-        # Read the latest encode time from the log
-        c_i = read_last_encode_time(encoder_log)
-
-        # Verify a new entry appeared
-        count_after = count_encode_time_entries(encoder_log)
-        if c_i is not None and count_after > count_before:
+        if times:
+            # Use the last entry (in case multiple were written)
+            c_i = times[-1]
             c_i_list.append(c_i)
             print(f"    iter {iteration}: c_i={c_i:.4f}s  ttft={ttft:.4f}s")
         else:
-            print(f"    iter {iteration}: c_i=N/A (log entry not found)  "
+            print(f"    iter {iteration}: c_i=N/A (file empty)  "
                   f"ttft={ttft:.4f}s")
 
     if not c_i_list:
-        print("  WARNING: no encoder compute times found in log, "
-              "falling back to TTFT")
-        c_i_list = ttft_list
+        raise RuntimeError(
+            f"No encoder compute times found in {encode_time_file}. "
+            f"Make sure the encoder worker is started with "
+            f"VLLM_ENCODE_TIME_FILE={encode_time_file}"
+        )
 
     return {
         "c_i": statistics.median(c_i_list),
@@ -215,9 +201,10 @@ def main():
     parser.add_argument("--server-url", type=str,
                         default="http://localhost:10001",
                         help="URL of the vLLM proxy/server")
-    parser.add_argument("--encoder-log", type=str, default=None,
-                        help="Glob pattern for the encoder worker log file "
-                        "(e.g. /tmp/.../logs/encoder_profile_*.log)")
+    parser.add_argument("--encode-time-file", type=str,
+                        default="/tmp/vllm_encode_times.txt",
+                        help="Path to shared encode time file "
+                        "(must match VLLM_ENCODE_TIME_FILE on encoder worker)")
     parser.add_argument("--model", type=str,
                         default="Qwen/Qwen2.5-VL-3B-Instruct",
                         help="Model name")
@@ -242,14 +229,6 @@ def main():
             Path(args.manifest_path).parent / "profile.json"
         )
 
-    encoder_log = args.encoder_log
-    if encoder_log is None:
-        from pathlib import Path
-        encoder_log = str(
-            Path(args.manifest_path).parent.parent
-            / "logs" / "encoder_profile_*.log"
-        )
-
     m_i_override = {}
     if args.m_i_override:
         m_i_override = json.loads(args.m_i_override)
@@ -261,10 +240,9 @@ def main():
 
         result = measure_encoder_compute_time(
             args.server_url, args.model, image_path,
-            encoder_log, args.num_warmup, args.num_iterations,
+            args.encode_time_file, args.num_warmup, args.num_iterations,
         )
 
-        # m_i: use override if provided, otherwise estimate from resolution
         if type_id in m_i_override:
             result["m_i"] = m_i_override[type_id]
         else:

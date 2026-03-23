@@ -48,6 +48,7 @@ GPU_MEM_P="${GPU_MEM_P:-0.60}"
 GPU_MEM_D="${GPU_MEM_D:-0.70}"
 
 EC_SHARED_STORAGE_PATH="${EC_SHARED_STORAGE_PATH:-/tmp/ec_cache}"
+ENCODE_TIME_FILE="${ENCODE_TIME_FILE:-/tmp/vllm_encode_times.txt}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-600}"
 
 # Working directories
@@ -115,6 +116,7 @@ start_1e1p1d() {
 
     # Encoder worker
     CUDA_VISIBLE_DEVICES="$GPU_E" \
+    VLLM_ENCODE_TIME_FILE="$ENCODE_TIME_FILE" \
     $extra_env \
     vllm serve "$MODEL" \
         --gpu-memory-utilization "$GPU_MEM_E" \
@@ -248,7 +250,7 @@ echo "Profiling encoder computation times..."
 python "$SCRIPT_DIR/profile_encoder.py" \
     --manifest-path "$MANIFEST_PATH" \
     --server-url "http://localhost:$PROXY_PORT" \
-    --encoder-log "${LOG_PATH}/encoder_profile_*.log" \
+    --encode-time-file "$ENCODE_TIME_FILE" \
     --model "$MODEL" \
     --num-warmup 2 \
     --num-iterations 10 \
