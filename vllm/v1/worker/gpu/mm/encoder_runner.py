@@ -59,6 +59,14 @@ class EncoderRunner:
         self,
         mm_kwargs: list[tuple[str, MultiModalKwargsItem]],
     ) -> list[torch.Tensor]:
+        # Debug: unconditional write to confirm this function is called
+        try:
+            with open("/tmp/vllm_encoder_debug.txt", "a") as _df:
+                _df.write(f"execute_mm_encoder called, {len(mm_kwargs)} items\n")
+                _df.flush()
+        except OSError:
+            pass
+
         encoder_outputs: list[torch.Tensor] = []
         torch.cuda.synchronize(self.device)
         t_start = time.perf_counter()
