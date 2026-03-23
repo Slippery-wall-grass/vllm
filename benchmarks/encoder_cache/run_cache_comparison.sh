@@ -116,8 +116,8 @@ start_1e1p1d() {
 
     # Encoder worker
     CUDA_VISIBLE_DEVICES="$GPU_E" \
-    VLLM_ENCODE_TIME_FILE="$ENCODE_TIME_FILE" \
     $extra_env \
+    env VLLM_ENCODE_TIME_FILE="$ENCODE_TIME_FILE" \
     vllm serve "$MODEL" \
         --gpu-memory-utilization "$GPU_MEM_E" \
         --port "$ENCODE_PORT" \

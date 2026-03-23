@@ -15,10 +15,6 @@ from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 logger = init_logger(__name__)
 
-# Path for sharing encoder compute time with external profiling tools.
-# Set VLLM_ENCODE_TIME_FILE to enable; disabled by default.
-_ENCODE_TIME_FILE = os.environ.get("VLLM_ENCODE_TIME_FILE", "")
-
 
 class EncoderRunner:
     def __init__(
@@ -78,11 +74,13 @@ class EncoderRunner:
         self.last_encode_time = elapsed
         logger.info("Encoder compute time: %.4fs (%d items)", elapsed,
                      len(mm_kwargs))
-        if _ENCODE_TIME_FILE:
+        encode_time_file = os.environ.get("VLLM_ENCODE_TIME_FILE", "")
+        if encode_time_file:
             try:
-                with open(_ENCODE_TIME_FILE, "a") as f:
+                with open(encode_time_file, "a") as f:
                     f.write(f"{elapsed:.6f}\n")
                     f.flush()
+                    os.fsync(f.fileno())
             except OSError:
                 pass
         return encoder_outputs
