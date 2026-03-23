@@ -114,10 +114,10 @@ start_1e1p1d() {
     rm -rf "$EC_SHARED_STORAGE_PATH"
     mkdir -p "$EC_SHARED_STORAGE_PATH"
 
-    # Encoder worker
+    # Encoder worker — export env var so all child processes inherit it
+    export VLLM_ENCODE_TIME_FILE="$ENCODE_TIME_FILE"
     CUDA_VISIBLE_DEVICES="$GPU_E" \
     $extra_env \
-    env VLLM_ENCODE_TIME_FILE="$ENCODE_TIME_FILE" \
     vllm serve "$MODEL" \
         --gpu-memory-utilization "$GPU_MEM_E" \
         --port "$ENCODE_PORT" \

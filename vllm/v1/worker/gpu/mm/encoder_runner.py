@@ -6,6 +6,7 @@ import time
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal.inputs import MultiModalKwargsItem
@@ -74,7 +75,7 @@ class EncoderRunner:
         self.last_encode_time = elapsed
         logger.info("Encoder compute time: %.4fs (%d items)", elapsed,
                      len(mm_kwargs))
-        encode_time_file = os.environ.get("VLLM_ENCODE_TIME_FILE", "")
+        encode_time_file = envs.VLLM_ENCODE_TIME_FILE
         if encode_time_file:
             try:
                 with open(encode_time_file, "a") as f:
