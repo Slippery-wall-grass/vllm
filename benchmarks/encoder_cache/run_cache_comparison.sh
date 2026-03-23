@@ -248,9 +248,10 @@ echo "Profiling encoder computation times..."
 python "$SCRIPT_DIR/profile_encoder.py" \
     --manifest-path "$MANIFEST_PATH" \
     --server-url "http://localhost:$PROXY_PORT" \
+    --encoder-log "${LOG_PATH}/encoder_profile_*.log" \
     --model "$MODEL" \
     --num-warmup 2 \
-    --num-iterations 5 \
+    --num-iterations 10 \
     --output-path "$WORK_DIR/profile.json"
 
 PROFILE_PATH="$WORK_DIR/profile.json"

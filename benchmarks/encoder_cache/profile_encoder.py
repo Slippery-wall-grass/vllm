@@ -3,17 +3,17 @@
 """Profile encoder computation time (c_i) and memory cost (m_i) for each
 image type.
 
-c_i is the pure encoder computation time, i.e. the time saved on a cache hit.
-For each measurement iteration we clear the encoder cache via the
-/reset_encoder_cache endpoint, then send the same image twice:
-  - 1st request: guaranteed cache miss (encoder runs)
-  - 2nd request: guaranteed cache hit  (encoder skipped)
-  c_i = TTFT_miss - TTFT_hit
+c_i is the pure encoder computation time measured directly via GPU-
+synchronised timing in the encoder_runner.  For each iteration we:
+  1. Clear the encoder cache via /reset_encoder_cache.
+  2. Send the image (guaranteed cache miss, encoder runs).
+  3. Parse the encoder worker log for "Encoder compute time: X.XXXXs".
 
 Usage:
     python profile_encoder.py \
         --manifest-path /tmp/encoder_cache_test_images/manifest.json \
         --server-url http://localhost:10001 \
+        --encoder-log /tmp/encoder_cache_benchmark/logs/encoder_profile_*.log \
         --model Qwen/Qwen2.5-VL-3B-Instruct \
         --num-warmup 2 \
         --num-iterations 5 \
@@ -22,23 +22,58 @@ Usage:
 
 import argparse
 import base64
+import glob
 import json
+import re
 import statistics
 import time
 
 import requests as http_requests
 
+# Pattern matching the log line emitted by encoder_runner.py
+_ENCODE_TIME_RE = re.compile(
+    r"Encoder compute time: ([\d.]+)s \((\d+) items?\)"
+)
+
 
 def encode_image_to_base64(image_path: str) -> str:
-    """Read an image file and return its base64-encoded string."""
     with open(image_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
 
 def reset_encoder_cache(server_url: str) -> None:
-    """Clear the encoder cache on the server (or all encode workers via proxy)."""
     resp = http_requests.post(f"{server_url}/reset_encoder_cache", timeout=30)
     resp.raise_for_status()
+
+
+def read_last_encode_time(log_path: str) -> float | None:
+    """Read the last 'Encoder compute time' entry from the encoder log."""
+    # Resolve glob (e.g. logs/encoder_profile_*.log)
+    paths = sorted(glob.glob(log_path))
+    if not paths:
+        return None
+    # Use the latest log file
+    with open(paths[-1], "r", errors="replace") as f:
+        lines = f.readlines()
+    # Search backwards for the last occurrence
+    for line in reversed(lines):
+        m = _ENCODE_TIME_RE.search(line)
+        if m:
+            return float(m.group(1))
+    return None
+
+
+def count_encode_time_entries(log_path: str) -> int:
+    """Count total 'Encoder compute time' entries in the log."""
+    paths = sorted(glob.glob(log_path))
+    if not paths:
+        return 0
+    count = 0
+    with open(paths[-1], "r", errors="replace") as f:
+        for line in f:
+            if _ENCODE_TIME_RE.search(line):
+                count += 1
+    return count
 
 
 def send_image_request(server_url: str, model: str, img_b64: str,
@@ -113,50 +148,61 @@ def send_image_request(server_url: str, model: str, img_b64: str,
 
 def measure_encoder_compute_time(
     server_url: str, model: str, image_path: str,
-    num_warmup: int, num_iterations: int,
+    encoder_log: str, num_warmup: int, num_iterations: int,
 ) -> dict:
     """Measure c_i for a single image type.
 
     For each iteration:
-      1. Reset encoder cache (guaranteed cold start).
-      2. Send image (cache miss) -> measure TTFT_miss.
-      3. Send same image again (cache hit) -> measure TTFT_hit.
-      4. c_i = TTFT_miss - TTFT_hit.
+      1. Reset encoder cache.
+      2. Send image (cache miss -> encoder runs, logs compute time).
+      3. Parse encoder log for the GPU-synchronised compute time.
     """
     img_b64 = encode_image_to_base64(image_path)
 
-    # Warmup: exercise the encoder path so CUDA kernels are compiled.
-    for i in range(num_warmup):
+    # Warmup
+    for _ in range(num_warmup):
         send_image_request(server_url, model, img_b64)
 
-    ttft_miss_list: list[float] = []
-    ttft_hit_list: list[float] = []
     c_i_list: list[float] = []
+    ttft_list: list[float] = []
 
     for iteration in range(num_iterations):
+        # Record how many log entries exist before this request
+        count_before = count_encode_time_entries(encoder_log)
+
         # Clear cache -> next request is guaranteed miss
         reset_encoder_cache(server_url)
 
-        ttft_miss = send_image_request(server_url, model, img_b64)
-        ttft_hit = send_image_request(server_url, model, img_b64)
+        ttft = send_image_request(server_url, model, img_b64)
+        ttft_list.append(ttft)
 
-        ttft_miss_list.append(ttft_miss)
-        ttft_hit_list.append(ttft_hit)
+        # Wait briefly for log flush
+        time.sleep(0.5)
 
-        c_i = max(0.0, ttft_miss - ttft_hit)
-        c_i_list.append(c_i)
-        print(f"    iter {iteration}: miss={ttft_miss:.4f}s  "
-              f"hit={ttft_hit:.4f}s  c_i={c_i:.4f}s")
+        # Read the latest encode time from the log
+        c_i = read_last_encode_time(encoder_log)
+
+        # Verify a new entry appeared
+        count_after = count_encode_time_entries(encoder_log)
+        if c_i is not None and count_after > count_before:
+            c_i_list.append(c_i)
+            print(f"    iter {iteration}: c_i={c_i:.4f}s  ttft={ttft:.4f}s")
+        else:
+            print(f"    iter {iteration}: c_i=N/A (log entry not found)  "
+                  f"ttft={ttft:.4f}s")
+
+    if not c_i_list:
+        print("  WARNING: no encoder compute times found in log, "
+              "falling back to TTFT")
+        c_i_list = ttft_list
 
     return {
         "c_i": statistics.median(c_i_list),
         "c_i_mean": statistics.mean(c_i_list),
         "c_i_std": statistics.stdev(c_i_list) if len(c_i_list) > 1 else 0.0,
         "c_i_all": c_i_list,
-        "ttft_miss_median": statistics.median(ttft_miss_list),
-        "ttft_hit_median": statistics.median(ttft_hit_list),
-        "ttft_miss_all": ttft_miss_list,
-        "ttft_hit_all": ttft_hit_list,
+        "ttft_median": statistics.median(ttft_list),
+        "ttft_all": ttft_list,
     }
 
 
@@ -169,12 +215,15 @@ def main():
     parser.add_argument("--server-url", type=str,
                         default="http://localhost:10001",
                         help="URL of the vLLM proxy/server")
+    parser.add_argument("--encoder-log", type=str, default=None,
+                        help="Glob pattern for the encoder worker log file "
+                        "(e.g. /tmp/.../logs/encoder_profile_*.log)")
     parser.add_argument("--model", type=str,
                         default="Qwen/Qwen2.5-VL-3B-Instruct",
                         help="Model name")
     parser.add_argument("--num-warmup", type=int, default=2,
                         help="Number of warmup iterations per image type")
-    parser.add_argument("--num-iterations", type=int, default=5,
+    parser.add_argument("--num-iterations", type=int, default=10,
                         help="Number of measurement iterations per type")
     parser.add_argument("--output-path", type=str, default=None,
                         help="Path for output profile JSON")
@@ -193,6 +242,14 @@ def main():
             Path(args.manifest_path).parent / "profile.json"
         )
 
+    encoder_log = args.encoder_log
+    if encoder_log is None:
+        from pathlib import Path
+        encoder_log = str(
+            Path(args.manifest_path).parent.parent
+            / "logs" / "encoder_profile_*.log"
+        )
+
     m_i_override = {}
     if args.m_i_override:
         m_i_override = json.loads(args.m_i_override)
@@ -204,23 +261,19 @@ def main():
 
         result = measure_encoder_compute_time(
             args.server_url, args.model, image_path,
-            args.num_warmup, args.num_iterations,
+            encoder_log, args.num_warmup, args.num_iterations,
         )
 
         # m_i: use override if provided, otherwise estimate from resolution
         if type_id in m_i_override:
             result["m_i"] = m_i_override[type_id]
         else:
-            # Default estimate: (w * h) / (patch_size^2)
-            # For Qwen2.5-VL with patch_size=14: tokens = (w*h)/(14*14)
             w, h = info["resolution"]
             result["m_i"] = max(1, (w * h) // (14 * 14))
 
         profile[type_id] = result
         print(f"  c_i={result['c_i']:.4f}s (encoder compute time), "
-              f"m_i={result['m_i']}, "
-              f"ttft_miss={result['ttft_miss_median']:.4f}s, "
-              f"ttft_hit={result['ttft_hit_median']:.4f}s")
+              f"m_i={result['m_i']}")
 
     with open(output_path, "w") as f:
         json.dump(profile, f, indent=2)
