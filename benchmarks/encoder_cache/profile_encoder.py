@@ -67,28 +67,53 @@ def send_image_request(server_url: str, model: str, image_path: str,
         "stream": True,
     }
 
-    start_time = time.perf_counter()
-    ttft = None
+    max_retries = 3
+    for attempt in range(max_retries):
+        start_time = time.perf_counter()
+        ttft = None
 
-    with http_requests.post(
-        f"{server_url}/v1/chat/completions",
-        json=payload,
-        stream=True,
-        timeout=120,
-    ) as response:
-        response.raise_for_status()
-        for line in response.iter_lines():
-            if line:
-                decoded = line.decode("utf-8")
-                if decoded.startswith("data: ") and decoded != "data: [DONE]":
-                    if ttft is None:
-                        ttft = time.perf_counter() - start_time
-                    # Continue reading to complete the request
+        try:
+            with http_requests.post(
+                f"{server_url}/v1/chat/completions",
+                json=payload,
+                stream=True,
+                timeout=300,
+            ) as response:
+                if response.status_code != 200:
+                    body = response.text
+                    print(f"  [attempt {attempt+1}] HTTP {response.status_code} "
+                          f"from {server_url}: {body[:500]}")
+                    if attempt < max_retries - 1:
+                        time.sleep(5)
+                        continue
+                    response.raise_for_status()
 
-    if ttft is None:
-        raise RuntimeError(f"No streaming response received for {image_path}")
+                for line in response.iter_lines():
+                    if line:
+                        decoded = line.decode("utf-8")
+                        if (decoded.startswith("data: ")
+                                and decoded != "data: [DONE]"):
+                            if ttft is None:
+                                ttft = time.perf_counter() - start_time
 
-    return ttft
+            if ttft is None:
+                print(f"  [attempt {attempt+1}] No streaming data received")
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                    continue
+                raise RuntimeError(
+                    f"No streaming response received for {image_path}"
+                )
+            return ttft
+
+        except http_requests.exceptions.ConnectionError as e:
+            print(f"  [attempt {attempt+1}] Connection error: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(5)
+                continue
+            raise
+
+    raise RuntimeError(f"All {max_retries} attempts failed for {image_path}")
 
 
 def measure_encoder_compute_time(
