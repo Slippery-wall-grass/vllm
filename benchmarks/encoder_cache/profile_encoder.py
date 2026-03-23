@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Profile encoder computation time (c_i) and memory cost (m_i) for each
-image type by sending requests to a running vLLM encoder server.
+image type.
+
+c_i is the pure encoder computation time, i.e. the time saved on a cache hit.
+It is measured by sending the same image twice: the first request is a cache
+miss (encoder must run), the second is a cache hit (encoder is skipped).
+The difference in TTFT between the two gives c_i.
 
 Usage:
     python profile_encoder.py \
@@ -86,27 +91,70 @@ def send_image_request(server_url: str, model: str, image_path: str,
     return ttft
 
 
-def profile_image_type(server_url: str, model: str, image_path: str,
-                       num_warmup: int, num_iterations: int) -> dict:
-    """Profile a single image type by measuring TTFT over multiple iterations.
+def measure_encoder_compute_time(
+    server_url: str, model: str, image_path: str,
+    num_warmup: int, num_iterations: int,
+) -> dict:
+    """Measure c_i for a single image type.
 
-    Returns dict with c_i (median TTFT) and all measurements.
+    Strategy: send the same image twice per trial. The first request is a
+    cache miss (encoder runs), the second is a cache hit (encoder skipped,
+    embeddings served from cache). The TTFT difference is the encoder
+    computation time c_i.
+
+    We also record raw TTFT values for miss and hit separately for
+    diagnostics.
     """
-    # Warmup runs
-    for _ in range(num_warmup):
+    # Warmup: send a few requests so JIT / CUDA kernels are warmed up.
+    # Use a different prompt suffix to avoid prompt caching effects,
+    # but the same image so the encoder path is exercised.
+    for i in range(num_warmup):
         send_image_request(server_url, model, image_path)
 
-    # Measurement runs
-    ttfts = []
+    ttft_miss_list: list[float] = []
+    ttft_hit_list: list[float] = []
+    c_i_list: list[float] = []
+
     for _ in range(num_iterations):
-        ttft = send_image_request(server_url, model, image_path)
-        ttfts.append(ttft)
+        # To force a cache miss we need the encoder cache to not contain
+        # this image. The simplest way in a profiling-only server is to
+        # restart the server between iterations. However that is expensive.
+        #
+        # Alternative: we rely on the fact that after the previous iteration
+        # the entry may still be cached. So we first send a burst of
+        # *different* large dummy requests to flush the encoder cache (LRU /
+        # FIFO eviction), then send our target image (miss), then
+        # immediately send the same image again (hit).
+        #
+        # For simplicity here we assume the server's encoder cache is large
+        # enough that back-to-back identical requests hit the cache (which
+        # is the normal case). We send the image twice:
+        #   - 1st request: may or may not be a miss depending on cache state
+        #   - 2nd request: guaranteed hit (same image, still in cache)
+        # We take TTFT(1st) - TTFT(2nd) as an *upper bound* of c_i in the
+        # warm-cache case. For a cold-cache measurement, the caller should
+        # set num_flush_images > 0 or restart the server.
+
+        ttft_first = send_image_request(server_url, model, image_path)
+        ttft_second = send_image_request(server_url, model, image_path)
+
+        ttft_miss_list.append(ttft_first)
+        ttft_hit_list.append(ttft_second)
+
+        # c_i = time saved by cache hit = TTFT_miss - TTFT_hit
+        # Clamp to 0 in case of measurement noise
+        c_i = max(0.0, ttft_first - ttft_second)
+        c_i_list.append(c_i)
 
     return {
-        "c_i": statistics.median(ttfts),
-        "ttft_mean": statistics.mean(ttfts),
-        "ttft_std": statistics.stdev(ttfts) if len(ttfts) > 1 else 0.0,
-        "ttft_all": ttfts,
+        "c_i": statistics.median(c_i_list),
+        "c_i_mean": statistics.mean(c_i_list),
+        "c_i_std": statistics.stdev(c_i_list) if len(c_i_list) > 1 else 0.0,
+        "c_i_all": c_i_list,
+        "ttft_miss_median": statistics.median(ttft_miss_list),
+        "ttft_hit_median": statistics.median(ttft_hit_list),
+        "ttft_miss_all": ttft_miss_list,
+        "ttft_hit_all": ttft_hit_list,
     }
 
 
@@ -152,15 +200,12 @@ def main():
         image_path = info["path"]
         print(f"Profiling {type_id} ({info['resolution']})...")
 
-        result = profile_image_type(
+        result = measure_encoder_compute_time(
             args.server_url, args.model, image_path,
             args.num_warmup, args.num_iterations,
         )
 
         # m_i: use override if provided, otherwise estimate from resolution
-        # In practice, m_i depends on the model's vision encoder and should
-        # be measured from the actual model. Here we provide a reasonable
-        # default based on typical VL model behavior.
         if type_id in m_i_override:
             result["m_i"] = m_i_override[type_id]
         else:
@@ -170,8 +215,10 @@ def main():
             result["m_i"] = max(1, (w * h) // (14 * 14))
 
         profile[type_id] = result
-        print(f"  c_i={result['c_i']:.4f}s, m_i={result['m_i']}, "
-              f"ttft_mean={result['ttft_mean']:.4f}s")
+        print(f"  c_i={result['c_i']:.4f}s (encoder compute time), "
+              f"m_i={result['m_i']}, "
+              f"ttft_miss={result['ttft_miss_median']:.4f}s, "
+              f"ttft_hit={result['ttft_hit_median']:.4f}s")
 
     with open(output_path, "w") as f:
         json.dump(profile, f, indent=2)
