@@ -4,14 +4,16 @@
 image type.
 
 c_i is the pure encoder computation time, i.e. the time saved on a cache hit.
-It is measured by sending the same image twice: the first request is a cache
-miss (encoder must run), the second is a cache hit (encoder is skipped).
-The difference in TTFT between the two gives c_i.
+For each measurement iteration we create a *unique variant* of the source
+image (by drawing a small random marker) so its mm_hash differs from all
+previous requests.  This guarantees the first send is a cache miss.  We then
+immediately send the identical image again (guaranteed cache hit) and take
+TTFT_miss - TTFT_hit = c_i.
 
 Usage:
     python profile_encoder.py \
         --manifest-path /tmp/encoder_cache_test_images/manifest.json \
-        --server-url http://localhost:19534 \
+        --server-url http://localhost:10001 \
         --model Qwen/Qwen2.5-VL-3B-Instruct \
         --num-warmup 2 \
         --num-iterations 5 \
@@ -20,45 +22,56 @@ Usage:
 
 import argparse
 import base64
+import io
 import json
+import random
 import statistics
 import time
 
 import requests as http_requests
+from PIL import Image, ImageDraw
 
 
-def encode_image_to_base64(image_path: str) -> str:
-    """Read an image file and return its base64-encoded string."""
-    with open(image_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+def image_to_base64(img: Image.Image) -> str:
+    """Encode a PIL Image to a JPEG base64 string."""
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def send_image_request(server_url: str, model: str, image_path: str,
-                       use_base64: bool = True,
-                       max_tokens: int = 10) -> float:
-    """Send a single image request and measure TTFT.
+def make_unique_variant(image_path: str, seed: int) -> str:
+    """Return a base64 string of *image_path* with a tiny unique marker.
 
-    Returns TTFT in seconds.
+    Drawing a small random rectangle in a corner ensures the image content
+    (and therefore its mm_hash) differs from every other variant while
+    keeping the encoder workload essentially identical.
     """
-    if use_base64:
-        img_b64 = encode_image_to_base64(image_path)
-        image_content = {
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
-        }
-    else:
-        image_content = {
-            "type": "image_url",
-            "image_url": {"url": f"file://{image_path}"},
-        }
+    rng = random.Random(seed)
+    img = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    # 2x2 pixel marker in a random corner position
+    x = rng.randint(0, max(0, img.width - 3))
+    y = rng.randint(0, max(0, img.height - 3))
+    color = (rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255))
+    draw.rectangle([x, y, x + 1, y + 1], fill=color)
+    return image_to_base64(img)
 
+
+def send_b64_request(server_url: str, model: str, img_b64: str,
+                     max_tokens: int = 10) -> float:
+    """Send a base64 image request and return TTFT in seconds."""
     payload = {
         "model": model,
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    image_content,
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{img_b64}",
+                        },
+                    },
                     {"type": "text", "text": "Describe this image briefly."},
                 ],
             }
@@ -81,8 +94,8 @@ def send_image_request(server_url: str, model: str, image_path: str,
             ) as response:
                 if response.status_code != 200:
                     body = response.text
-                    print(f"  [attempt {attempt+1}] HTTP {response.status_code} "
-                          f"from {server_url}: {body[:500]}")
+                    print(f"  [attempt {attempt+1}] HTTP {response.status_code}"
+                          f" from {server_url}: {body[:500]}")
                     if attempt < max_retries - 1:
                         time.sleep(5)
                         continue
@@ -101,9 +114,7 @@ def send_image_request(server_url: str, model: str, image_path: str,
                 if attempt < max_retries - 1:
                     time.sleep(5)
                     continue
-                raise RuntimeError(
-                    f"No streaming response received for {image_path}"
-                )
+                raise RuntimeError("No streaming response received")
             return ttft
 
         except http_requests.exceptions.ConnectionError as e:
@@ -113,7 +124,7 @@ def send_image_request(server_url: str, model: str, image_path: str,
                 continue
             raise
 
-    raise RuntimeError(f"All {max_retries} attempts failed for {image_path}")
+    raise RuntimeError(f"All {max_retries} attempts failed")
 
 
 def measure_encoder_compute_time(
@@ -122,54 +133,35 @@ def measure_encoder_compute_time(
 ) -> dict:
     """Measure c_i for a single image type.
 
-    Strategy: send the same image twice per trial. The first request is a
-    cache miss (encoder runs), the second is a cache hit (encoder skipped,
-    embeddings served from cache). The TTFT difference is the encoder
-    computation time c_i.
-
-    We also record raw TTFT values for miss and hit separately for
-    diagnostics.
+    For each iteration:
+      1. Create a unique variant of the image (different mm_hash) so the
+         first request is a guaranteed cache miss.
+      2. Send the *same* variant again — guaranteed cache hit.
+      3. c_i = TTFT_miss - TTFT_hit.
     """
-    # Warmup: send a few requests so JIT / CUDA kernels are warmed up.
-    # Use a different prompt suffix to avoid prompt caching effects,
-    # but the same image so the encoder path is exercised.
+    # Warmup: exercise the encoder path so CUDA kernels are compiled.
     for i in range(num_warmup):
-        send_image_request(server_url, model, image_path)
+        warmup_b64 = make_unique_variant(image_path, seed=-(i + 1))
+        send_b64_request(server_url, model, warmup_b64)
 
     ttft_miss_list: list[float] = []
     ttft_hit_list: list[float] = []
     c_i_list: list[float] = []
 
-    for _ in range(num_iterations):
-        # To force a cache miss we need the encoder cache to not contain
-        # this image. The simplest way in a profiling-only server is to
-        # restart the server between iterations. However that is expensive.
-        #
-        # Alternative: we rely on the fact that after the previous iteration
-        # the entry may still be cached. So we first send a burst of
-        # *different* large dummy requests to flush the encoder cache (LRU /
-        # FIFO eviction), then send our target image (miss), then
-        # immediately send the same image again (hit).
-        #
-        # For simplicity here we assume the server's encoder cache is large
-        # enough that back-to-back identical requests hit the cache (which
-        # is the normal case). We send the image twice:
-        #   - 1st request: may or may not be a miss depending on cache state
-        #   - 2nd request: guaranteed hit (same image, still in cache)
-        # We take TTFT(1st) - TTFT(2nd) as an *upper bound* of c_i in the
-        # warm-cache case. For a cold-cache measurement, the caller should
-        # set num_flush_images > 0 or restart the server.
+    for iteration in range(num_iterations):
+        # Unique variant → guaranteed fresh mm_hash → guaranteed miss
+        variant_b64 = make_unique_variant(image_path, seed=iteration * 1000)
 
-        ttft_first = send_image_request(server_url, model, image_path)
-        ttft_second = send_image_request(server_url, model, image_path)
+        ttft_miss = send_b64_request(server_url, model, variant_b64)
+        ttft_hit = send_b64_request(server_url, model, variant_b64)
 
-        ttft_miss_list.append(ttft_first)
-        ttft_hit_list.append(ttft_second)
+        ttft_miss_list.append(ttft_miss)
+        ttft_hit_list.append(ttft_hit)
 
-        # c_i = time saved by cache hit = TTFT_miss - TTFT_hit
-        # Clamp to 0 in case of measurement noise
-        c_i = max(0.0, ttft_first - ttft_second)
+        c_i = max(0.0, ttft_miss - ttft_hit)
         c_i_list.append(c_i)
+        print(f"    iter {iteration}: miss={ttft_miss:.4f}s  "
+              f"hit={ttft_hit:.4f}s  c_i={c_i:.4f}s")
 
     return {
         "c_i": statistics.median(c_i_list),
@@ -190,8 +182,8 @@ def main():
     parser.add_argument("--manifest-path", type=str, required=True,
                         help="Path to image manifest JSON")
     parser.add_argument("--server-url", type=str,
-                        default="http://localhost:19534",
-                        help="URL of the vLLM encoder server")
+                        default="http://localhost:10001",
+                        help="URL of the vLLM proxy/server")
     parser.add_argument("--model", type=str,
                         default="Qwen/Qwen2.5-VL-3B-Instruct",
                         help="Model name")
