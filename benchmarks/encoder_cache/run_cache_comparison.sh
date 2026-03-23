@@ -40,6 +40,13 @@ GPU_E="${GPU_E:-2}"
 GPU_P="${GPU_P:-2}"
 GPU_D="${GPU_D:-3}"
 
+# Encoder worker needs enough KV cache to fit visual tokens from test images.
+# With 0.01 utilization the KV cache is too small for most image sizes.
+# Since E and P share a GPU, keep it modest (E=0.10, P=0.60).
+GPU_MEM_E="${GPU_MEM_E:-0.10}"
+GPU_MEM_P="${GPU_MEM_P:-0.60}"
+GPU_MEM_D="${GPU_MEM_D:-0.70}"
+
 EC_SHARED_STORAGE_PATH="${EC_SHARED_STORAGE_PATH:-/tmp/ec_cache}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-600}"
 
@@ -110,7 +117,7 @@ start_1e1p1d() {
     CUDA_VISIBLE_DEVICES="$GPU_E" \
     $extra_env \
     vllm serve "$MODEL" \
-        --gpu-memory-utilization 0.01 \
+        --gpu-memory-utilization "$GPU_MEM_E" \
         --port "$ENCODE_PORT" \
         --enforce-eager \
         --enable-request-id-headers \
@@ -133,7 +140,7 @@ start_1e1p1d() {
     UCX_NET_DEVICES=all \
     VLLM_NIXL_SIDE_CHANNEL_PORT=5559 \
     vllm serve "$MODEL" \
-        --gpu-memory-utilization 0.7 \
+        --gpu-memory-utilization "$GPU_MEM_P" \
         --port "$PREFILL_PORT" \
         --enforce-eager \
         --enable-request-id-headers \
@@ -158,7 +165,7 @@ start_1e1p1d() {
     UCX_NET_DEVICES=all \
     VLLM_NIXL_SIDE_CHANNEL_PORT=6000 \
     vllm serve "$MODEL" \
-        --gpu-memory-utilization 0.7 \
+        --gpu-memory-utilization "$GPU_MEM_D" \
         --port "$DECODE_PORT" \
         --enforce-eager \
         --enable-request-id-headers \

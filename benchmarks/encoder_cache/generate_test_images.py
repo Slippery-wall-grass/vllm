@@ -19,15 +19,19 @@ from PIL import Image, ImageDraw
 
 # Default resolutions to generate different types of images.
 # Each resolution produces different m_i (encoder embedding counts).
+# Resolutions are kept moderate so the encoder worker (which runs with
+# gpu-memory-utilization 0.01 in disagg mode) has enough KV cache to
+# fit the visual tokens.  Patch-size 14 gives token counts:
+#   224 -> 256,  280 -> 400,  336 -> 576,  392 -> 784,  448 -> 1024
 DEFAULT_RESOLUTIONS = [
     (224, 224),
+    (252, 252),
+    (280, 280),
+    (308, 308),
     (336, 336),
+    (364, 364),
+    (392, 392),
     (448, 448),
-    (672, 672),
-    (896, 896),
-    (1120, 1120),
-    (1344, 1344),
-    (1568, 1568),
 ]
 
 # Colors for different image types to ensure distinct content hashes.
