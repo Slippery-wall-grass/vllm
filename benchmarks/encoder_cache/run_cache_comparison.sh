@@ -76,10 +76,10 @@ START_TIME=$(date +"%Y%m%d_%H%M%S")
 
 wait_for_server() {
     local port=$1
-    echo "Waiting for server on port $port..."
+    echo "Waiting for server on port $port (health check)..."
     timeout "$TIMEOUT_SECONDS" bash -c "
-        until curl -s localhost:$port/v1/chat/completions > /dev/null 2>&1; do
-            sleep 2
+        until curl -sf http://localhost:$port/health > /dev/null 2>&1; do
+            sleep 3
         done" && echo "Server on port $port is ready" && return 0 \
         || { echo "Timeout waiting for server on port $port"; return 1; }
 }
