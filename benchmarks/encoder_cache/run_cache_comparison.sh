@@ -97,6 +97,100 @@ cleanup_servers() {
 trap 'cleanup_servers; exit 1' INT TERM
 
 ###############################################################################
+# Helper: Start full 1E1P1D stack
+###############################################################################
+start_1e1p1d() {
+    local extra_env="${1:-}"
+    local label="${2:-default}"
+
+    rm -rf "$EC_SHARED_STORAGE_PATH"
+    mkdir -p "$EC_SHARED_STORAGE_PATH"
+
+    # Encoder worker
+    CUDA_VISIBLE_DEVICES="$GPU_E" \
+    $extra_env \
+    vllm serve "$MODEL" \
+        --gpu-memory-utilization 0.01 \
+        --port "$ENCODE_PORT" \
+        --enforce-eager \
+        --enable-request-id-headers \
+        --no-enable-prefix-caching \
+        --max-num-batched-tokens 114688 \
+        --max-num-seqs 128 \
+        --allowed-local-media-path "$IMAGE_DIR" \
+        --ec-transfer-config '{
+            "ec_connector": "ECExampleConnector",
+            "ec_role": "ec_producer",
+            "ec_connector_extra_config": {
+                "shared_storage_path": "'"$EC_SHARED_STORAGE_PATH"'"
+            }
+        }' \
+        >"${LOG_PATH}/encoder_${label}_${START_TIME}.log" 2>&1 &
+    PIDS+=($!)
+
+    # Prefill worker
+    CUDA_VISIBLE_DEVICES="$GPU_P" \
+    UCX_NET_DEVICES=all \
+    VLLM_NIXL_SIDE_CHANNEL_PORT=5559 \
+    vllm serve "$MODEL" \
+        --gpu-memory-utilization 0.7 \
+        --port "$PREFILL_PORT" \
+        --enforce-eager \
+        --enable-request-id-headers \
+        --max-num-seqs 128 \
+        --allowed-local-media-path "$IMAGE_DIR" \
+        --ec-transfer-config '{
+            "ec_connector": "ECExampleConnector",
+            "ec_role": "ec_consumer",
+            "ec_connector_extra_config": {
+                "shared_storage_path": "'"$EC_SHARED_STORAGE_PATH"'"
+            }
+        }' \
+        --kv-transfer-config '{
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_producer"
+        }' \
+        >"${LOG_PATH}/prefill_${label}_${START_TIME}.log" 2>&1 &
+    PIDS+=($!)
+
+    # Decode worker
+    CUDA_VISIBLE_DEVICES="$GPU_D" \
+    UCX_NET_DEVICES=all \
+    VLLM_NIXL_SIDE_CHANNEL_PORT=6000 \
+    vllm serve "$MODEL" \
+        --gpu-memory-utilization 0.7 \
+        --port "$DECODE_PORT" \
+        --enforce-eager \
+        --enable-request-id-headers \
+        --max-num-seqs 128 \
+        --allowed-local-media-path "$IMAGE_DIR" \
+        --kv-transfer-config '{
+            "kv_connector": "NixlConnector",
+            "kv_role": "kv_consumer"
+        }' \
+        >"${LOG_PATH}/decode_${label}_${START_TIME}.log" 2>&1 &
+    PIDS+=($!)
+
+    # Wait for all workers
+    wait_for_server "$ENCODE_PORT"
+    wait_for_server "$PREFILL_PORT"
+    wait_for_server "$DECODE_PORT"
+
+    # Start proxy
+    python "${GIT_ROOT}/examples/online_serving/disaggregated_encoder/disagg_epd_proxy.py" \
+        --host "0.0.0.0" \
+        --port "$PROXY_PORT" \
+        --encode-servers-urls "http://localhost:$ENCODE_PORT" \
+        --prefill-servers-urls "http://localhost:$PREFILL_PORT" \
+        --decode-servers-urls "http://localhost:$DECODE_PORT" \
+        >"${LOG_PATH}/proxy_${label}_${START_TIME}.log" 2>&1 &
+    PIDS+=($!)
+
+    wait_for_server "$PROXY_PORT"
+    echo "All 1E1P1D services are up! ($label)"
+}
+
+###############################################################################
 # Step 1: Generate test images
 ###############################################################################
 echo "============================================================"
@@ -132,41 +226,21 @@ fi
 echo "Distribution: $DISTRIBUTION"
 
 ###############################################################################
-# Step 3: Start 1E1P1D and profile encoder
+# Step 3: Start full 1E1P1D stack and profile encoder
 ###############################################################################
 echo "============================================================"
-echo "Step 3: Starting encoder worker for profiling"
+echo "Step 3: Starting full 1E1P1D stack for profiling"
 echo "============================================================"
 
-rm -rf "$EC_SHARED_STORAGE_PATH"
-mkdir -p "$EC_SHARED_STORAGE_PATH"
-
-# Start encoder worker only for profiling
-CUDA_VISIBLE_DEVICES="$GPU_E" vllm serve "$MODEL" \
-    --gpu-memory-utilization 0.01 \
-    --port "$ENCODE_PORT" \
-    --enforce-eager \
-    --enable-request-id-headers \
-    --no-enable-prefix-caching \
-    --max-num-batched-tokens 114688 \
-    --max-num-seqs 128 \
-    --allowed-local-media-path "$IMAGE_DIR" \
-    --ec-transfer-config '{
-        "ec_connector": "ECExampleConnector",
-        "ec_role": "ec_producer",
-        "ec_connector_extra_config": {
-            "shared_storage_path": "'"$EC_SHARED_STORAGE_PATH"'"
-        }
-    }' \
-    >"${LOG_PATH}/encoder_profile_${START_TIME}.log" 2>&1 &
-PIDS+=($!)
-
-wait_for_server "$ENCODE_PORT"
+# Profiling must go through the full pipeline (encoder -> prefill -> decode)
+# because the encoder worker alone (ec_producer, gpu-memory-utilization 0.01)
+# cannot serve complete chat completion requests.
+start_1e1p1d "" "profile"
 
 echo "Profiling encoder computation times..."
 python "$SCRIPT_DIR/profile_encoder.py" \
     --manifest-path "$MANIFEST_PATH" \
-    --server-url "http://localhost:$ENCODE_PORT" \
+    --server-url "http://localhost:$PROXY_PORT" \
     --model "$MODEL" \
     --num-warmup 2 \
     --num-iterations 5 \
@@ -174,8 +248,9 @@ python "$SCRIPT_DIR/profile_encoder.py" \
 
 PROFILE_PATH="$WORK_DIR/profile.json"
 
-# Stop profiling server
+# Stop profiling stack
 cleanup_servers
+sleep 5
 
 ###############################################################################
 # Step 4: Solve for lambda*
@@ -191,99 +266,6 @@ python "$SCRIPT_DIR/solve_lambda.py" \
     --output-path "$WORK_DIR/lambda_config.json"
 
 LAMBDA_CONFIG_PATH="$WORK_DIR/lambda_config.json"
-
-###############################################################################
-# Helper: Start full 1E1P1D stack
-###############################################################################
-start_1e1p1d() {
-    local extra_env="${1:-}"
-
-    rm -rf "$EC_SHARED_STORAGE_PATH"
-    mkdir -p "$EC_SHARED_STORAGE_PATH"
-
-    # Encoder worker
-    CUDA_VISIBLE_DEVICES="$GPU_E" \
-    $extra_env \
-    vllm serve "$MODEL" \
-        --gpu-memory-utilization 0.01 \
-        --port "$ENCODE_PORT" \
-        --enforce-eager \
-        --enable-request-id-headers \
-        --no-enable-prefix-caching \
-        --max-num-batched-tokens 114688 \
-        --max-num-seqs 128 \
-        --allowed-local-media-path "$IMAGE_DIR" \
-        --ec-transfer-config '{
-            "ec_connector": "ECExampleConnector",
-            "ec_role": "ec_producer",
-            "ec_connector_extra_config": {
-                "shared_storage_path": "'"$EC_SHARED_STORAGE_PATH"'"
-            }
-        }' \
-        >"${LOG_PATH}/encoder_${2}_${START_TIME}.log" 2>&1 &
-    PIDS+=($!)
-
-    # Prefill worker
-    CUDA_VISIBLE_DEVICES="$GPU_P" \
-    UCX_NET_DEVICES=all \
-    VLLM_NIXL_SIDE_CHANNEL_PORT=5559 \
-    vllm serve "$MODEL" \
-        --gpu-memory-utilization 0.7 \
-        --port "$PREFILL_PORT" \
-        --enforce-eager \
-        --enable-request-id-headers \
-        --max-num-seqs 128 \
-        --allowed-local-media-path "$IMAGE_DIR" \
-        --ec-transfer-config '{
-            "ec_connector": "ECExampleConnector",
-            "ec_role": "ec_consumer",
-            "ec_connector_extra_config": {
-                "shared_storage_path": "'"$EC_SHARED_STORAGE_PATH"'"
-            }
-        }' \
-        --kv-transfer-config '{
-            "kv_connector": "NixlConnector",
-            "kv_role": "kv_producer"
-        }' \
-        >"${LOG_PATH}/prefill_${2}_${START_TIME}.log" 2>&1 &
-    PIDS+=($!)
-
-    # Decode worker
-    CUDA_VISIBLE_DEVICES="$GPU_D" \
-    UCX_NET_DEVICES=all \
-    VLLM_NIXL_SIDE_CHANNEL_PORT=6000 \
-    vllm serve "$MODEL" \
-        --gpu-memory-utilization 0.7 \
-        --port "$DECODE_PORT" \
-        --enforce-eager \
-        --enable-request-id-headers \
-        --max-num-seqs 128 \
-        --allowed-local-media-path "$IMAGE_DIR" \
-        --kv-transfer-config '{
-            "kv_connector": "NixlConnector",
-            "kv_role": "kv_consumer"
-        }' \
-        >"${LOG_PATH}/decode_${2}_${START_TIME}.log" 2>&1 &
-    PIDS+=($!)
-
-    # Wait for all workers
-    wait_for_server "$ENCODE_PORT"
-    wait_for_server "$PREFILL_PORT"
-    wait_for_server "$DECODE_PORT"
-
-    # Start proxy
-    python "${GIT_ROOT}/examples/online_serving/disaggregated_encoder/disagg_epd_proxy.py" \
-        --host "0.0.0.0" \
-        --port "$PROXY_PORT" \
-        --encode-servers-urls "http://localhost:$ENCODE_PORT" \
-        --prefill-servers-urls "http://localhost:$PREFILL_PORT" \
-        --decode-servers-urls "http://localhost:$DECODE_PORT" \
-        >"${LOG_PATH}/proxy_${2}_${START_TIME}.log" 2>&1 &
-    PIDS+=($!)
-
-    wait_for_server "$PROXY_PORT"
-    echo "All 1E1P1D services are up! ($2)"
-}
 
 ###############################################################################
 # Step 5: Benchmark FIFO policy
