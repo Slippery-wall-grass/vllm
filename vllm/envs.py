@@ -181,7 +181,6 @@ if TYPE_CHECKING:
     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
     VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
-    VLLM_ENCODE_TIME_FILE: str = ""
     VLLM_KV_CACHE_LAYOUT: Literal["NHD", "HND"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_USE_NVFP4_CT_EMULATIONS: bool = False
@@ -1349,9 +1348,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": lambda: int(
         os.getenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "300")
     ),
-    # File path for recording encoder compute times (profiling).
-    # Each encode call appends one line with the elapsed seconds.
-    "VLLM_ENCODE_TIME_FILE": lambda: os.getenv("VLLM_ENCODE_TIME_FILE", ""),
     # KV Cache layout used throughout vllm.
     # Some common values are:
     # - NHD

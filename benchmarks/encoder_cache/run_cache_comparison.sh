@@ -48,7 +48,6 @@ GPU_MEM_P="${GPU_MEM_P:-0.60}"
 GPU_MEM_D="${GPU_MEM_D:-0.70}"
 
 EC_SHARED_STORAGE_PATH="${EC_SHARED_STORAGE_PATH:-/tmp/ec_cache}"
-ENCODE_TIME_FILE="${ENCODE_TIME_FILE:-/tmp/vllm_encode_times.txt}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-600}"
 
 # Working directories
@@ -114,8 +113,7 @@ start_1e1p1d() {
     rm -rf "$EC_SHARED_STORAGE_PATH"
     mkdir -p "$EC_SHARED_STORAGE_PATH"
 
-    # Encoder worker — export env var so all child processes inherit it
-    export VLLM_ENCODE_TIME_FILE="$ENCODE_TIME_FILE"
+    # Encoder worker
     CUDA_VISIBLE_DEVICES="$GPU_E" \
     $extra_env \
     vllm serve "$MODEL" \
@@ -235,32 +233,22 @@ fi
 echo "Distribution: $DISTRIBUTION"
 
 ###############################################################################
-# Step 3: Start full 1E1P1D stack and profile encoder
+# Step 3: Profile encoder computation time (c_i)
 ###############################################################################
 echo "============================================================"
-echo "Step 3: Starting full 1E1P1D stack for profiling"
+echo "Step 3: Profiling encoder computation times"
 echo "============================================================"
 
-# Profiling must go through the full pipeline (encoder -> prefill -> decode)
-# because the encoder worker alone (ec_producer, gpu-memory-utilization 0.01)
-# cannot serve complete chat completion requests.
-start_1e1p1d "" "profile"
-
-echo "Profiling encoder computation times..."
-python "$SCRIPT_DIR/profile_encoder.py" \
+# Directly load the vision encoder and time it. No server needed.
+CUDA_VISIBLE_DEVICES="$GPU_E" python "$SCRIPT_DIR/profile_encoder.py" \
     --manifest-path "$MANIFEST_PATH" \
-    --server-url "http://localhost:$PROXY_PORT" \
-    --encode-time-file "$ENCODE_TIME_FILE" \
     --model "$MODEL" \
-    --num-warmup 2 \
+    --device cuda:0 \
+    --num-warmup 3 \
     --num-iterations 10 \
     --output-path "$WORK_DIR/profile.json"
 
 PROFILE_PATH="$WORK_DIR/profile.json"
-
-# Stop profiling stack
-cleanup_servers
-sleep 5
 
 ###############################################################################
 # Step 4: Solve for lambda*

@@ -1,20 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
-import time
-
 import numpy as np
 import torch
 
-import vllm.envs as envs
-from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import group_mm_kwargs_by_modality
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
-
-logger = init_logger(__name__)
 
 
 class EncoderRunner:
@@ -59,17 +52,7 @@ class EncoderRunner:
         self,
         mm_kwargs: list[tuple[str, MultiModalKwargsItem]],
     ) -> list[torch.Tensor]:
-        # Debug: unconditional write to confirm this function is called
-        try:
-            with open("/tmp/vllm_encoder_debug.txt", "a") as _df:
-                _df.write(f"execute_mm_encoder called, {len(mm_kwargs)} items\n")
-                _df.flush()
-        except OSError:
-            pass
-
         encoder_outputs: list[torch.Tensor] = []
-        torch.cuda.synchronize(self.device)
-        t_start = time.perf_counter()
         for modality, num_items, mm_kwargs_group in group_mm_kwargs_by_modality(
             mm_kwargs, device=self.device, pin_memory=False
         ):
@@ -78,20 +61,6 @@ class EncoderRunner:
                 curr_group_outputs, expected_num_items=num_items
             )
             encoder_outputs.extend(curr_group_outputs)
-        torch.cuda.synchronize(self.device)
-        elapsed = time.perf_counter() - t_start
-        self.last_encode_time = elapsed
-        logger.info("Encoder compute time: %.4fs (%d items)", elapsed,
-                     len(mm_kwargs))
-        encode_time_file = envs.VLLM_ENCODE_TIME_FILE
-        if encode_time_file:
-            try:
-                with open(encode_time_file, "a") as f:
-                    f.write(f"{elapsed:.6f}\n")
-                    f.flush()
-                    os.fsync(f.fileno())
-            except OSError:
-                pass
         return encoder_outputs
 
     def gather_mm_embeddings(
