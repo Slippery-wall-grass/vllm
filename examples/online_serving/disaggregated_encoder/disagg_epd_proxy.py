@@ -455,6 +455,21 @@ async def health_check():
     )
 
 
+@app.post("/reset_encoder_cache")
+async def reset_encoder_cache():
+    """Reset encoder cache on all encode workers."""
+    for u in app.state.e_urls:
+        try:
+            async with encode_session.post(
+                f"{u}/reset_encoder_cache"
+            ) as resp:
+                resp.raise_for_status()
+        except Exception as e:
+            logger.error("Failed to reset encoder cache on %s: %s", u, e)
+            return JSONResponse({"error": str(e)}, status_code=502)
+    return JSONResponse({"status": "ok"})
+
+
 ###############################################################################
 # Simple profiler fan-out (unchanged except for sessions)
 ###############################################################################

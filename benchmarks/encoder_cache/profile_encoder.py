@@ -4,11 +4,11 @@
 image type.
 
 c_i is the pure encoder computation time, i.e. the time saved on a cache hit.
-For each measurement iteration we create a *unique variant* of the source
-image (by drawing a small random marker) so its mm_hash differs from all
-previous requests.  This guarantees the first send is a cache miss.  We then
-immediately send the identical image again (guaranteed cache hit) and take
-TTFT_miss - TTFT_hit = c_i.
+For each measurement iteration we clear the encoder cache via the
+/reset_encoder_cache endpoint, then send the same image twice:
+  - 1st request: guaranteed cache miss (encoder runs)
+  - 2nd request: guaranteed cache hit  (encoder skipped)
+  c_i = TTFT_miss - TTFT_hit
 
 Usage:
     python profile_encoder.py \
@@ -22,43 +22,27 @@ Usage:
 
 import argparse
 import base64
-import io
 import json
-import random
 import statistics
 import time
 
 import requests as http_requests
-from PIL import Image, ImageDraw
 
 
-def image_to_base64(img: Image.Image) -> str:
-    """Encode a PIL Image to a JPEG base64 string."""
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=95)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
+def encode_image_to_base64(image_path: str) -> str:
+    """Read an image file and return its base64-encoded string."""
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
 
-def make_unique_variant(image_path: str, seed: int) -> str:
-    """Return a base64 string of *image_path* with a tiny unique marker.
-
-    Drawing a small random rectangle in a corner ensures the image content
-    (and therefore its mm_hash) differs from every other variant while
-    keeping the encoder workload essentially identical.
-    """
-    rng = random.Random(seed)
-    img = Image.open(image_path).convert("RGB")
-    draw = ImageDraw.Draw(img)
-    # 2x2 pixel marker in a random corner position
-    x = rng.randint(0, max(0, img.width - 3))
-    y = rng.randint(0, max(0, img.height - 3))
-    color = (rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255))
-    draw.rectangle([x, y, x + 1, y + 1], fill=color)
-    return image_to_base64(img)
+def reset_encoder_cache(server_url: str) -> None:
+    """Clear the encoder cache on the server (or all encode workers via proxy)."""
+    resp = http_requests.post(f"{server_url}/reset_encoder_cache", timeout=30)
+    resp.raise_for_status()
 
 
-def send_b64_request(server_url: str, model: str, img_b64: str,
-                     max_tokens: int = 10) -> float:
+def send_image_request(server_url: str, model: str, img_b64: str,
+                       max_tokens: int = 10) -> float:
     """Send a base64 image request and return TTFT in seconds."""
     payload = {
         "model": model,
@@ -134,26 +118,27 @@ def measure_encoder_compute_time(
     """Measure c_i for a single image type.
 
     For each iteration:
-      1. Create a unique variant of the image (different mm_hash) so the
-         first request is a guaranteed cache miss.
-      2. Send the *same* variant again — guaranteed cache hit.
-      3. c_i = TTFT_miss - TTFT_hit.
+      1. Reset encoder cache (guaranteed cold start).
+      2. Send image (cache miss) -> measure TTFT_miss.
+      3. Send same image again (cache hit) -> measure TTFT_hit.
+      4. c_i = TTFT_miss - TTFT_hit.
     """
+    img_b64 = encode_image_to_base64(image_path)
+
     # Warmup: exercise the encoder path so CUDA kernels are compiled.
     for i in range(num_warmup):
-        warmup_b64 = make_unique_variant(image_path, seed=-(i + 1))
-        send_b64_request(server_url, model, warmup_b64)
+        send_image_request(server_url, model, img_b64)
 
     ttft_miss_list: list[float] = []
     ttft_hit_list: list[float] = []
     c_i_list: list[float] = []
 
     for iteration in range(num_iterations):
-        # Unique variant → guaranteed fresh mm_hash → guaranteed miss
-        variant_b64 = make_unique_variant(image_path, seed=iteration * 1000)
+        # Clear cache -> next request is guaranteed miss
+        reset_encoder_cache(server_url)
 
-        ttft_miss = send_b64_request(server_url, model, variant_b64)
-        ttft_hit = send_b64_request(server_url, model, variant_b64)
+        ttft_miss = send_image_request(server_url, model, img_b64)
+        ttft_hit = send_image_request(server_url, model, img_b64)
 
         ttft_miss_list.append(ttft_miss)
         ttft_hit_list.append(ttft_hit)
