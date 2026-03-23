@@ -5,8 +5,10 @@ import torch
 
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 from vllm.v1.core.encoder_cache_manager import (
+    DistributionAwareCacheManager,
     EncoderCacheManager,
     EncoderDecoderCacheManager,
+    TypeMetadata,
 )
 
 pytestmark = pytest.mark.cpu_test
@@ -335,3 +337,166 @@ def test_encoder_decoder_cache_manager_reset_allows_fresh_allocations():
 
     assert manager.num_free_slots == 2
     assert "img2" in manager.allocated
+
+
+# ---------- DistributionAwareCacheManager Tests ---------- #
+
+def _make_distribution_aware_cache(cache_size, types_config, hash_to_type):
+    """Helper to create a configured DistributionAwareCacheManager."""
+    manager = DistributionAwareCacheManager(cache_size)
+    type_metadata = {}
+    for type_id, cfg in types_config.items():
+        type_metadata[type_id] = TypeMetadata(
+            type_id=type_id,
+            p_i=cfg["p_i"],
+            m_i=cfg["m_i"],
+            c_i=cfg["c_i"],
+        )
+    manager.configure_distribution(type_metadata, hash_to_type)
+    return manager
+
+
+def test_distribution_aware_no_config_falls_back_to_fifo():
+    """Without configuration, behaves like FIFO."""
+    manager = DistributionAwareCacheManager(cache_size=10)
+    req1 = MockRequest("r1", ["imgA"], [6])
+    req2 = MockRequest("r2", ["imgB"], [5])
+
+    assert manager.can_allocate(req1, 0, int(1e9), 0)
+    manager.allocate(req1, 0)
+    manager.free_encoder_input(req1, 0)
+
+    assert manager.can_allocate(req2, 0, int(1e9), 0)
+    manager.allocate(req2, 0)
+
+    assert "imgA" not in manager.cached
+    assert "imgA" in manager.get_freed_mm_hashes()
+
+
+def test_distribution_aware_prefers_evictable():
+    """Evictable entries are evicted before non-evictable ones."""
+    # Setup: high p_i for type_a (frequent access => non-evictable)
+    # low p_i for type_b (rare access => evictable)
+    types_config = {
+        "type_a": {"p_i": 0.9, "m_i": 5, "c_i": 10.0},  # high c, frequent
+        "type_b": {"p_i": 0.01, "m_i": 5, "c_i": 0.001},  # low c, rare
+    }
+    hash_to_type = {"imgA": "type_a", "imgB": "type_b"}
+
+    manager = _make_distribution_aware_cache(
+        cache_size=15, types_config=types_config, hash_to_type=hash_to_type
+    )
+
+    req1 = MockRequest("r1", ["imgA"], [5])
+    req2 = MockRequest("r2", ["imgB"], [5])
+    req3 = MockRequest("r3", ["imgC"], [6])
+
+    # Allocate and free both
+    manager.allocate(req1, 0)
+    manager.allocate(req2, 0)
+    manager.free_encoder_input(req1, 0)
+    manager.free_encoder_input(req2, 0)
+
+    # Both are now in freeable. imgB (rare, low cost) should be evictable,
+    # imgA (frequent, high cost) should be non-evictable.
+    # When we need space for imgC, imgB should be evicted first.
+    assert manager.can_allocate(req3, 0, int(1e9), 0)
+    manager.allocate(req3, 0)
+
+    freed = manager.get_freed_mm_hashes()
+    # imgB (evictable) should be evicted, imgA (non-evictable) should remain
+    assert "imgB" in freed
+
+
+def test_distribution_aware_fallback_to_fifo():
+    """When no evictable entries, falls back to FIFO."""
+    # All types have very high computation cost => all non-evictable
+    types_config = {
+        "type_a": {"p_i": 0.5, "m_i": 5, "c_i": 1000.0},
+        "type_b": {"p_i": 0.5, "m_i": 5, "c_i": 1000.0},
+    }
+    hash_to_type = {"imgA": "type_a", "imgB": "type_b"}
+
+    manager = _make_distribution_aware_cache(
+        cache_size=10, types_config=types_config, hash_to_type=hash_to_type
+    )
+
+    req1 = MockRequest("r1", ["imgA"], [5])
+    req2 = MockRequest("r2", ["imgB"], [5])
+    req3 = MockRequest("r3", ["imgC"], [6])
+
+    manager.allocate(req1, 0)
+    manager.allocate(req2, 0)
+    manager.free_encoder_input(req1, 0)
+    manager.free_encoder_input(req2, 0)
+
+    # Both non-evictable, but we still need space => fallback to FIFO
+    assert manager.can_allocate(req3, 0, int(1e9), 0)
+    manager.allocate(req3, 0)
+
+    freed = manager.get_freed_mm_hashes()
+    # At least one should be evicted to make space
+    assert len(freed) >= 1
+
+
+def test_distribution_aware_hit_rate_tracking():
+    """Cache hit/miss counters work correctly."""
+    manager = DistributionAwareCacheManager(cache_size=20)
+
+    req = MockRequest("r1", ["imgA"], [5])
+    # Miss
+    assert not manager.check_and_update_cache(req, 0)
+    assert manager.cache_misses == 1
+    assert manager.cache_hits == 0
+
+    manager.allocate(req, 0)
+    # Hit
+    assert manager.check_and_update_cache(req, 0)
+    assert manager.cache_hits == 1
+    assert manager.cache_misses == 1
+    assert manager.get_hit_rate() == 0.5
+
+
+def test_lambda_solver():
+    """Verify the lambda solver produces a reasonable result."""
+    manager = DistributionAwareCacheManager(cache_size=10)
+    types_config = {
+        "type_a": {"p_i": 0.3, "m_i": 5, "c_i": 0.05},
+        "type_b": {"p_i": 0.7, "m_i": 5, "c_i": 0.02},
+    }
+    type_metadata = {
+        tid: TypeMetadata(type_id=tid, **cfg)
+        for tid, cfg in types_config.items()
+    }
+    manager.configure_distribution(type_metadata, {})
+
+    # lambda* should be non-negative
+    assert manager.lambda_star >= 0
+    assert manager._configured
+
+
+def test_distribution_aware_reset():
+    """Reset clears distribution-aware state too."""
+    manager = DistributionAwareCacheManager(cache_size=10)
+    req = MockRequest("r1", ["imgA"], [5])
+
+    manager.allocate(req, 0)
+    manager.check_and_update_cache(req, 0)
+
+    manager.reset()
+
+    assert manager.cache_hits == 0
+    assert manager.cache_misses == 0
+    assert len(manager.evictability) == 0
+    assert manager.num_free_slots == 10
+
+
+def test_distribution_aware_get_stats():
+    """get_stats returns expected structure."""
+    manager = DistributionAwareCacheManager(cache_size=10)
+    stats = manager.get_stats()
+    assert "cache_hits" in stats
+    assert "cache_misses" in stats
+    assert "hit_rate" in stats
+    assert "lambda_star" in stats
+    assert stats["configured"] is False

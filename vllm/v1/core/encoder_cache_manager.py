@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import math
+import random
 from collections import OrderedDict
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -264,6 +268,341 @@ class EncoderCacheManager:
         freed = self.freed
         self.freed = []
         return freed
+
+
+@dataclass
+class TypeMetadata:
+    """Metadata for a data type used in distribution-aware cache management.
+
+    Attributes:
+        type_id: Unique identifier for this data type.
+        p_i: Access probability of this data type.
+        m_i: Memory cost in number of encoder embeddings.
+        c_i: Computation cost (encoder time in seconds).
+    """
+    type_id: str
+    p_i: float
+    m_i: int
+    c_i: float
+
+
+class DistributionAwareCacheManager(EncoderCacheManager):
+    """Distribution-aware encoder cache manager.
+
+    Instead of FIFO eviction, this manager uses knowledge of the access
+    distribution to decide which cache entries to keep vs evict.
+
+    The algorithm solves for the optimal dual variable lambda* that maximizes:
+        D(lambda) = (M - B) * lambda
+                    - sum_i p_i * E[(m_i * d_i * lambda - c_i)^+]
+    where:
+        M = sum of all m_i
+        B = cache size (memory budget)
+        d_i ~ Geometric(p_i), i.e. P[d_i = d] = p_i * (1-p_i)^d
+
+    When an entry becomes unreferenced, we sample its next arrival time d
+    from the geometric distribution and check if m_i * lambda* * d - c_i >= 0.
+    If so, the entry is marked evictable (cost of keeping > cost of recomputing).
+    Otherwise, it is marked non-evictable (should be kept in cache).
+
+    When eviction is needed, evictable entries are evicted first (FIFO among
+    evictables). If not enough, non-evictable entries are evicted as fallback.
+    """
+
+    def __init__(self, cache_size: int):
+        super().__init__(cache_size)
+        # Distribution configuration
+        self.type_metadata: dict[str, TypeMetadata] = {}
+        self.hash_to_type: dict[str, str] = {}
+        self.lambda_star: float = 0.0
+        self._configured = False
+
+        # Per-entry evictability: mm_hash -> is_evictable
+        self.evictability: dict[str, bool] = {}
+
+        # Cache hit/miss statistics
+        self.cache_hits: int = 0
+        self.cache_misses: int = 0
+
+        self._rng = random.Random(42)
+
+    def reset(self) -> None:
+        super().reset()
+        self.evictability.clear()
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    def configure_distribution(
+        self,
+        type_metadata: dict[str, TypeMetadata],
+        hash_to_type: dict[str, str],
+    ) -> None:
+        """Configure the distribution parameters and solve for lambda*.
+
+        Args:
+            type_metadata: Mapping from type_id to TypeMetadata.
+            hash_to_type: Mapping from mm_hash to type_id.
+        """
+        self.type_metadata = type_metadata
+        self.hash_to_type = hash_to_type
+        self.lambda_star = self._solve_lambda()
+        self._configured = True
+        logger.info(
+            "Distribution-aware cache configured: lambda*=%.6f, "
+            "%d types, %d hash mappings",
+            self.lambda_star,
+            len(type_metadata),
+            len(hash_to_type),
+        )
+
+    @classmethod
+    def from_config_file(cls, cache_size: int,
+                         config_path: str) -> "DistributionAwareCacheManager":
+        """Create a DistributionAwareCacheManager from a JSON config file.
+
+        Expected JSON format:
+        {
+            "types": {
+                "type_0": {"p_i": 0.3, "m_i": 576, "c_i": 0.05},
+                ...
+            },
+            "hash_to_type": {
+                "abc123...": "type_0",
+                ...
+            }
+        }
+        """
+        manager = cls(cache_size)
+        with open(config_path) as f:
+            config = json.load(f)
+
+        type_metadata = {}
+        for type_id, meta in config["types"].items():
+            type_metadata[type_id] = TypeMetadata(
+                type_id=type_id,
+                p_i=meta["p_i"],
+                m_i=meta["m_i"],
+                c_i=meta["c_i"],
+            )
+
+        hash_to_type = config.get("hash_to_type", {})
+        manager.configure_distribution(type_metadata, hash_to_type)
+        return manager
+
+    def _expected_positive_part(self, m_i: int, c_i: float, p_i: float,
+                                lam: float) -> float:
+        """Compute E[(m_i * d * lam - c_i)^+] where d ~ Geometric(p_i).
+
+        P[d = d] = p_i * (1-p_i)^d for d = 0, 1, 2, ...
+
+        E[(m*d*lam - c)^+] = sum_{d >= d0} p*(1-p)^d * (m*d*lam - c)
+        where d0 = ceil(c / (m*lam)) if m*lam > 0, else infinity.
+
+        Using geometric tail sums:
+          sum_{d=d0}^inf q^d = q^d0 / (1-q) = q^d0 / p
+          sum_{d=d0}^inf d*q^d = d0*q^d0/(1-q) + q^(d0+1)/(1-q)^2
+        """
+        if lam <= 0 or m_i * lam <= 0:
+            return 0.0
+
+        d0 = max(0, math.ceil(c_i / (m_i * lam)))
+        q = 1 - p_i
+
+        if q <= 0 or q >= 1:
+            # Degenerate: p_i=1 means d is always 0
+            if p_i >= 1.0:
+                val = m_i * 0 * lam - c_i
+                return max(0.0, val) * 1.0
+            return 0.0
+
+        q_d0 = q ** d0
+
+        # sum_{d=d0}^inf p*q^d = p * q^d0 / (1-q) = q^d0
+        tail_prob = q_d0  # = p * q^d0 / p
+
+        # sum_{d=d0}^inf d * p * q^d
+        # = p * [d0 * q^d0 / (1-q) + q^(d0+1) / (1-q)^2]
+        # = d0 * q^d0 + q^(d0+1) / (1-q)
+        # = d0 * q^d0 + q^(d0+1) / p
+        tail_d_weighted = d0 * q_d0 + q ** (d0 + 1) / p_i
+
+        # E[(m*d*lam - c)^+] = m*lam * tail_d_weighted - c * tail_prob
+        result = m_i * lam * tail_d_weighted - c_i * tail_prob
+        return max(0.0, result)
+
+    def _dual_function(self, lam: float) -> float:
+        """Compute D(lambda) = (M - B)*lambda - sum_i p_i*E[(m_i*d_i*lam - c_i)^+]."""
+        M = sum(meta.m_i for meta in self.type_metadata.values())
+        B = self.cache_size
+
+        val = (M - B) * lam
+        for meta in self.type_metadata.values():
+            val -= meta.p_i * self._expected_positive_part(
+                meta.m_i, meta.c_i, meta.p_i, lam
+            )
+        return val
+
+    def _solve_lambda(self) -> float:
+        """Solve for lambda* that maximizes D(lambda) using scipy."""
+        if not self.type_metadata:
+            return 0.0
+
+        try:
+            from scipy.optimize import minimize_scalar
+        except ImportError:
+            logger.warning(
+                "scipy not available, falling back to grid search for lambda*"
+            )
+            return self._solve_lambda_grid()
+
+        result = minimize_scalar(
+            lambda l: -self._dual_function(l),
+            bounds=(0, 10000),
+            method="bounded",
+        )
+        return result.x
+
+    def _solve_lambda_grid(self) -> float:
+        """Fallback grid search for lambda* when scipy is unavailable."""
+        best_lam = 0.0
+        best_val = self._dual_function(0.0)
+        for exp in range(-6, 5):
+            for mantissa in [1, 2, 5]:
+                lam = mantissa * (10.0 ** exp)
+                val = self._dual_function(lam)
+                if val > best_val:
+                    best_val = val
+                    best_lam = lam
+        # Refine around best
+        for delta in [x * best_lam * 0.01 for x in range(-50, 51)]:
+            lam = best_lam + delta
+            if lam <= 0:
+                continue
+            val = self._dual_function(lam)
+            if val > best_val:
+                best_val = val
+                best_lam = lam
+        return best_lam
+
+    def _sample_geometric(self, p_i: float) -> int:
+        """Sample from geometric distribution P[d=d] = p_i * (1-p_i)^d."""
+        if p_i >= 1.0:
+            return 0
+        if p_i <= 0.0:
+            return 0
+        # Use inverse CDF: d = floor(log(U) / log(1-p_i))
+        u = self._rng.random()
+        if u == 0:
+            return 0
+        return int(math.log(u) / math.log(1 - p_i))
+
+    def _compute_evictability(self, mm_hash: str,
+                              num_encoder_embeds: int) -> bool:
+        """Determine if an entry should be marked as evictable.
+
+        Returns True if the entry is evictable (can be removed when needed).
+        """
+        if not self._configured:
+            return True  # Fall back to FIFO behavior
+
+        type_id = self.hash_to_type.get(mm_hash)
+        if type_id is None or type_id not in self.type_metadata:
+            return True  # Unknown type, treat as evictable
+
+        meta = self.type_metadata[type_id]
+        d = self._sample_geometric(meta.p_i)
+        cost = meta.m_i * self.lambda_star * d - meta.c_i
+        return cost >= 0  # evictable if keeping cost >= recompute cost
+
+    def check_and_update_cache(self, request: Request, input_id: int) -> bool:
+        result = super().check_and_update_cache(request, input_id)
+        if result:
+            self.cache_hits += 1
+        else:
+            self.cache_misses += 1
+        return result
+
+    def free_encoder_input(self, request: Request, input_id: int) -> None:
+        mm_hash = request.mm_features[input_id].identifier
+        was_referenced = bool(self.cached.get(mm_hash))
+
+        super().free_encoder_input(request, input_id)
+
+        # If entry just moved to freeable, compute evictability
+        if was_referenced and mm_hash in self.freeable:
+            num_encoder_embeds = request.get_num_encoder_embeds(input_id)
+            is_evictable = self._compute_evictability(
+                mm_hash, num_encoder_embeds
+            )
+            self.evictability[mm_hash] = is_evictable
+
+    def can_allocate(
+        self,
+        request: Request,
+        input_id: int,
+        encoder_compute_budget: int,
+        num_embeds_to_schedule: int,
+    ) -> bool:
+        num_embeds = request.get_num_encoder_embeds(input_id)
+
+        if num_embeds > encoder_compute_budget:
+            return False
+
+        num_embeds += num_embeds_to_schedule
+
+        if num_embeds <= self.num_free_slots:
+            return True
+
+        if num_embeds > self.num_freeable_slots:
+            return False
+
+        # Phase 1: evict entries marked as evictable first
+        evictable_hashes = [
+            h for h in self.freeable
+            if self.evictability.get(h, True)
+        ]
+        for mm_hash in evictable_hashes:
+            if num_embeds <= self.num_free_slots:
+                break
+            num_free_embeds = self.freeable.pop(mm_hash)
+            del self.cached[mm_hash]
+            self.evictability.pop(mm_hash, None)
+            self.freed.append(mm_hash)
+            self.num_free_slots += num_free_embeds
+
+        # Phase 2: if still not enough, fall back to FIFO on non-evictables
+        while num_embeds > self.num_free_slots:
+            mm_hash, num_free_embeds = self.freeable.popitem(last=False)
+            del self.cached[mm_hash]
+            self.evictability.pop(mm_hash, None)
+            self.freed.append(mm_hash)
+            self.num_free_slots += num_free_embeds
+
+        return True
+
+    def get_hit_rate(self) -> float:
+        """Return the cache hit rate."""
+        total = self.cache_hits + self.cache_misses
+        if total == 0:
+            return 0.0
+        return self.cache_hits / total
+
+    def get_stats(self) -> dict:
+        """Return cache statistics."""
+        return {
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "hit_rate": self.get_hit_rate(),
+            "lambda_star": self.lambda_star,
+            "configured": self._configured,
+            "num_types": len(self.type_metadata),
+            "evictable_count": sum(
+                1 for v in self.evictability.values() if v
+            ),
+            "non_evictable_count": sum(
+                1 for v in self.evictability.values() if not v
+            ),
+        }
 
 
 def compute_mm_encoder_budget(
