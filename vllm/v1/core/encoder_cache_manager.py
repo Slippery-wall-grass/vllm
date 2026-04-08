@@ -647,6 +647,7 @@ class NoCacheEncoderManager(EncoderCacheManager):
             num_encoder_embeds = request.get_num_encoder_embeds(input_id)
             del self.cached[mm_hash]
             self.num_free_slots += num_encoder_embeds
+            self.num_freeable_slots += num_encoder_embeds
             self.freed.append(mm_hash)
 
     def get_hit_rate(self) -> float:
