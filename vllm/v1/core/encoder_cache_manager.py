@@ -605,6 +605,104 @@ class DistributionAwareCacheManager(EncoderCacheManager):
         }
 
 
+class NoCacheEncoderManager(EncoderCacheManager):
+    """Encoder cache manager that disables cross-request caching.
+
+    Used as a baseline for benchmarking. Entries are physically removed
+    from the cache as soon as no request references them, so a follow-up
+    request for the same multimodal input always misses and recomputes.
+
+    Concurrent requests for the same input within a single scheduler step
+    can still share the in-flight encoder output (this is unavoidable
+    without major scheduler changes), but back-to-back requests separated
+    in time will always recompute.
+    """
+
+    def __init__(self, cache_size: int):
+        super().__init__(cache_size)
+        self.cache_hits: int = 0
+        self.cache_misses: int = 0
+
+    def reset(self) -> None:
+        super().reset()
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+    def check_and_update_cache(self, request: Request, input_id: int) -> bool:
+        result = super().check_and_update_cache(request, input_id)
+        if result:
+            self.cache_hits += 1
+        else:
+            self.cache_misses += 1
+        return result
+
+    def free_encoder_input(self, request: Request, input_id: int) -> None:
+        req_id = request.request_id
+        mm_hash = request.mm_features[input_id].identifier
+        if not self.cached.get(mm_hash, None):
+            return
+        self.cached[mm_hash].discard(req_id)
+        if not self.cached[mm_hash]:
+            # Immediately physically free instead of keeping in `freeable`.
+            num_encoder_embeds = request.get_num_encoder_embeds(input_id)
+            del self.cached[mm_hash]
+            self.num_free_slots += num_encoder_embeds
+            self.freed.append(mm_hash)
+
+    def get_hit_rate(self) -> float:
+        total = self.cache_hits + self.cache_misses
+        if total == 0:
+            return 0.0
+        return self.cache_hits / total
+
+    def get_stats(self) -> dict:
+        return {
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "hit_rate": self.get_hit_rate(),
+            "policy": "none",
+        }
+
+
+def create_encoder_cache_manager(cache_size: int) -> EncoderCacheManager:
+    """Factory that selects an encoder cache manager from env vars.
+
+    Reads `VLLM_ENCODER_CACHE_POLICY` (one of "fifo", "none",
+    "distribution_aware") and, when applicable,
+    `VLLM_ENCODER_CACHE_CONFIG_PATH` for the distribution config.
+    """
+    import vllm.envs as envs
+
+    policy = (envs.VLLM_ENCODER_CACHE_POLICY or "fifo").lower()
+
+    if policy == "none":
+        logger.info("Encoder cache policy: none (caching disabled)")
+        return NoCacheEncoderManager(cache_size=cache_size)
+
+    if policy == "distribution_aware":
+        config_path = envs.VLLM_ENCODER_CACHE_CONFIG_PATH
+        if not config_path:
+            logger.warning(
+                "VLLM_ENCODER_CACHE_POLICY=distribution_aware but "
+                "VLLM_ENCODER_CACHE_CONFIG_PATH not set; falling back to FIFO."
+            )
+            return EncoderCacheManager(cache_size=cache_size)
+        logger.info(
+            "Encoder cache policy: distribution_aware (config=%s)",
+            config_path,
+        )
+        return DistributionAwareCacheManager.from_config_file(
+            cache_size=cache_size, config_path=config_path
+        )
+
+    if policy != "fifo":
+        logger.warning(
+            "Unknown VLLM_ENCODER_CACHE_POLICY=%s; falling back to FIFO.",
+            policy,
+        )
+    return EncoderCacheManager(cache_size=cache_size)
+
+
 def compute_mm_encoder_budget(
     scheduler_config: "SchedulerConfig",
     mm_max_toks_per_item: Mapping[str, int],

@@ -2,16 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
-# End-to-end comparison of FIFO vs Distribution-Aware encoder cache policies.
+# End-to-end comparison of None / FIFO / Distribution-Aware encoder cache
+# policies.
 #
 # This script:
 #   1. Generates K synthetic test images
-#   2. Deploys 1E1P1D (encoder + prefill + decode) via disagg setup
-#   3. Profiles encoder computation time for each image type
-#   4. Solves for optimal lambda*
-#   5. Runs benchmark with FIFO cache policy
-#   6. Restarts with distribution-aware policy and runs benchmark again
-#   7. Prints comparison of TTFT and hit rate
+#   2. Profiles encoder computation time for each image type (offline)
+#   3. Solves for optimal lambda*
+#   4. Deploys 1E1P1D and benchmarks with no-cache baseline
+#   5. Restarts with FIFO and benchmarks
+#   6. Restarts with distribution-aware and benchmarks
+#   7. Prints 3-way comparison: TTFT, throughput, hit-rate, improvement
+#      vs the no-cache baseline
 #
 # Usage:
 #   bash run_cache_comparison.sh
@@ -107,15 +109,17 @@ trap 'cleanup_servers; exit 1' INT TERM
 # Helper: Start full 1E1P1D stack
 ###############################################################################
 start_1e1p1d() {
-    local extra_env="${1:-}"
+    local policy="${1:-fifo}"
     local label="${2:-default}"
+    local config_path="${3:-}"
 
     rm -rf "$EC_SHARED_STORAGE_PATH"
     mkdir -p "$EC_SHARED_STORAGE_PATH"
 
     # Encoder worker
     CUDA_VISIBLE_DEVICES="$GPU_E" \
-    $extra_env \
+    VLLM_ENCODER_CACHE_POLICY="$policy" \
+    VLLM_ENCODER_CACHE_CONFIG_PATH="$config_path" \
     vllm serve "$MODEL" \
         --gpu-memory-utilization "$GPU_MEM_E" \
         --port "$ENCODE_PORT" \
@@ -135,10 +139,13 @@ start_1e1p1d() {
         >"${LOG_PATH}/encoder_${label}_${START_TIME}.log" 2>&1 &
     PIDS+=($!)
 
-    # Prefill worker
+    # Prefill worker (also reads encoder cache policy since it has its own
+    # scheduler / EncoderCacheManager that decides when to load from EC)
     CUDA_VISIBLE_DEVICES="$GPU_P" \
     UCX_NET_DEVICES=all \
     VLLM_NIXL_SIDE_CHANNEL_PORT=5559 \
+    VLLM_ENCODER_CACHE_POLICY="$policy" \
+    VLLM_ENCODER_CACHE_CONFIG_PATH="$config_path" \
     vllm serve "$MODEL" \
         --gpu-memory-utilization "$GPU_MEM_P" \
         --port "$PREFILL_PORT" \
@@ -266,55 +273,20 @@ python "$SCRIPT_DIR/solve_lambda.py" \
 LAMBDA_CONFIG_PATH="$WORK_DIR/lambda_config.json"
 
 ###############################################################################
-# Step 5: Benchmark FIFO policy
+# Step 4.5: Build distribution config for the dist-aware cache manager
 ###############################################################################
-echo "============================================================"
-echo "Step 5: Benchmarking FIFO cache policy"
-echo "============================================================"
+DIST_CONFIG_PATH="$WORK_DIR/dist_cache_config.json"
 
-start_1e1p1d "" "fifo"
-
-python "$SCRIPT_DIR/run_benchmark.py" \
-    --manifest-path "$MANIFEST_PATH" \
-    --distribution "$DISTRIBUTION" \
-    --num-requests "$NUM_REQUESTS" \
-    --server-url "http://localhost:$PROXY_PORT" \
-    --model "$MODEL" \
-    --qps "$QPS" \
-    --seed "$SEED" \
-    --label "fifo" \
-    --output-path "$WORK_DIR/results_fifo.json"
-
-cleanup_servers
-sleep 5
-
-###############################################################################
-# Step 6: Benchmark Distribution-Aware policy
-###############################################################################
-echo "============================================================"
-echo "Step 6: Benchmarking Distribution-Aware cache policy"
-echo "============================================================"
-
-# Pass distribution config via environment variable
-export ENCODER_CACHE_DISTRIBUTION_CONFIG="$WORK_DIR/dist_cache_config.json"
-
-# Generate the distribution config file for the cache manager
 python -c "
 import json
 
-# Load lambda config
 with open('$LAMBDA_CONFIG_PATH') as f:
     lam_config = json.load(f)
 
-# Load manifest to get hash mappings (for testing, we use image paths as hashes)
 with open('$MANIFEST_PATH') as f:
     manifest = json.load(f)
 
-# Build cache manager config
-config = {
-    'types': {},
-    'hash_to_type': {}
-}
+config = {'types': {}, 'hash_to_type': {}}
 
 for t in lam_config['types']:
     tid = t['type_id']
@@ -324,34 +296,63 @@ for t in lam_config['types']:
         'c_i': t['c_i'],
     }
 
-# Map image paths to type_ids (hash_to_type will be populated at runtime
-# when actual mm_hashes are known)
+# Map image paths to type_ids. Note: at runtime the cache uses real mm_hashes,
+# this mapping is used by tests / debugging.
 for tid, info in manifest.items():
     config['hash_to_type'][info['path']] = tid
 
-with open('$ENCODER_CACHE_DISTRIBUTION_CONFIG', 'w') as f:
+with open('$DIST_CONFIG_PATH', 'w') as f:
     json.dump(config, f, indent=2)
 
-print(f'Distribution cache config written to $ENCODER_CACHE_DISTRIBUTION_CONFIG')
+print(f'Distribution cache config written to $DIST_CONFIG_PATH')
 "
 
-start_1e1p1d "" "dist_aware"
+###############################################################################
+# Helper: run a single benchmark trial under a given policy
+###############################################################################
+run_trial() {
+    local policy="$1"
+    local label="$2"
+    local config_path="${3:-}"
 
-python "$SCRIPT_DIR/run_benchmark.py" \
-    --manifest-path "$MANIFEST_PATH" \
-    --distribution "$DISTRIBUTION" \
-    --num-requests "$NUM_REQUESTS" \
-    --server-url "http://localhost:$PROXY_PORT" \
-    --model "$MODEL" \
-    --qps "$QPS" \
-    --seed "$SEED" \
-    --label "distribution_aware" \
-    --output-path "$WORK_DIR/results_dist_aware.json"
+    echo "============================================================"
+    echo "Benchmarking policy=$policy (label=$label)"
+    echo "============================================================"
 
-cleanup_servers
+    start_1e1p1d "$policy" "$label" "$config_path"
+
+    python "$SCRIPT_DIR/run_benchmark.py" \
+        --manifest-path "$MANIFEST_PATH" \
+        --distribution "$DISTRIBUTION" \
+        --num-requests "$NUM_REQUESTS" \
+        --server-url "http://localhost:$PROXY_PORT" \
+        --model "$MODEL" \
+        --qps "$QPS" \
+        --seed "$SEED" \
+        --label "$label" \
+        --output-path "$WORK_DIR/results_${label}.json"
+
+    cleanup_servers
+    sleep 5
+}
 
 ###############################################################################
-# Step 7: Compare results
+# Step 5: Benchmark no-cache baseline
+###############################################################################
+run_trial "none" "none"
+
+###############################################################################
+# Step 6: Benchmark FIFO policy
+###############################################################################
+run_trial "fifo" "fifo"
+
+###############################################################################
+# Step 6.5: Benchmark Distribution-Aware policy
+###############################################################################
+run_trial "distribution_aware" "dist_aware" "$DIST_CONFIG_PATH"
+
+###############################################################################
+# Step 7: Compare results (None / FIFO / Dist-Aware)
 ###############################################################################
 echo "============================================================"
 echo "Step 7: Comparison Results"
@@ -360,62 +361,84 @@ echo "============================================================"
 python -c "
 import json
 
+with open('$WORK_DIR/results_none.json') as f:
+    none_r = json.load(f)['metrics']
 with open('$WORK_DIR/results_fifo.json') as f:
-    fifo = json.load(f)
+    fifo_r = json.load(f)['metrics']
 with open('$WORK_DIR/results_dist_aware.json') as f:
-    dist = json.load(f)
+    dist_r = json.load(f)['metrics']
 
-fm = fifo['metrics']
-dm = dist['metrics']
+def fmt(v):
+    return f'{v:.2f}' if isinstance(v, (int, float)) else str(v)
 
-print()
-print('=' * 70)
-print('FIFO vs Distribution-Aware Encoder Cache Comparison')
-print('=' * 70)
-print(f\"{'Metric':<25} {'FIFO':<15} {'Dist-Aware':<15} {'Improvement':<15}\")
-print('-' * 70)
-
-for metric, label in [
-    ('ttft_mean_ms', 'TTFT Mean (ms)'),
-    ('ttft_median_ms', 'TTFT Median (ms)'),
-    ('ttft_p95_ms', 'TTFT P95 (ms)'),
-    ('ttft_p99_ms', 'TTFT P99 (ms)'),
-    ('latency_mean_ms', 'Latency Mean (ms)'),
-]:
-    fv = fm.get(metric, 0)
-    dv = dm.get(metric, 0)
-    if fv > 0:
-        improvement = (fv - dv) / fv * 100
-        print(f'{label:<25} {fv:<15.2f} {dv:<15.2f} {improvement:+.1f}%')
-    else:
-        print(f'{label:<25} {fv:<15.2f} {dv:<15.2f} N/A')
+def imp(base, new, higher_is_better=False):
+    if base in (0, None) or new in (0, None):
+        return 'N/A'
+    delta = (new - base) / base * 100
+    if higher_is_better:
+        return f'{delta:+.1f}%'
+    return f'{-delta:+.1f}%'  # show reduction as positive
 
 print()
-print(f\"{'Successful':<25} {fm['successful']:<15} {dm['successful']:<15}\")
-print(f\"{'Failed':<25} {fm['failed']:<15} {dm['failed']:<15}\")
-print()
-print('Per-Type TTFT Comparison (median ms):')
-print(f\"{'Type':<12} {'FIFO':<15} {'Dist-Aware':<15} {'Improvement':<15}\")
-print('-' * 57)
+print('=' * 90)
+print('Encoder Cache Policy Comparison (vs no-cache baseline)')
+print('=' * 90)
+print(f\"{'Metric':<22} {'None':<14} {'FIFO':<14} {'Dist-Aware':<14}\"
+      f\"{'FIFO vs None':<14} {'Dist vs None':<14}\")
+print('-' * 90)
 
-all_types = set(list(fm.get('per_type', {}).keys()) +
-                list(dm.get('per_type', {}).keys()))
+# (metric_key, label, higher_is_better)
+metrics = [
+    ('ttft_mean_ms',     'TTFT Mean (ms)',     False),
+    ('ttft_median_ms',   'TTFT Median (ms)',   False),
+    ('ttft_p95_ms',      'TTFT P95 (ms)',      False),
+    ('ttft_p99_ms',      'TTFT P99 (ms)',      False),
+    ('latency_mean_ms',  'Latency Mean (ms)',  False),
+    ('throughput_rps',   'Throughput (req/s)', True),
+    ('wall_clock_s',     'Wall Clock (s)',     False),
+]
+
+for key, label, higher in metrics:
+    nv = none_r.get(key, 0)
+    fv = fifo_r.get(key, 0)
+    dv = dist_r.get(key, 0)
+    print(f'{label:<22} {fmt(nv):<14} {fmt(fv):<14} {fmt(dv):<14}'
+          f'{imp(nv, fv, higher):<14} {imp(nv, dv, higher):<14}')
+
+print()
+print(f\"{'Successful':<22} {none_r['successful']:<14} {fifo_r['successful']:<14} \"
+      f\"{dist_r['successful']:<14}\")
+print(f\"{'Failed':<22} {none_r['failed']:<14} {fifo_r['failed']:<14} \"
+      f\"{dist_r['failed']:<14}\")
+print()
+print('Per-Type TTFT Median (ms):')
+print(f\"{'Type':<10} {'None':<14} {'FIFO':<14} {'Dist-Aware':<14}\"
+      f\"{'FIFO vs None':<14} {'Dist vs None':<14}\")
+print('-' * 80)
+
+all_types = (
+    set(none_r.get('per_type', {}).keys())
+    | set(fifo_r.get('per_type', {}).keys())
+    | set(dist_r.get('per_type', {}).keys())
+)
 for tid in sorted(all_types):
-    ft = fm.get('per_type', {}).get(tid, {}).get('ttft_median_ms', 0)
-    dt = dm.get('per_type', {}).get(tid, {}).get('ttft_median_ms', 0)
-    if ft > 0:
-        imp = (ft - dt) / ft * 100
-        print(f'{tid:<12} {ft:<15.2f} {dt:<15.2f} {imp:+.1f}%')
-    else:
-        print(f'{tid:<12} {ft:<15.2f} {dt:<15.2f} N/A')
+    nt = none_r.get('per_type', {}).get(tid, {}).get('ttft_median_ms', 0)
+    ft = fifo_r.get('per_type', {}).get(tid, {}).get('ttft_median_ms', 0)
+    dt = dist_r.get('per_type', {}).get(tid, {}).get('ttft_median_ms', 0)
+    print(f'{tid:<10} {fmt(nt):<14} {fmt(ft):<14} {fmt(dt):<14}'
+          f'{imp(nt, ft):<14} {imp(nt, dt):<14}')
 
+print()
+print('Note: Improvement columns show TTFT/latency reduction (positive is')
+print('better) or throughput gain (positive is better).')
 print()
 print(f'Full results saved in: $WORK_DIR/')
 "
 
 echo ""
 echo "Done! Results are in $WORK_DIR/"
-echo "  - results_fifo.json"
-echo "  - results_dist_aware.json"
+echo "  - results_none.json       (no-cache baseline)"
+echo "  - results_fifo.json       (FIFO/LRU)"
+echo "  - results_dist_aware.json (distribution-aware)"
 echo "  - lambda_config.json"
 echo "  - profile.json"

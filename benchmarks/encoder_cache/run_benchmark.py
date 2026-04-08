@@ -143,12 +143,16 @@ async def run_benchmark(
     model: str,
     qps: float,
     max_tokens: int = 20,
-) -> list[dict]:
-    """Run the benchmark by sending requests at the specified QPS."""
+) -> tuple[list[dict], float]:
+    """Run the benchmark by sending requests at the specified QPS.
+
+    Returns (results, wall_clock_seconds).
+    """
     results = []
     interval = 1.0 / qps if qps > 0 else 0
 
     connector = aiohttp.TCPConnector(limit=100)
+    bench_start = time.perf_counter()
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = []
         for i, item in enumerate(workload):
@@ -167,19 +171,24 @@ async def run_benchmark(
             result["type_id"] = type_id
             results.append(result)
 
-    return results
+    wall_clock = time.perf_counter() - bench_start
+    return results, wall_clock
 
 
-def compute_metrics(results: list[dict]) -> dict:
+def compute_metrics(results: list[dict], wall_clock: float = 0.0) -> dict:
     """Compute aggregate metrics from benchmark results."""
     successful = [r for r in results if r["success"]]
     failed = [r for r in results if not r["success"]]
+
+    throughput = (len(successful) / wall_clock) if wall_clock > 0 else 0.0
 
     if not successful:
         return {
             "total_requests": len(results),
             "successful": 0,
             "failed": len(failed),
+            "wall_clock_s": wall_clock,
+            "throughput_rps": throughput,
             "error": "All requests failed",
         }
 
@@ -208,6 +217,8 @@ def compute_metrics(results: list[dict]) -> dict:
         "total_requests": len(results),
         "successful": len(successful),
         "failed": len(failed),
+        "wall_clock_s": wall_clock,
+        "throughput_rps": throughput,
         "ttft_mean_ms": statistics.mean(ttfts) * 1000,
         "ttft_median_ms": statistics.median(ttfts) * 1000,
         "ttft_p95_ms": sorted(ttfts)[int(len(ttfts) * 0.95)] * 1000
@@ -229,6 +240,8 @@ def print_results(metrics: dict, label: str = "") -> None:
     print(f"Total requests:    {metrics['total_requests']}")
     print(f"Successful:        {metrics['successful']}")
     print(f"Failed:            {metrics['failed']}")
+    print(f"Wall clock:        {metrics.get('wall_clock_s', 0):.2f} s")
+    print(f"Throughput:        {metrics.get('throughput_rps', 0):.2f} req/s")
     print(f"TTFT mean:         {metrics.get('ttft_mean_ms', 'N/A'):.2f} ms")
     print(f"TTFT median:       {metrics.get('ttft_median_ms', 'N/A'):.2f} ms")
     print(f"TTFT p95:          {metrics.get('ttft_p95_ms', 'N/A'):.2f} ms")
@@ -306,12 +319,12 @@ def main():
               f"({count/len(workload)*100:.1f}%)")
 
     print(f"\nSending requests to {args.server_url}...")
-    results = asyncio.run(
+    results, wall_clock = asyncio.run(
         run_benchmark(workload, args.server_url, args.model,
                       args.qps, args.max_tokens)
     )
 
-    metrics = compute_metrics(results)
+    metrics = compute_metrics(results, wall_clock)
     print_results(metrics, args.label)
 
     # Save results

@@ -244,6 +244,8 @@ if TYPE_CHECKING:
     VLLM_CUDA_COMPATIBILITY_PATH: str | None = None
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
+    VLLM_ENCODER_CACHE_POLICY: str = "fifo"
+    VLLM_ENCODER_CACHE_CONFIG_PATH: str | None = None
 
 
 def get_default_cache_root():
@@ -1627,6 +1629,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scaling command in elastic EP.
     "VLLM_ELASTIC_EP_DRAIN_REQUESTS": lambda: bool(
         int(os.getenv("VLLM_ELASTIC_EP_DRAIN_REQUESTS", "0"))
+    ),
+    # Encoder cache replacement policy. One of:
+    #   "fifo"               - default LRU/FIFO eviction
+    #   "none"               - disable caching (entries freed immediately
+    #                          when no request references them)
+    #   "distribution_aware" - distribution-aware eviction; requires
+    #                          VLLM_ENCODER_CACHE_CONFIG_PATH
+    "VLLM_ENCODER_CACHE_POLICY": lambda: os.getenv(
+        "VLLM_ENCODER_CACHE_POLICY", "fifo"
+    ).lower(),
+    # Path to a JSON config file for the distribution-aware encoder cache.
+    "VLLM_ENCODER_CACHE_CONFIG_PATH": lambda: os.getenv(
+        "VLLM_ENCODER_CACHE_CONFIG_PATH", None
     ),
 }
 
