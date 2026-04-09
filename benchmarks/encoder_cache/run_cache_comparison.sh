@@ -19,8 +19,12 @@
 #   bash run_cache_comparison.sh
 #
 # Override defaults via environment variables:
-#   MODEL=Qwen/Qwen2.5-VL-3B-Instruct NUM_TYPES=5 NUM_REQUESTS=200 \
+#   MODEL=Qwen/Qwen2.5-VL-3B-Instruct NUM_TYPES=5 NUM_REQUESTS=2000 \
+#     BENCH_MODE=closed CONCURRENCY=32 WARMUP_REQUESTS=400 \
 #     bash run_cache_comparison.sh
+#
+# BENCH_MODE=closed (default) runs a fixed-concurrency saturation test and
+# reports max throughput; BENCH_MODE=open fires at fixed QPS (uses $QPS).
 set -euo pipefail
 
 ###############################################################################
@@ -28,8 +32,15 @@ set -euo pipefail
 ###############################################################################
 MODEL="${MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"
 NUM_TYPES="${NUM_TYPES:-5}"
-NUM_REQUESTS="${NUM_REQUESTS:-200}"
+NUM_REQUESTS="${NUM_REQUESTS:-2000}"
+# Load mode: "closed" drives the server to saturation for throughput
+# measurement (recommended); "open" fires at a fixed QPS for latency-at-load.
+BENCH_MODE="${BENCH_MODE:-closed}"
 QPS="${QPS:-2}"
+CONCURRENCY="${CONCURRENCY:-32}"
+# Warmup requests are excluded from metrics so the cache reaches steady
+# state before measurement begins.
+WARMUP_REQUESTS="${WARMUP_REQUESTS:-400}"
 SEED="${SEED:-42}"
 CACHE_BUDGET="${CACHE_BUDGET:-2000}"
 
@@ -327,7 +338,10 @@ run_trial() {
         --num-requests "$NUM_REQUESTS" \
         --server-url "http://localhost:$PROXY_PORT" \
         --model "$MODEL" \
+        --mode "$BENCH_MODE" \
         --qps "$QPS" \
+        --concurrency "$CONCURRENCY" \
+        --warmup-requests "$WARMUP_REQUESTS" \
         --seed "$SEED" \
         --label "$label" \
         --output-path "$WORK_DIR/results_${label}.json"

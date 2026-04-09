@@ -137,21 +137,23 @@ async def send_request(
         }
 
 
-async def run_benchmark(
+async def run_benchmark_open(
     workload: list[dict],
     server_url: str,
     model: str,
     qps: float,
     max_tokens: int = 20,
 ) -> tuple[list[dict], float]:
-    """Run the benchmark by sending requests at the specified QPS.
+    """Open-loop benchmark: dispatch requests at a fixed QPS regardless of
+    downstream latency. Useful for measuring steady-state TTFT at a given
+    load level, NOT for measuring max throughput.
 
     Returns (results, wall_clock_seconds).
     """
     results = []
     interval = 1.0 / qps if qps > 0 else 0
 
-    connector = aiohttp.TCPConnector(limit=100)
+    connector = aiohttp.TCPConnector(limit=1000)
     bench_start = time.perf_counter()
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = []
@@ -169,22 +171,109 @@ async def run_benchmark(
             result = await task
             result["request_id"] = i
             result["type_id"] = type_id
+            result["phase"] = "measure"
             results.append(result)
 
     wall_clock = time.perf_counter() - bench_start
     return results, wall_clock
 
 
+async def run_benchmark_closed(
+    workload: list[dict],
+    server_url: str,
+    model: str,
+    concurrency: int,
+    warmup_requests: int,
+    max_tokens: int = 20,
+) -> tuple[list[dict], float]:
+    """Closed-loop (saturation) benchmark: N workers continuously pull from a
+    shared queue and fire requests as fast as the server accepts them. This
+    drives the system to its throughput ceiling.
+
+    The first `warmup_requests` items are marked as "warmup" and excluded
+    from throughput/latency metrics so that the cache reaches steady state
+    before measurement starts. The measurement window begins when the first
+    non-warmup request is dispatched and ends when the last non-warmup
+    request completes.
+
+    Returns (results, measurement_wall_clock_seconds).
+    """
+    results: list[dict] = []
+    results_lock = asyncio.Lock()
+
+    # Shared index into the workload
+    next_idx = 0
+    idx_lock = asyncio.Lock()
+
+    # Track the measurement window independently of warmup
+    measure_start: float | None = None
+    measure_end: float | None = None
+
+    connector = aiohttp.TCPConnector(limit=max(concurrency * 2, 100))
+    total = len(workload)
+
+    async def worker(session: aiohttp.ClientSession, worker_id: int) -> None:
+        nonlocal next_idx, measure_start, measure_end
+        while True:
+            async with idx_lock:
+                if next_idx >= total:
+                    return
+                i = next_idx
+                next_idx += 1
+
+            item = workload[i]
+            is_warmup = i < warmup_requests
+
+            # Start the measurement clock on the first non-warmup dispatch
+            if not is_warmup and measure_start is None:
+                measure_start = time.perf_counter()
+
+            result = await send_request(
+                session, server_url, model,
+                item["image_path"], max_tokens,
+            )
+            result["request_id"] = i
+            result["type_id"] = item["type_id"]
+            result["phase"] = "warmup" if is_warmup else "measure"
+
+            # Stamp completion time; the last non-warmup completion wins
+            if not is_warmup:
+                measure_end = time.perf_counter()
+
+            async with results_lock:
+                results.append(result)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        workers = [
+            asyncio.create_task(worker(session, w))
+            for w in range(concurrency)
+        ]
+        await asyncio.gather(*workers)
+
+    if measure_start is None or measure_end is None:
+        # Either no warmup occurred or nothing was measured
+        return results, 0.0
+    return results, measure_end - measure_start
+
+
 def compute_metrics(results: list[dict], wall_clock: float = 0.0) -> dict:
-    """Compute aggregate metrics from benchmark results."""
-    successful = [r for r in results if r["success"]]
-    failed = [r for r in results if not r["success"]]
+    """Compute aggregate metrics from benchmark results.
+
+    Requests whose `phase` is "warmup" are excluded from all metrics so that
+    throughput / TTFT reflect steady-state cache behavior. `wall_clock` must
+    already be the measurement-window duration (warmup excluded).
+    """
+    measured = [r for r in results if r.get("phase", "measure") != "warmup"]
+    successful = [r for r in measured if r["success"]]
+    failed = [r for r in measured if not r["success"]]
 
     throughput = (len(successful) / wall_clock) if wall_clock > 0 else 0.0
 
     if not successful:
         return {
             "total_requests": len(results),
+            "measured_requests": len(measured),
+            "warmup_requests": len(results) - len(measured),
             "successful": 0,
             "failed": len(failed),
             "wall_clock_s": wall_clock,
@@ -215,6 +304,8 @@ def compute_metrics(results: list[dict], wall_clock: float = 0.0) -> dict:
 
     return {
         "total_requests": len(results),
+        "measured_requests": len(measured),
+        "warmup_requests": len(results) - len(measured),
         "successful": len(successful),
         "failed": len(failed),
         "wall_clock_s": wall_clock,
@@ -277,8 +368,20 @@ def main():
     parser.add_argument("--model", type=str,
                         default="Qwen/Qwen2.5-VL-3B-Instruct",
                         help="Model name")
+    parser.add_argument("--mode", type=str, default="open",
+                        choices=["open", "closed"],
+                        help="'open' = fixed QPS (latency-at-load test); "
+                        "'closed' = fixed concurrency saturation test "
+                        "(max throughput)")
     parser.add_argument("--qps", type=float, default=2.0,
-                        help="Requests per second")
+                        help="[open mode] Requests per second")
+    parser.add_argument("--concurrency", type=int, default=32,
+                        help="[closed mode] Number of in-flight workers")
+    parser.add_argument("--warmup-requests", type=int, default=0,
+                        help="[closed mode] Number of initial requests to "
+                        "exclude from metrics so the cache reaches steady "
+                        "state. Recommended: at least 2x cache capacity "
+                        "in items.")
     parser.add_argument("--max-tokens", type=int, default=20,
                         help="Max output tokens per request")
     parser.add_argument("--seed", type=int, default=42,
@@ -301,8 +404,13 @@ def main():
         print(f"Normalizing distribution (sum={total_p})")
         distribution = {k: v / total_p for k, v in distribution.items()}
 
-    print(f"Generating workload: {args.num_requests} requests, "
-          f"QPS={args.qps}, seed={args.seed}")
+    if args.mode == "closed":
+        print(f"Generating workload: {args.num_requests} requests "
+              f"(warmup={args.warmup_requests}), "
+              f"concurrency={args.concurrency}, seed={args.seed}")
+    else:
+        print(f"Generating workload: {args.num_requests} requests, "
+              f"QPS={args.qps}, seed={args.seed}")
     workload = generate_workload(
         manifest, distribution, args.num_requests, args.seed
     )
@@ -319,10 +427,20 @@ def main():
               f"({count/len(workload)*100:.1f}%)")
 
     print(f"\nSending requests to {args.server_url}...")
-    results, wall_clock = asyncio.run(
-        run_benchmark(workload, args.server_url, args.model,
-                      args.qps, args.max_tokens)
-    )
+    if args.mode == "closed":
+        results, wall_clock = asyncio.run(
+            run_benchmark_closed(
+                workload, args.server_url, args.model,
+                args.concurrency, args.warmup_requests, args.max_tokens,
+            )
+        )
+    else:
+        results, wall_clock = asyncio.run(
+            run_benchmark_open(
+                workload, args.server_url, args.model,
+                args.qps, args.max_tokens,
+            )
+        )
 
     metrics = compute_metrics(results, wall_clock)
     print_results(metrics, args.label)
@@ -338,8 +456,11 @@ def main():
     output = {
         "label": args.label,
         "config": {
+            "mode": args.mode,
             "num_requests": args.num_requests,
             "qps": args.qps,
+            "concurrency": args.concurrency,
+            "warmup_requests": args.warmup_requests,
             "seed": args.seed,
             "distribution": distribution,
         },
