@@ -322,24 +322,88 @@ def compute_metrics(results: list[dict], wall_clock: float = 0.0) -> dict:
     }
 
 
-def print_results(metrics: dict, label: str = "") -> None:
-    """Print benchmark results in a table."""
+def aggregate_rounds(round_metrics: list[dict]) -> dict:
+    """Aggregate metrics across multiple rounds into mean ± std."""
+    if len(round_metrics) == 1:
+        # Single round: just copy the metrics, std = 0
+        m = round_metrics[0]
+        agg = {}
+        for key in ("throughput_rps", "ttft_mean_ms", "ttft_median_ms",
+                     "ttft_p95_ms", "ttft_p99_ms", "latency_mean_ms",
+                     "latency_median_ms"):
+            val = m.get(key)
+            if val is not None:
+                agg[key] = {"mean": val, "std": 0.0}
+        agg["successful"] = {
+            "mean": m.get("successful", 0), "std": 0.0,
+        }
+        agg["failed"] = {
+            "mean": m.get("failed", 0), "std": 0.0,
+        }
+        return agg
+
+    agg = {}
+    for key in ("throughput_rps", "ttft_mean_ms", "ttft_median_ms",
+                 "ttft_p95_ms", "ttft_p99_ms", "latency_mean_ms",
+                 "latency_median_ms"):
+        vals = [m[key] for m in round_metrics if key in m and m[key] is not None]
+        if vals:
+            agg[key] = {
+                "mean": statistics.mean(vals),
+                "std": statistics.stdev(vals) if len(vals) > 1 else 0.0,
+            }
+    for key in ("successful", "failed"):
+        vals = [m.get(key, 0) for m in round_metrics]
+        agg[key] = {
+            "mean": statistics.mean(vals),
+            "std": statistics.stdev(vals) if len(vals) > 1 else 0.0,
+        }
+    return agg
+
+
+def print_results(metrics: dict, label: str = "",
+                  aggregated: dict | None = None,
+                  num_rounds: int = 1) -> None:
+    """Print benchmark results in a table.
+
+    If aggregated is provided (multi-round), show mean ± std format.
+    Otherwise show single-round metrics.
+    """
     header = f"Benchmark Results{f' ({label})' if label else ''}"
     print("=" * 60)
     print(header)
+    if num_rounds > 1:
+        print(f"  ({num_rounds} rounds aggregated)")
     print("=" * 60)
-    print(f"Total requests:    {metrics['total_requests']}")
-    print(f"Successful:        {metrics['successful']}")
-    print(f"Failed:            {metrics['failed']}")
-    print(f"Wall clock:        {metrics.get('wall_clock_s', 0):.2f} s")
-    print(f"Throughput:        {metrics.get('throughput_rps', 0):.2f} req/s")
-    print(f"TTFT mean:         {metrics.get('ttft_mean_ms', 'N/A'):.2f} ms")
-    print(f"TTFT median:       {metrics.get('ttft_median_ms', 'N/A'):.2f} ms")
-    print(f"TTFT p95:          {metrics.get('ttft_p95_ms', 'N/A'):.2f} ms")
-    print(f"TTFT p99:          {metrics.get('ttft_p99_ms', 'N/A'):.2f} ms")
-    print(f"Latency mean:      {metrics.get('latency_mean_ms', 'N/A'):.2f} ms")
-    print()
 
+    if aggregated and num_rounds > 1:
+        def fmt_agg(key: str) -> str:
+            v = aggregated.get(key)
+            if v is None:
+                return "N/A"
+            return f"{v['mean']:.2f} ± {v['std']:.2f}"
+
+        print(f"Successful:        {fmt_agg('successful')}")
+        print(f"Failed:            {fmt_agg('failed')}")
+        print(f"Throughput:        {fmt_agg('throughput_rps')} req/s")
+        print(f"TTFT mean:         {fmt_agg('ttft_mean_ms')} ms")
+        print(f"TTFT median:       {fmt_agg('ttft_median_ms')} ms")
+        print(f"TTFT p95:          {fmt_agg('ttft_p95_ms')} ms")
+        print(f"TTFT p99:          {fmt_agg('ttft_p99_ms')} ms")
+        print(f"Latency mean:      {fmt_agg('latency_mean_ms')} ms")
+    else:
+        print(f"Total requests:    {metrics['total_requests']}")
+        print(f"Successful:        {metrics['successful']}")
+        print(f"Failed:            {metrics['failed']}")
+        print(f"Wall clock:        {metrics.get('wall_clock_s', 0):.2f} s")
+        print(f"Throughput:        {metrics.get('throughput_rps', 0):.2f} req/s")
+        print(f"TTFT mean:         {metrics.get('ttft_mean_ms', 'N/A'):.2f} ms")
+        print(f"TTFT median:       {metrics.get('ttft_median_ms', 'N/A'):.2f} ms")
+        print(f"TTFT p95:          {metrics.get('ttft_p95_ms', 'N/A'):.2f} ms")
+        print(f"TTFT p99:          {metrics.get('ttft_p99_ms', 'N/A'):.2f} ms")
+        print(f"Latency mean:      {metrics.get('latency_mean_ms', 'N/A'):.2f} ms")
+
+    print()
     if "per_type" in metrics:
         print(f"{'Type':<12} {'Count':<8} {'TTFT mean':<12} "
               f"{'TTFT median':<12} {'TTFT p95':<12}")
@@ -386,6 +450,10 @@ def main():
                         help="Max output tokens per request")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for workload generation")
+    parser.add_argument("--num-rounds", type=int, default=1,
+                        help="Number of independent rounds to run. Each "
+                        "round uses a different seed (seed + round_idx) "
+                        "and the results are aggregated with mean ± std.")
     parser.add_argument("--output-path", type=str, default=None,
                         help="Path for output results JSON")
     parser.add_argument("--label", type=str, default="",
@@ -404,46 +472,74 @@ def main():
         print(f"Normalizing distribution (sum={total_p})")
         distribution = {k: v / total_p for k, v in distribution.items()}
 
-    if args.mode == "closed":
-        print(f"Generating workload: {args.num_requests} requests "
-              f"(warmup={args.warmup_requests}), "
-              f"concurrency={args.concurrency}, seed={args.seed}")
-    else:
-        print(f"Generating workload: {args.num_requests} requests, "
-              f"QPS={args.qps}, seed={args.seed}")
-    workload = generate_workload(
-        manifest, distribution, args.num_requests, args.seed
-    )
+    num_rounds = args.num_rounds
+    per_round_metrics: list[dict] = []
+    last_metrics: dict = {}
+    last_results: list[dict] = []
 
-    # Print distribution summary
-    type_counts: dict[str, int] = {}
-    for item in workload:
-        type_counts[item["type_id"]] = type_counts.get(
-            item["type_id"], 0
-        ) + 1
-    print("Workload distribution:")
-    for tid, count in sorted(type_counts.items()):
-        print(f"  {tid}: {count} requests "
-              f"({count/len(workload)*100:.1f}%)")
+    for round_idx in range(num_rounds):
+        round_seed = args.seed + round_idx
 
-    print(f"\nSending requests to {args.server_url}...")
-    if args.mode == "closed":
-        results, wall_clock = asyncio.run(
-            run_benchmark_closed(
-                workload, args.server_url, args.model,
-                args.concurrency, args.warmup_requests, args.max_tokens,
-            )
-        )
-    else:
-        results, wall_clock = asyncio.run(
-            run_benchmark_open(
-                workload, args.server_url, args.model,
-                args.qps, args.max_tokens,
-            )
+        if num_rounds > 1:
+            print(f"\n{'='*60}")
+            print(f"Round {round_idx + 1}/{num_rounds} (seed={round_seed})")
+            print(f"{'='*60}")
+
+        if args.mode == "closed":
+            print(f"Generating workload: {args.num_requests} requests "
+                  f"(warmup={args.warmup_requests}), "
+                  f"concurrency={args.concurrency}, seed={round_seed}")
+        else:
+            print(f"Generating workload: {args.num_requests} requests, "
+                  f"QPS={args.qps}, seed={round_seed}")
+
+        workload = generate_workload(
+            manifest, distribution, args.num_requests, round_seed,
         )
 
-    metrics = compute_metrics(results, wall_clock)
-    print_results(metrics, args.label)
+        # Print distribution summary (only on first round)
+        if round_idx == 0:
+            type_counts: dict[str, int] = {}
+            for item in workload:
+                type_counts[item["type_id"]] = type_counts.get(
+                    item["type_id"], 0
+                ) + 1
+            print("Workload distribution:")
+            for tid, count in sorted(type_counts.items()):
+                print(f"  {tid}: {count} requests "
+                      f"({count/len(workload)*100:.1f}%)")
+
+        print(f"\nSending requests to {args.server_url}...")
+        if args.mode == "closed":
+            results, wall_clock = asyncio.run(
+                run_benchmark_closed(
+                    workload, args.server_url, args.model,
+                    args.concurrency, args.warmup_requests, args.max_tokens,
+                )
+            )
+        else:
+            results, wall_clock = asyncio.run(
+                run_benchmark_open(
+                    workload, args.server_url, args.model,
+                    args.qps, args.max_tokens,
+                )
+            )
+
+        metrics = compute_metrics(results, wall_clock)
+        per_round_metrics.append(metrics)
+        last_metrics = metrics
+        last_results = results
+
+        if num_rounds > 1:
+            print(f"  Round {round_idx + 1}: throughput="
+                  f"{metrics.get('throughput_rps', 0):.2f} req/s, "
+                  f"ttft_mean={metrics.get('ttft_mean_ms', 0):.2f} ms, "
+                  f"successful={metrics.get('successful', 0)}, "
+                  f"failed={metrics.get('failed', 0)}")
+
+    # Aggregate across rounds
+    aggregated = aggregate_rounds(per_round_metrics)
+    print_results(last_metrics, args.label, aggregated, num_rounds)
 
     # Save results
     output_path = args.output_path
@@ -462,10 +558,13 @@ def main():
             "concurrency": args.concurrency,
             "warmup_requests": args.warmup_requests,
             "seed": args.seed,
+            "num_rounds": num_rounds,
             "distribution": distribution,
         },
-        "metrics": metrics,
-        "raw_results": results,
+        "metrics": last_metrics,
+        "aggregated": aggregated,
+        "per_round": per_round_metrics,
+        "raw_results": last_results,
     }
 
     with open(output_path, "w") as f:

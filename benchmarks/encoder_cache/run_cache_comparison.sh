@@ -41,6 +41,9 @@ CONCURRENCY="${CONCURRENCY:-32}"
 # Warmup requests are excluded from metrics so the cache reaches steady
 # state before measurement begins.
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-400}"
+# Number of independent rounds per policy. Each round uses a different
+# seed; results are aggregated with mean ± std to reduce noise.
+NUM_ROUNDS="${NUM_ROUNDS:-3}"
 SEED="${SEED:-42}"
 CACHE_BUDGET="${CACHE_BUDGET:-2000}"
 
@@ -342,6 +345,7 @@ run_trial() {
         --qps "$QPS" \
         --concurrency "$CONCURRENCY" \
         --warmup-requests "$WARMUP_REQUESTS" \
+        --num-rounds "$NUM_ROUNDS" \
         --seed "$SEED" \
         --label "$label" \
         --output-path "$WORK_DIR/results_${label}.json"
@@ -376,30 +380,51 @@ python -c "
 import json
 
 with open('$WORK_DIR/results_none.json') as f:
-    none_r = json.load(f)['metrics']
+    none_data = json.load(f)
 with open('$WORK_DIR/results_fifo.json') as f:
-    fifo_r = json.load(f)['metrics']
+    fifo_data = json.load(f)
 with open('$WORK_DIR/results_dist_aware.json') as f:
-    dist_r = json.load(f)['metrics']
+    dist_data = json.load(f)
 
-def fmt(v):
+# Use aggregated means when available (multi-round), fall back to metrics
+def get_val(data, key):
+    agg = data.get('aggregated', {})
+    if key in agg:
+        return agg[key]['mean']
+    return data.get('metrics', {}).get(key, 0)
+
+def get_std(data, key):
+    agg = data.get('aggregated', {})
+    if key in agg:
+        return agg[key].get('std', 0)
+    return 0
+
+num_rounds = none_data.get('config', {}).get('num_rounds', 1)
+
+def fmt(data, key):
+    v = get_val(data, key)
+    s = get_std(data, key)
+    if s > 0:
+        return f'{v:.2f}+/-{s:.2f}'
     return f'{v:.2f}' if isinstance(v, (int, float)) else str(v)
 
-def imp(base, new, higher_is_better=False):
+def imp(base_data, new_data, key, higher_is_better=False):
+    base = get_val(base_data, key)
+    new = get_val(new_data, key)
     if base in (0, None) or new in (0, None):
         return 'N/A'
     delta = (new - base) / base * 100
     if higher_is_better:
         return f'{delta:+.1f}%'
-    return f'{-delta:+.1f}%'  # show reduction as positive
+    return f'{-delta:+.1f}%'
 
 print()
-print('=' * 90)
-print('Encoder Cache Policy Comparison (vs no-cache baseline)')
-print('=' * 90)
-print(f\"{'Metric':<22} {'None':<14} {'FIFO':<14} {'Dist-Aware':<14}\"
-      f\"{'FIFO vs None':<14} {'Dist vs None':<14}\")
-print('-' * 90)
+print('=' * 100)
+print(f'Encoder Cache Policy Comparison (vs no-cache baseline, {num_rounds} round(s))')
+print('=' * 100)
+print(f\"{'Metric':<22} {'None':<18} {'FIFO':<18} {'Dist-Aware':<18}\"
+      f\"{'FIFO vs None':<12} {'Dist vs None':<12}\")
+print('-' * 100)
 
 # (metric_key, label, higher_is_better)
 metrics = [
@@ -409,26 +434,39 @@ metrics = [
     ('ttft_p99_ms',      'TTFT P99 (ms)',      False),
     ('latency_mean_ms',  'Latency Mean (ms)',  False),
     ('throughput_rps',   'Throughput (req/s)', True),
-    ('wall_clock_s',     'Wall Clock (s)',     False),
 ]
 
 for key, label, higher in metrics:
-    nv = none_r.get(key, 0)
-    fv = fifo_r.get(key, 0)
-    dv = dist_r.get(key, 0)
-    print(f'{label:<22} {fmt(nv):<14} {fmt(fv):<14} {fmt(dv):<14}'
-          f'{imp(nv, fv, higher):<14} {imp(nv, dv, higher):<14}')
+    print(f'{label:<22} {fmt(none_data, key):<18} '
+          f'{fmt(fifo_data, key):<18} {fmt(dist_data, key):<18}'
+          f'{imp(none_data, fifo_data, key, higher):<12} '
+          f'{imp(none_data, dist_data, key, higher):<12}')
 
 print()
-print(f\"{'Successful':<22} {none_r['successful']:<14} {fifo_r['successful']:<14} \"
-      f\"{dist_r['successful']:<14}\")
-print(f\"{'Failed':<22} {none_r['failed']:<14} {fifo_r['failed']:<14} \"
-      f\"{dist_r['failed']:<14}\")
+ns = fmt(none_data, 'successful')
+fs = fmt(fifo_data, 'successful')
+ds = fmt(dist_data, 'successful')
+print(f\"{'Successful':<22} {ns:<18} {fs:<18} {ds:<18}\")
+nf = fmt(none_data, 'failed')
+ff = fmt(fifo_data, 'failed')
+df = fmt(dist_data, 'failed')
+print(f\"{'Failed':<22} {nf:<18} {ff:<18} {df:<18}\")
+
+# Per-type breakdown uses last-round metrics (not aggregated)
+none_r = none_data['metrics']
+fifo_r = fifo_data['metrics']
+dist_r = dist_data['metrics']
+
 print()
-print('Per-Type TTFT Median (ms):')
+print('Per-Type TTFT Median (ms) [last round]:')
 print(f\"{'Type':<10} {'None':<14} {'FIFO':<14} {'Dist-Aware':<14}\"
       f\"{'FIFO vs None':<14} {'Dist vs None':<14}\")
 print('-' * 80)
+
+def imp_val(base, new):
+    if base in (0, None) or new in (0, None):
+        return 'N/A'
+    return f'{-(new - base) / base * 100:+.1f}%'
 
 all_types = (
     set(none_r.get('per_type', {}).keys())
@@ -439,12 +477,13 @@ for tid in sorted(all_types):
     nt = none_r.get('per_type', {}).get(tid, {}).get('ttft_median_ms', 0)
     ft = fifo_r.get('per_type', {}).get(tid, {}).get('ttft_median_ms', 0)
     dt = dist_r.get('per_type', {}).get(tid, {}).get('ttft_median_ms', 0)
-    print(f'{tid:<10} {fmt(nt):<14} {fmt(ft):<14} {fmt(dt):<14}'
-          f'{imp(nt, ft):<14} {imp(nt, dt):<14}')
+    print(f'{tid:<10} {nt:<14.2f} {ft:<14.2f} {dt:<14.2f}'
+          f'{imp_val(nt, ft):<14} {imp_val(nt, dt):<14}')
 
 print()
-print('Note: Improvement columns show TTFT/latency reduction (positive is')
-print('better) or throughput gain (positive is better).')
+if num_rounds > 1:
+    print(f'Values shown as mean+/-std across {num_rounds} rounds.')
+print('Improvement: TTFT/latency reduction or throughput gain (positive = better).')
 print()
 print(f'Full results saved in: $WORK_DIR/')
 "
