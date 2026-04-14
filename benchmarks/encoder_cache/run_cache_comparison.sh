@@ -78,6 +78,12 @@ DISTRIBUTION="${DISTRIBUTION:-}"
 export UCX_TLS=all
 export UCX_NET_DEVICES=all
 
+# GPU frequency locking: set to a fixed clock (MHz) to reduce variance.
+# Set to "" to skip locking. Use `nvidia-smi -q -d SUPPORTED_CLOCKS` to
+# find valid values for your GPU.
+GPU_LOCK_GC="${GPU_LOCK_GC:-}"    # graphics clock, e.g. "1410"
+GPU_LOCK_MC="${GPU_LOCK_MC:-}"    # memory clock, e.g. "1593"
+
 ###############################################################################
 # Setup
 ###############################################################################
@@ -89,6 +95,54 @@ mkdir -p "$WORK_DIR" "$IMAGE_DIR" "$LOG_PATH"
 declare -a PIDS=()
 
 START_TIME=$(date +"%Y%m%d_%H%M%S")
+
+# Collect unique GPU IDs used by this benchmark
+declare -a USED_GPUS=()
+for g in "$GPU_E" "$GPU_P" "$GPU_D"; do
+    local_dup=false
+    for existing in "${USED_GPUS[@]+"${USED_GPUS[@]}"}"; do
+        if [ "$existing" = "$g" ]; then
+            local_dup=true
+            break
+        fi
+    done
+    if [ "$local_dup" = false ]; then
+        USED_GPUS+=("$g")
+    fi
+done
+
+lock_gpu_clocks() {
+    if [ -z "$GPU_LOCK_GC" ] && [ -z "$GPU_LOCK_MC" ]; then
+        return
+    fi
+    echo "Locking GPU clocks for GPUs: ${USED_GPUS[*]}"
+    for gpu_id in "${USED_GPUS[@]}"; do
+        sudo nvidia-smi -pm 1 -i "$gpu_id"
+        if [ -n "$GPU_LOCK_GC" ]; then
+            sudo nvidia-smi -lgc "$GPU_LOCK_GC","$GPU_LOCK_GC" -i "$gpu_id"
+            echo "  GPU $gpu_id: graphics clock locked to ${GPU_LOCK_GC} MHz"
+        fi
+        if [ -n "$GPU_LOCK_MC" ]; then
+            sudo nvidia-smi -lmc "$GPU_LOCK_MC","$GPU_LOCK_MC" -i "$gpu_id"
+            echo "  GPU $gpu_id: memory clock locked to ${GPU_LOCK_MC} MHz"
+        fi
+    done
+}
+
+unlock_gpu_clocks() {
+    if [ -z "$GPU_LOCK_GC" ] && [ -z "$GPU_LOCK_MC" ]; then
+        return
+    fi
+    echo "Unlocking GPU clocks for GPUs: ${USED_GPUS[*]}"
+    for gpu_id in "${USED_GPUS[@]}"; do
+        if [ -n "$GPU_LOCK_GC" ]; then
+            sudo nvidia-smi -rgc -i "$gpu_id" 2>/dev/null || true
+        fi
+        if [ -n "$GPU_LOCK_MC" ]; then
+            sudo nvidia-smi -rmc -i "$gpu_id" 2>/dev/null || true
+        fi
+    done
+}
 
 wait_for_server() {
     local port=$1
@@ -117,7 +171,7 @@ cleanup_servers() {
     echo "All servers stopped."
 }
 
-trap 'cleanup_servers; exit 1' INT TERM
+trap 'cleanup_servers; unlock_gpu_clocks; exit 1' INT TERM
 
 ###############################################################################
 # Helper: Start full 1E1P1D stack
@@ -357,8 +411,10 @@ run_trial() {
 }
 
 ###############################################################################
-# Step 5: Benchmark no-cache baseline
+# Step 5: Lock GPU clocks and benchmark
 ###############################################################################
+lock_gpu_clocks
+
 run_trial "none" "none"
 
 ###############################################################################
@@ -370,6 +426,8 @@ run_trial "fifo" "fifo"
 # Step 6.5: Benchmark Distribution-Aware policy
 ###############################################################################
 run_trial "distribution_aware" "dist_aware" "$DIST_CONFIG_PATH"
+
+unlock_gpu_clocks
 
 ###############################################################################
 # Step 7: Compare results (None / FIFO / Dist-Aware)
