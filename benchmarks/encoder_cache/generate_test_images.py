@@ -88,12 +88,18 @@ def main():
 
     manifest_path = args.manifest_path or str(output_dir / "manifest.json")
 
-    resolutions = DEFAULT_RESOLUTIONS[:K]
-    if K > len(DEFAULT_RESOLUTIONS):
-        # Generate additional resolutions by scaling
-        for i in range(len(DEFAULT_RESOLUTIONS), K):
-            base = 224 + i * 112
-            resolutions.append((base, base))
+    if K <= len(DEFAULT_RESOLUTIONS):
+        resolutions = DEFAULT_RESOLUTIONS[:K]
+    else:
+        # Generate K resolutions evenly spaced within the default range
+        # (224 to 448) so we never exceed the largest default resolution.
+        min_res = DEFAULT_RESOLUTIONS[0][0]
+        max_res = DEFAULT_RESOLUTIONS[-1][0]
+        step = (max_res - min_res) / (K - 1) if K > 1 else 0
+        resolutions = [
+            (round(min_res + i * step), round(min_res + i * step))
+            for i in range(K)
+        ]
 
     manifest = {}
     for i in range(K):
