@@ -26,6 +26,21 @@ from pathlib import Path
 import aiohttp
 
 
+import requests as http_requests
+
+
+def reset_encoder_cache(encoder_url: str) -> None:
+    """Reset the encoder cache on the encoder worker.
+
+    Requires VLLM_SERVER_DEV_MODE=1 on the encoder worker.
+    """
+    resp = http_requests.post(
+        f"{encoder_url}/reset_encoder_cache", timeout=30,
+    )
+    resp.raise_for_status()
+    print(f"  Encoder cache reset via {encoder_url}")
+
+
 def encode_image_to_base64(image_path: str) -> str:
     with open(image_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
@@ -454,6 +469,12 @@ def main():
                         help="Number of independent rounds to run. Each "
                         "round uses a different seed (seed + round_idx) "
                         "and the results are aggregated with mean ± std.")
+    parser.add_argument("--encoder-url", type=str, default=None,
+                        help="URL of the encoder worker (e.g. "
+                        "http://localhost:19534). If provided, the encoder "
+                        "cache is reset via POST /reset_encoder_cache "
+                        "before each round (requires VLLM_SERVER_DEV_MODE=1 "
+                        "on the encoder worker).")
     parser.add_argument("--output-path", type=str, default=None,
                         help="Path for output results JSON")
     parser.add_argument("--label", type=str, default="",
@@ -484,6 +505,10 @@ def main():
             print(f"\n{'='*60}")
             print(f"Round {round_idx + 1}/{num_rounds} (seed={round_seed})")
             print(f"{'='*60}")
+
+        # Reset encoder cache before each round so all rounds start cold
+        if args.encoder_url:
+            reset_encoder_cache(args.encoder_url)
 
         if args.mode == "closed":
             print(f"Generating workload: {args.num_requests} requests "

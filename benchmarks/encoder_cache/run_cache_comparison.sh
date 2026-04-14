@@ -130,8 +130,9 @@ start_1e1p1d() {
     rm -rf "$EC_SHARED_STORAGE_PATH"
     mkdir -p "$EC_SHARED_STORAGE_PATH"
 
-    # Encoder worker
+    # Encoder worker (dev mode enables /reset_encoder_cache endpoint)
     CUDA_VISIBLE_DEVICES="$GPU_E" \
+    VLLM_SERVER_DEV_MODE=1 \
     VLLM_ENCODER_CACHE_POLICY="$policy" \
     VLLM_ENCODER_CACHE_CONFIG_PATH="$config_path" \
     vllm serve "$MODEL" \
@@ -346,6 +347,7 @@ run_trial() {
         --concurrency "$CONCURRENCY" \
         --warmup-requests "$WARMUP_REQUESTS" \
         --num-rounds "$NUM_ROUNDS" \
+        --encoder-url "http://localhost:$ENCODE_PORT" \
         --seed "$SEED" \
         --label "$label" \
         --output-path "$WORK_DIR/results_${label}.json"
