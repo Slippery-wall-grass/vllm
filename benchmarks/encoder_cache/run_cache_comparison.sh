@@ -120,13 +120,13 @@ lock_gpu_clocks() {
     fi
     echo "Locking GPU clocks for GPUs: ${USED_GPUS[*]}"
     for gpu_id in "${USED_GPUS[@]}"; do
-        sudo nvidia-smi -pm 1 -i "$gpu_id"
+        nvidia-smi -pm 1 -i "$gpu_id"
         if [ -n "$GPU_LOCK_GC" ]; then
-            sudo nvidia-smi -lgc "$GPU_LOCK_GC","$GPU_LOCK_GC" -i "$gpu_id"
+            nvidia-smi -lgc "$GPU_LOCK_GC","$GPU_LOCK_GC" -i "$gpu_id"
             echo "  GPU $gpu_id: graphics clock locked to ${GPU_LOCK_GC} MHz"
         fi
         if [ -n "$GPU_LOCK_MC" ]; then
-            sudo nvidia-smi -lmc "$GPU_LOCK_MC","$GPU_LOCK_MC" -i "$gpu_id"
+            nvidia-smi -lmc "$GPU_LOCK_MC","$GPU_LOCK_MC" -i "$gpu_id"
             echo "  GPU $gpu_id: memory clock locked to ${GPU_LOCK_MC} MHz"
         fi
     done
@@ -139,10 +139,10 @@ unlock_gpu_clocks() {
     echo "Unlocking GPU clocks for GPUs: ${USED_GPUS[*]}"
     for gpu_id in "${USED_GPUS[@]}"; do
         if [ -n "$GPU_LOCK_GC" ]; then
-            sudo nvidia-smi -rgc -i "$gpu_id" 2>/dev/null || true
+            nvidia-smi -rgc -i "$gpu_id" 2>/dev/null || true
         fi
         if [ -n "$GPU_LOCK_MC" ]; then
-            sudo nvidia-smi -rmc -i "$gpu_id" 2>/dev/null || true
+            nvidia-smi -rmc -i "$gpu_id" 2>/dev/null || true
         fi
     done
 }
