@@ -25,6 +25,12 @@
 #
 # BENCH_MODE=closed (default) runs a fixed-concurrency saturation test and
 # reports max throughput; BENCH_MODE=open fires at fixed QPS (uses $QPS).
+#
+# To use images from a real dataset (e.g. VisionArena-Chat) instead of the
+# synthetic generator, run preprocess_real_dataset.py first, then:
+#   SKIP_GENERATION=1 WORK_DIR=/tmp/real_data IMAGE_DIR=/tmp/real_data/images \
+#     DISTRIBUTION="$(cat /tmp/real_data/distribution_real.json)" \
+#     bash run_cache_comparison.sh
 set -euo pipefail
 
 ###############################################################################
@@ -277,25 +283,42 @@ start_1e1p1d() {
 }
 
 ###############################################################################
-# Step 1: Generate test images
+# Step 1 + 2: Generate test images and distribution (or reuse existing)
 ###############################################################################
-echo "============================================================"
-echo "Step 1: Generating $NUM_TYPES test image types"
-echo "============================================================"
+if [ "${SKIP_GENERATION:-0}" = "1" ]; then
+    echo "============================================================"
+    echo "SKIP_GENERATION=1 — reusing existing manifest and distribution"
+    echo "============================================================"
+    MANIFEST_PATH="${MANIFEST_PATH:-$WORK_DIR/manifest.json}"
+    if [ ! -f "$MANIFEST_PATH" ]; then
+        echo "ERROR: SKIP_GENERATION=1 but $MANIFEST_PATH does not exist."
+        echo "Run preprocess_real_dataset.py first, or unset SKIP_GENERATION."
+        exit 1
+    fi
+    if [ -z "$DISTRIBUTION" ]; then
+        echo "ERROR: SKIP_GENERATION=1 but DISTRIBUTION env var is empty."
+        echo "Pass DISTRIBUTION=\"\$(cat .../distribution_real.json)\""
+        exit 1
+    fi
+    echo "Using manifest: $MANIFEST_PATH"
+else
+    echo "============================================================"
+    echo "Step 1: Generating $NUM_TYPES test image types"
+    echo "============================================================"
 
-python "$SCRIPT_DIR/generate_test_images.py" \
-    --num-types "$NUM_TYPES" \
-    --output-dir "$IMAGE_DIR" \
-    --manifest-path "$WORK_DIR/manifest.json"
+    python "$SCRIPT_DIR/generate_test_images.py" \
+        --num-types "$NUM_TYPES" \
+        --output-dir "$IMAGE_DIR" \
+        --manifest-path "$WORK_DIR/manifest.json"
 
-MANIFEST_PATH="$WORK_DIR/manifest.json"
+    MANIFEST_PATH="$WORK_DIR/manifest.json"
 
-###############################################################################
-# Step 2: Generate distribution if not provided
-###############################################################################
-if [ -z "$DISTRIBUTION" ]; then
-    echo "Generating Zipf-like distribution for $NUM_TYPES types..."
-    DISTRIBUTION=$(python -c "
+    ###########################################################################
+    # Step 2: Generate distribution if not provided
+    ###########################################################################
+    if [ -z "$DISTRIBUTION" ]; then
+        echo "Generating Zipf-like distribution for $NUM_TYPES types..."
+        DISTRIBUTION=$(python -c "
 import json, math
 K = $NUM_TYPES
 # Zipf distribution: p_i proportional to 1/i
@@ -307,6 +330,7 @@ remainder = round(1.0 - sum(dist.values()), 4)
 dist['type_0'] = round(dist['type_0'] + remainder, 4)
 print(json.dumps(dist))
 ")
+    fi
 fi
 
 echo "Distribution: $DISTRIBUTION"
