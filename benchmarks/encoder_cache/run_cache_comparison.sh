@@ -63,7 +63,10 @@ GPU_MEM_E="${GPU_MEM_E:-0.10}"
 GPU_MEM_P="${GPU_MEM_P:-0.60}"
 GPU_MEM_D="${GPU_MEM_D:-0.70}"
 
-EC_SHARED_STORAGE_PATH="${EC_SHARED_STORAGE_PATH:-/tmp/ec_cache}"
+# Use /dev/shm (tmpfs in memory) by default to avoid disk IO jitter on
+# every encoder->prefill transfer. /dev/shm is a built-in tmpfs on almost
+# every Linux system - no mount / sudo required.
+EC_SHARED_STORAGE_PATH="${EC_SHARED_STORAGE_PATH:-/dev/shm/ec_cache}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-600}"
 
 # Working directories
@@ -411,8 +414,13 @@ run_trial() {
 }
 
 ###############################################################################
-# Step 5: Lock GPU clocks and benchmark
+# Step 5: Lock GPU clocks, pre-warm page cache, benchmark
 ###############################################################################
+# Pre-read all images into the page cache so the first round doesn't pay the
+# cold-read penalty (improves consistency across rounds).
+echo "Pre-loading test images into page cache..."
+cat "$IMAGE_DIR"/*.jpg > /dev/null 2>&1 || true
+
 lock_gpu_clocks
 
 run_trial "none" "none"
