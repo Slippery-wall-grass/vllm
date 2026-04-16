@@ -475,6 +475,11 @@ def main():
                         "cache is reset via POST /reset_encoder_cache "
                         "before each round (requires VLLM_SERVER_DEV_MODE=1 "
                         "on the encoder worker).")
+    parser.add_argument("--global-warmup", type=int, default=20,
+                        help="Number of requests to send before round 1 to "
+                        "warm up CUDA kernels, cuDNN autotuning, and TCP "
+                        "connections. These are fully discarded and do not "
+                        "appear in any metrics. Set to 0 to skip.")
     parser.add_argument("--output-path", type=str, default=None,
                         help="Path for output results JSON")
     parser.add_argument("--label", type=str, default="",
@@ -492,6 +497,28 @@ def main():
     if abs(total_p - 1.0) > 0.01:
         print(f"Normalizing distribution (sum={total_p})")
         distribution = {k: v / total_p for k, v in distribution.items()}
+
+    # Global warmup: send a few throwaway requests to warm up CUDA kernels,
+    # cuDNN autotuning, PyTorch memory allocator, and TCP connection pools.
+    # Without this, the first round has ~5x higher TTFT than subsequent ones.
+    if args.global_warmup > 0:
+        print(f"\nGlobal warmup: sending {args.global_warmup} throwaway "
+              f"requests to warm up CUDA / cuDNN / connections...")
+        warmup_wl = generate_workload(
+            manifest, distribution, args.global_warmup, seed=0,
+        )
+        if args.mode == "closed":
+            asyncio.run(run_benchmark_closed(
+                warmup_wl, args.server_url, args.model,
+                min(args.concurrency, args.global_warmup),
+                warmup_requests=0, max_tokens=args.max_tokens,
+            ))
+        else:
+            asyncio.run(run_benchmark_open(
+                warmup_wl, args.server_url, args.model,
+                args.qps, args.max_tokens,
+            ))
+        print("Global warmup done.\n")
 
     num_rounds = args.num_rounds
     per_round_metrics: list[dict] = []
