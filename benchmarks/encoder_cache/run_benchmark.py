@@ -521,9 +521,13 @@ def main():
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for workload generation")
     parser.add_argument("--num-rounds", type=int, default=1,
-                        help="Number of independent rounds to run. Each "
-                        "round uses a different seed (seed + round_idx) "
-                        "and the results are aggregated with mean ± std.")
+                        help="Number of independent rounds to run. "
+                        "Results are aggregated with mean ± std.")
+    parser.add_argument("--fix-seed-across-rounds", action="store_true",
+                        default=False,
+                        help="Use the same seed for all rounds (isolate "
+                        "hardware noise). Default: each round uses "
+                        "seed + round_idx (captures ordering sensitivity).")
     parser.add_argument("--encoder-url", type=str, default=None,
                         help="URL of the encoder worker (e.g. "
                         "http://localhost:19534). If provided, the encoder "
@@ -581,7 +585,8 @@ def main():
     last_results: list[dict] = []
 
     for round_idx in range(num_rounds):
-        round_seed = args.seed + round_idx
+        round_seed = (args.seed if args.fix_seed_across_rounds
+                       else args.seed + round_idx)
 
         if num_rounds > 1:
             print(f"\n{'='*60}")

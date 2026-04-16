@@ -319,15 +319,20 @@ else
     if [ -z "$DISTRIBUTION" ]; then
         echo "Generating Zipf-like distribution for $NUM_TYPES types..."
         DISTRIBUTION=$(python -c "
-import json, math
+import json, random
 K = $NUM_TYPES
-# Zipf distribution: p_i proportional to 1/i
+# Zipf weights: 1/1, 1/2, ..., 1/K
 raw = [1.0/(i+1) for i in range(K)]
+# Shuffle so the highest probability is NOT always on the smallest
+# resolution (type_0). This way p_i and m_i are decorrelated.
+random.seed($SEED)
+random.shuffle(raw)
 total = sum(raw)
 dist = {f'type_{i}': round(raw[i]/total, 4) for i in range(K)}
 # Fix rounding
 remainder = round(1.0 - sum(dist.values()), 4)
-dist['type_0'] = round(dist['type_0'] + remainder, 4)
+first_key = f'type_0'
+dist[first_key] = round(dist[first_key] + remainder, 4)
 print(json.dumps(dist))
 ")
     fi
