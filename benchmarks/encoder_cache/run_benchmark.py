@@ -134,21 +134,27 @@ async def send_request(
                         except json.JSONDecodeError:
                             pass
 
-        total_latency = time.perf_counter() - start_time
+        end_time = time.perf_counter()
+        total_latency = end_time - start_time
 
         return {
             "ttft": ttft,
             "total_latency": total_latency,
             "output_tokens": output_tokens,
             "success": ttft is not None,
+            "send_time": start_time,
+            "complete_time": end_time,
         }
     except Exception as e:
+        end_time = time.perf_counter()
         return {
             "ttft": None,
-            "total_latency": time.perf_counter() - start_time,
+            "total_latency": end_time - start_time,
             "output_tokens": 0,
             "success": False,
             "error": str(e),
+            "send_time": start_time,
+            "complete_time": end_time,
         }
 
 
@@ -282,7 +288,46 @@ def compute_metrics(results: list[dict], wall_clock: float = 0.0) -> dict:
     successful = [r for r in measured if r["success"]]
     failed = [r for r in measured if not r["success"]]
 
-    throughput = (len(successful) / wall_clock) if wall_clock > 0 else 0.0
+    # --- Three throughput metrics ---
+    # 1. Effective throughput: successful / wall_clock (includes sleep gaps)
+    throughput_eff = (len(successful) / wall_clock) if wall_clock > 0 else 0.0
+
+    # 2. Offered throughput: successful / (last_complete - first_send)
+    #    Measures actual server-facing window span.
+    send_times = [r["send_time"] for r in successful if "send_time" in r]
+    complete_times = [r["complete_time"] for r in successful
+                      if "complete_time" in r]
+    if send_times and complete_times:
+        server_window = max(complete_times) - min(send_times)
+        throughput_offered = (
+            len(successful) / server_window if server_window > 0 else 0.0
+        )
+    else:
+        server_window = wall_clock
+        throughput_offered = throughput_eff
+
+    # 3. Server capacity (Little's Law estimate):
+    #    capacity ≈ concurrency / mean_latency
+    #    Equivalent to: successful / sum(latency) — the average number of
+    #    requests the server can handle per second if fully utilised.
+    latencies_all = [r["total_latency"] for r in successful]
+    if latencies_all:
+        total_busy = sum(latencies_all)
+        throughput_capacity = (
+            len(successful) ** 2 / total_busy / len(successful)
+            if total_busy > 0 else 0.0
+        )
+        # Simplifies to: len(successful) / total_busy * concurrency
+        # But we don't know concurrency here, so use the simpler form:
+        # capacity = 1 / mean_latency * avg_concurrency
+        # avg_concurrency = total_busy / server_window
+        avg_concurrency = total_busy / server_window if server_window > 0 else 1
+        mean_latency = statistics.mean(latencies_all)
+        throughput_capacity = (
+            avg_concurrency / mean_latency if mean_latency > 0 else 0.0
+        )
+    else:
+        throughput_capacity = 0.0
 
     if not successful:
         return {
@@ -292,7 +337,9 @@ def compute_metrics(results: list[dict], wall_clock: float = 0.0) -> dict:
             "successful": 0,
             "failed": len(failed),
             "wall_clock_s": wall_clock,
-            "throughput_rps": throughput,
+            "throughput_rps": throughput_eff,
+            "throughput_offered_rps": 0.0,
+            "throughput_capacity_rps": 0.0,
             "error": "All requests failed",
         }
 
@@ -324,7 +371,9 @@ def compute_metrics(results: list[dict], wall_clock: float = 0.0) -> dict:
         "successful": len(successful),
         "failed": len(failed),
         "wall_clock_s": wall_clock,
-        "throughput_rps": throughput,
+        "throughput_rps": throughput_eff,
+        "throughput_offered_rps": throughput_offered,
+        "throughput_capacity_rps": throughput_capacity,
         "ttft_mean_ms": statistics.mean(ttfts) * 1000,
         "ttft_median_ms": statistics.median(ttfts) * 1000,
         "ttft_p95_ms": sorted(ttfts)[int(len(ttfts) * 0.95)] * 1000
@@ -358,7 +407,9 @@ def aggregate_rounds(round_metrics: list[dict]) -> dict:
         return agg
 
     agg = {}
-    for key in ("throughput_rps", "ttft_mean_ms", "ttft_median_ms",
+    for key in ("throughput_rps", "throughput_offered_rps",
+                 "throughput_capacity_rps",
+                 "ttft_mean_ms", "ttft_median_ms",
                  "ttft_p95_ms", "ttft_p99_ms", "latency_mean_ms",
                  "latency_median_ms"):
         vals = [m[key] for m in round_metrics if key in m and m[key] is not None]
@@ -400,7 +451,9 @@ def print_results(metrics: dict, label: str = "",
 
         print(f"Successful:        {fmt_agg('successful')}")
         print(f"Failed:            {fmt_agg('failed')}")
-        print(f"Throughput:        {fmt_agg('throughput_rps')} req/s")
+        print(f"Throughput (eff):   {fmt_agg('throughput_rps')} req/s")
+        print(f"Throughput (offer): {fmt_agg('throughput_offered_rps')} req/s")
+        print(f"Throughput (cap):  {fmt_agg('throughput_capacity_rps')} req/s")
         print(f"TTFT mean:         {fmt_agg('ttft_mean_ms')} ms")
         print(f"TTFT median:       {fmt_agg('ttft_median_ms')} ms")
         print(f"TTFT p95:          {fmt_agg('ttft_p95_ms')} ms")
@@ -411,7 +464,9 @@ def print_results(metrics: dict, label: str = "",
         print(f"Successful:        {metrics['successful']}")
         print(f"Failed:            {metrics['failed']}")
         print(f"Wall clock:        {metrics.get('wall_clock_s', 0):.2f} s")
-        print(f"Throughput:        {metrics.get('throughput_rps', 0):.2f} req/s")
+        print(f"Throughput (eff):   {metrics.get('throughput_rps', 0):.2f} req/s")
+        print(f"Throughput (offer): {metrics.get('throughput_offered_rps', 0):.2f} req/s")
+        print(f"Throughput (cap):  {metrics.get('throughput_capacity_rps', 0):.2f} req/s")
         print(f"TTFT mean:         {metrics.get('ttft_mean_ms', 'N/A'):.2f} ms")
         print(f"TTFT median:       {metrics.get('ttft_median_ms', 'N/A'):.2f} ms")
         print(f"TTFT p95:          {metrics.get('ttft_p95_ms', 'N/A'):.2f} ms")
