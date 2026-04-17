@@ -386,44 +386,63 @@ def compute_metrics(results: list[dict], wall_clock: float = 0.0) -> dict:
     }
 
 
-def aggregate_rounds(round_metrics: list[dict]) -> dict:
-    """Aggregate metrics across multiple rounds into mean ± std."""
+def _trimmed_mean_std(vals: list[float],
+                      trim: int = 0) -> tuple[float, float]:
+    """Return (mean, std) of vals after dropping `trim` highest and `trim`
+    lowest values. Falls back to full data if trimming would leave <2 values.
+    """
+    if not vals:
+        return 0.0, 0.0
+    if trim > 0 and len(vals) > 2 * trim + 1:
+        sv = sorted(vals)
+        kept = sv[trim:len(sv) - trim]
+    else:
+        kept = vals
+    mean = statistics.mean(kept)
+    std = statistics.stdev(kept) if len(kept) > 1 else 0.0
+    return mean, std
+
+
+def aggregate_rounds(round_metrics: list[dict], trim: int = 0) -> dict:
+    """Aggregate metrics across multiple rounds into mean ± std.
+
+    If trim > 0, drop the `trim` highest and `trim` lowest values for each
+    metric before computing mean/std (trimmed mean — robust to outliers
+    such as the inflated first-round TTFT).
+    """
+    keys_metric = (
+        "throughput_rps", "throughput_offered_rps",
+        "throughput_capacity_rps",
+        "ttft_mean_ms", "ttft_median_ms",
+        "ttft_p95_ms", "ttft_p99_ms",
+        "latency_mean_ms", "latency_median_ms",
+    )
+    keys_count = ("successful", "failed")
+
     if len(round_metrics) == 1:
-        # Single round: just copy the metrics, std = 0
         m = round_metrics[0]
         agg = {}
-        for key in ("throughput_rps", "ttft_mean_ms", "ttft_median_ms",
-                     "ttft_p95_ms", "ttft_p99_ms", "latency_mean_ms",
-                     "latency_median_ms"):
+        for key in keys_metric:
             val = m.get(key)
             if val is not None:
                 agg[key] = {"mean": val, "std": 0.0}
-        agg["successful"] = {
-            "mean": m.get("successful", 0), "std": 0.0,
-        }
-        agg["failed"] = {
-            "mean": m.get("failed", 0), "std": 0.0,
-        }
+        for key in keys_count:
+            agg[key] = {"mean": m.get(key, 0), "std": 0.0}
         return agg
 
     agg = {}
-    for key in ("throughput_rps", "throughput_offered_rps",
-                 "throughput_capacity_rps",
-                 "ttft_mean_ms", "ttft_median_ms",
-                 "ttft_p95_ms", "ttft_p99_ms", "latency_mean_ms",
-                 "latency_median_ms"):
-        vals = [m[key] for m in round_metrics if key in m and m[key] is not None]
+    for key in keys_metric:
+        vals = [
+            m[key] for m in round_metrics
+            if key in m and m[key] is not None
+        ]
         if vals:
-            agg[key] = {
-                "mean": statistics.mean(vals),
-                "std": statistics.stdev(vals) if len(vals) > 1 else 0.0,
-            }
-    for key in ("successful", "failed"):
+            mean, std = _trimmed_mean_std(vals, trim=trim)
+            agg[key] = {"mean": mean, "std": std}
+    for key in keys_count:
         vals = [m.get(key, 0) for m in round_metrics]
-        agg[key] = {
-            "mean": statistics.mean(vals),
-            "std": statistics.stdev(vals) if len(vals) > 1 else 0.0,
-        }
+        mean, std = _trimmed_mean_std(vals, trim=trim)
+        agg[key] = {"mean": mean, "std": std}
     return agg
 
 
@@ -528,6 +547,11 @@ def main():
                         help="Use the same seed for all rounds (isolate "
                         "hardware noise). Default: each round uses "
                         "seed + round_idx (captures ordering sensitivity).")
+    parser.add_argument("--trim", type=int, default=0,
+                        help="When aggregating across rounds, drop the N "
+                        "highest and N lowest values for each metric "
+                        "(trimmed mean). Recommended: 1 for >=5 rounds. "
+                        "Default 0 (no trimming).")
     parser.add_argument("--encoder-url", type=str, default=None,
                         help="URL of the encoder worker (e.g. "
                         "http://localhost:19534). If provided, the encoder "
@@ -650,7 +674,7 @@ def main():
                   f"failed={metrics.get('failed', 0)}")
 
     # Aggregate across rounds
-    aggregated = aggregate_rounds(per_round_metrics)
+    aggregated = aggregate_rounds(per_round_metrics, trim=args.trim)
     print_results(last_metrics, args.label, aggregated, num_rounds)
 
     # Save results

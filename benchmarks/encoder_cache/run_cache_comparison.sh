@@ -50,6 +50,10 @@ WARMUP_REQUESTS="${WARMUP_REQUESTS:-400}"
 # Number of independent rounds per policy. Each round uses a different
 # seed; results are aggregated with mean ± std to reduce noise.
 NUM_ROUNDS="${NUM_ROUNDS:-3}"
+# Trimmed mean: drop the N highest and N lowest values for each metric
+# when aggregating across rounds. Recommended TRIM=1 for NUM_ROUNDS>=5
+# to remove outliers (e.g. residual first-round warmup effects).
+TRIM="${TRIM:-0}"
 SEED="${SEED:-42}"
 CACHE_BUDGET="${CACHE_BUDGET:-2000}"
 
@@ -433,6 +437,7 @@ run_trial() {
         --concurrency "$CONCURRENCY" \
         --warmup-requests "$WARMUP_REQUESTS" \
         --num-rounds "$NUM_ROUNDS" \
+        --trim "$TRIM" \
         --encoder-url "http://localhost:$ENCODE_PORT" \
         --seed "$SEED" \
         --label "$label" \
