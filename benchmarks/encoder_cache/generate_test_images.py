@@ -112,6 +112,7 @@ def main():
         generate_image(resolution, color, type_id, filepath)
 
         manifest[type_id] = {
+            "media_type": "image",
             "path": os.path.abspath(filepath),
             "resolution": list(resolution),
             "filename": filename,

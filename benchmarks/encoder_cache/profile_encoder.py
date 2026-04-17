@@ -24,14 +24,18 @@ from PIL import Image
 from transformers import AutoProcessor
 
 
-def _run_vision_encoder(model, pixel_values, extra_kwargs):
-    """Call the vision encoder and return the output tensor."""
+def _run_vision_encoder(model, pixel_values, extra_kwargs,
+                        is_video: bool = False):
+    """Call the vision encoder and return the output tensor.
+
+    For video inputs (Qwen2.5-VL), pass video_grid_thw. For images, pass
+    image_grid_thw. The same `model.visual()` handles both.
+    """
+    grid_thw_key = "video_grid_thw" if is_video else "image_grid_thw"
     if hasattr(model, "visual"):
-        # Qwen2-VL style
         return model.visual(pixel_values,
-                            grid_thw=extra_kwargs.get("image_grid_thw"))
+                            grid_thw=extra_kwargs.get(grid_thw_key))
     elif hasattr(model, "vision_tower"):
-        # LLaVA style
         return model.vision_tower(pixel_values)
     elif hasattr(model, "get_image_features"):
         return model.get_image_features(pixel_values)
@@ -42,6 +46,27 @@ def _run_vision_encoder(model, pixel_values, extra_kwargs):
             "Cannot find vision encoder on model. "
             f"Model type: {type(model).__name__}"
         )
+
+
+def _load_video_frames(video_path: str) -> list:
+    """Load all frames from an mp4 as a list of HxWx3 uint8 numpy arrays
+    in RGB order (compatible with HF Qwen2.5-VL processor)."""
+    import cv2
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open video {video_path}")
+    frames = []
+    while True:
+        ok, frame_bgr = cap.read()
+        if not ok:
+            break
+        # OpenCV gives BGR; processor expects RGB
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        frames.append(frame_rgb)
+    cap.release()
+    if not frames:
+        raise RuntimeError(f"No frames decoded from {video_path}")
+    return frames
 
 
 def profile_image(model, processor, image: Image.Image, device: str,
@@ -101,6 +126,66 @@ def profile_image(model, processor, image: Image.Image, device: str,
     return times, m_i
 
 
+def profile_video(model, processor, video_path: str, device: str,
+                  num_warmup: int, num_iterations: int
+                  ) -> tuple[list[float], int]:
+    """Run the vision encoder on a video.
+
+    Returns (per_iteration_times, m_i). For Qwen2.5-VL the processor
+    accepts `videos=[list_of_frames]` and emits pixel_values_videos plus
+    video_grid_thw. The visual encoder itself is the same module used for
+    images, but with the video grid.
+    """
+    frames = _load_video_frames(video_path)
+    inputs = processor(
+        videos=[frames],
+        text="Describe this video.",
+        return_tensors="pt",
+    ).to(device)
+
+    if "pixel_values_videos" not in inputs:
+        raise RuntimeError(
+            "Processor did not produce pixel_values_videos; "
+            "this model probably does not support video input."
+        )
+
+    pixel_values = inputs["pixel_values_videos"]
+    extra_kwargs = {}
+    for key in ("video_grid_thw", "second_per_grid_ts"):
+        if key in inputs:
+            extra_kwargs[key] = inputs[key]
+
+    m_i = 0
+    with torch.inference_mode():
+        for _ in range(num_warmup):
+            out = _run_vision_encoder(
+                model, pixel_values, extra_kwargs, is_video=True,
+            )
+            torch.cuda.synchronize(device)
+        if isinstance(out, torch.Tensor):
+            if out.dim() == 2:
+                m_i = out.shape[0]
+            elif out.dim() == 3:
+                m_i = out.shape[1]
+        elif isinstance(out, (tuple, list)):
+            t = out[0] if isinstance(out[0], torch.Tensor) else out
+            if isinstance(t, torch.Tensor):
+                m_i = t.shape[1] if t.dim() == 3 else t.shape[0]
+
+    times: list[float] = []
+    with torch.inference_mode():
+        for _ in range(num_iterations):
+            torch.cuda.synchronize(device)
+            t0 = time.perf_counter()
+            _run_vision_encoder(
+                model, pixel_values, extra_kwargs, is_video=True,
+            )
+            torch.cuda.synchronize(device)
+            times.append(time.perf_counter() - t0)
+
+    return times, m_i
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Profile encoder computation time for each image type"
@@ -143,14 +228,22 @@ def main():
 
     profile = {}
     for type_id, info in manifest.items():
-        image_path = info["path"]
-        print(f"Profiling {type_id} ({info['resolution']})...")
-
-        image = Image.open(image_path).convert("RGB")
-        times, m_i = profile_image(
-            model, processor, image, device,
-            args.num_warmup, args.num_iterations,
-        )
+        media_type = info.get("media_type", "image")
+        media_path = info["path"]
+        if media_type == "video":
+            print(f"Profiling {type_id} (video {info['resolution']}, "
+                  f"{info.get('num_frames', '?')} frames)...")
+            times, m_i = profile_video(
+                model, processor, media_path, device,
+                args.num_warmup, args.num_iterations,
+            )
+        else:
+            print(f"Profiling {type_id} (image {info['resolution']})...")
+            image = Image.open(media_path).convert("RGB")
+            times, m_i = profile_image(
+                model, processor, image, device,
+                args.num_warmup, args.num_iterations,
+            )
 
         for i, t in enumerate(times):
             print(f"    iter {i}: c_i={t:.4f}s")
@@ -159,6 +252,7 @@ def main():
             m_i = m_i_override[type_id]
 
         result = {
+            "media_type": media_type,
             "c_i": statistics.median(times),
             "c_i_mean": statistics.mean(times),
             "c_i_std": statistics.stdev(times) if len(times) > 1 else 0.0,

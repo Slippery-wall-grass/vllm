@@ -41,9 +41,13 @@ def reset_encoder_cache(encoder_url: str) -> None:
     print(f"  Encoder cache reset via {encoder_url}")
 
 
-def encode_image_to_base64(image_path: str) -> str:
-    with open(image_path, "rb") as f:
+def encode_file_to_base64(path: str) -> str:
+    with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
+
+
+def encode_image_to_base64(image_path: str) -> str:
+    return encode_file_to_base64(image_path)
 
 
 def generate_workload(
@@ -54,7 +58,7 @@ def generate_workload(
 ) -> list[dict]:
     """Generate a workload of requests following the specified distribution.
 
-    Returns list of dicts with type_id and image_path.
+    Returns list of dicts with type_id, media_path, and media_type.
     """
     rng = random.Random(seed)
 
@@ -64,13 +68,32 @@ def generate_workload(
     workload = []
     for _ in range(num_requests):
         type_id = rng.choices(type_ids, weights=weights, k=1)[0]
-        image_path = manifest[type_id]["path"]
+        entry = manifest[type_id]
         workload.append({
             "type_id": type_id,
-            "image_path": image_path,
+            "media_path": entry["path"],
+            "media_type": entry.get("media_type", "image"),
+            # Backwards-compat alias for older code paths
+            "image_path": entry["path"],
         })
 
     return workload
+
+
+def _build_media_content(media_path: str, media_type: str) -> dict:
+    """Build the OpenAI-style content part for an image or video."""
+    if media_type == "video":
+        b64 = encode_file_to_base64(media_path)
+        return {
+            "type": "video_url",
+            "video_url": {"url": f"data:video/mp4;base64,{b64}"},
+        }
+    # Default to image
+    b64 = encode_file_to_base64(media_path)
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+    }
 
 
 async def send_request(
@@ -79,9 +102,19 @@ async def send_request(
     model: str,
     image_path: str,
     max_tokens: int = 20,
+    media_type: str = "image",
 ) -> dict:
-    """Send a single streaming request and measure TTFT and total latency."""
-    img_b64 = encode_image_to_base64(image_path)
+    """Send a single streaming request and measure TTFT and total latency.
+
+    `image_path` is kept as the parameter name for backwards compatibility
+    but accepts any media path (image or video). `media_type` controls the
+    payload type sent to the server.
+    """
+    media_content = _build_media_content(image_path, media_type)
+    prompt_text = (
+        "Describe this video briefly." if media_type == "video"
+        else "Describe this image briefly."
+    )
 
     payload = {
         "model": model,
@@ -89,13 +122,8 @@ async def send_request(
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{img_b64}"
-                        },
-                    },
-                    {"type": "text", "text": "Describe this image briefly."},
+                    media_content,
+                    {"type": "text", "text": prompt_text},
                 ],
             }
         ],
@@ -184,7 +212,8 @@ async def run_benchmark_open(
 
             task = asyncio.create_task(
                 send_request(session, server_url, model,
-                             item["image_path"], max_tokens)
+                             item["image_path"], max_tokens,
+                             media_type=item.get("media_type", "image"))
             )
             tasks.append((i, item["type_id"], task))
 
@@ -252,6 +281,7 @@ async def run_benchmark_closed(
             result = await send_request(
                 session, server_url, model,
                 item["image_path"], max_tokens,
+                media_type=item.get("media_type", "image"),
             )
             result["request_id"] = i
             result["type_id"] = item["type_id"]

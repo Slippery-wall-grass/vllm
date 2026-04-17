@@ -37,7 +37,10 @@ set -euo pipefail
 # Configuration
 ###############################################################################
 MODEL="${MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"
-NUM_TYPES="${NUM_TYPES:-5}"
+NUM_TYPES="${NUM_TYPES:-5}"            # number of image types K
+NUM_VIDEOS="${NUM_VIDEOS:-0}"          # number of video types V (0 = no video)
+VIDEO_DURATION_S="${VIDEO_DURATION_S:-2}"
+VIDEO_FPS="${VIDEO_FPS:-8}"
 NUM_REQUESTS="${NUM_REQUESTS:-2000}"
 # Load mode: "closed" drives the server to saturation for throughput
 # measurement (recommended); "open" fires at a fixed QPS for latency-at-load.
@@ -197,6 +200,13 @@ start_1e1p1d() {
     rm -rf "$EC_SHARED_STORAGE_PATH"
     mkdir -p "$EC_SHARED_STORAGE_PATH"
 
+    # When video types are present, allow at most 1 video per prompt and
+    # at most 1 image per prompt (each request carries one media item).
+    local mm_limit_arg=""
+    if [ "$NUM_VIDEOS" -gt 0 ]; then
+        mm_limit_arg='--limit-mm-per-prompt={"image":1,"video":1}'
+    fi
+
     # Encoder worker (dev mode enables /reset_encoder_cache endpoint)
     CUDA_VISIBLE_DEVICES="$GPU_E" \
     VLLM_SERVER_DEV_MODE=1 \
@@ -211,6 +221,7 @@ start_1e1p1d() {
         --max-num-batched-tokens 114688 \
         --max-num-seqs 128 \
         --allowed-local-media-path "$IMAGE_DIR" \
+        $mm_limit_arg \
         --ec-transfer-config '{
             "ec_connector": "ECExampleConnector",
             "ec_role": "ec_producer",
@@ -235,6 +246,7 @@ start_1e1p1d() {
         --enable-request-id-headers \
         --max-num-seqs 128 \
         --allowed-local-media-path "$IMAGE_DIR" \
+        $mm_limit_arg \
         --ec-transfer-config '{
             "ec_connector": "ECExampleConnector",
             "ec_role": "ec_consumer",
@@ -260,6 +272,7 @@ start_1e1p1d() {
         --enable-request-id-headers \
         --max-num-seqs 128 \
         --allowed-local-media-path "$IMAGE_DIR" \
+        $mm_limit_arg \
         --kv-transfer-config '{
             "kv_connector": "NixlConnector",
             "kv_role": "kv_consumer"
@@ -318,14 +331,29 @@ else
     MANIFEST_PATH="$WORK_DIR/manifest.json"
 
     ###########################################################################
+    # Step 1.5: Generate test videos (if NUM_VIDEOS > 0) and append to manifest
+    ###########################################################################
+    if [ "$NUM_VIDEOS" -gt 0 ]; then
+        echo "Generating $NUM_VIDEOS test video types "
+        echo "(duration=${VIDEO_DURATION_S}s, fps=$VIDEO_FPS)..."
+        python "$SCRIPT_DIR/generate_test_videos.py" \
+            --num-videos "$NUM_VIDEOS" \
+            --duration-s "$VIDEO_DURATION_S" \
+            --fps "$VIDEO_FPS" \
+            --output-dir "$IMAGE_DIR" \
+            --manifest-path "$MANIFEST_PATH" \
+            --start-type-id "$NUM_TYPES"
+    fi
+
+    ###########################################################################
     # Step 2: Generate distribution if not provided
     ###########################################################################
     if [ -z "$DISTRIBUTION" ]; then
         echo "Generating Zipf-like distribution for $NUM_TYPES types..."
         DISTRIBUTION=$(python -c "
 import json, random
-K = $NUM_TYPES
-# Zipf weights: 1/1, 1/2, ..., 1/K
+K = $NUM_TYPES + $NUM_VIDEOS
+# Zipf weights: 1/1, 1/2, ..., 1/K (covers both image and video types)
 raw = [1.0/(i+1) for i in range(K)]
 # Shuffle so the highest probability is NOT always on the smallest
 # resolution (type_0). This way p_i and m_i are decorrelated.
