@@ -52,19 +52,52 @@ def _normalize_split_name(s: str) -> str:
 
 
 def collect_url_counts(split: str, hf_token: str | None) -> Counter:
-    """Stream the dataset and count occurrences of each link_selected URL."""
+    """Stream the dataset and count occurrences of each link_selected URL.
+
+    VideoMMMU exposes three *configurations* (not splits): Perception,
+    Comprehension, Adaptation. Each config has a single "test" split.
+    We pass the config name via the second positional argument and the
+    inner split via split="test".
+    """
     from datasets import load_dataset
 
     counts: Counter = Counter()
-    splits_to_scan = (
+    configs_to_scan = (
         ["Perception", "Comprehension", "Adaptation"]
         if split == "all" else [_normalize_split_name(split)]
     )
-    for sp in splits_to_scan:
-        print(f"Loading lmms-lab/VideoMMMU split={sp}...")
-        ds = load_dataset(
-            "lmms-lab/VideoMMMU", split=sp, token=hf_token,
-        )
+    for cfg in configs_to_scan:
+        print(f"Loading lmms-lab/VideoMMMU config={cfg}...")
+        # Try the most common HF inner split names; fall back to picking
+        # whatever single split this config actually exposes.
+        ds = None
+        last_err: Exception | None = None
+        for inner in ("test", "train", "validation"):
+            try:
+                ds = load_dataset(
+                    "lmms-lab/VideoMMMU", cfg, split=inner, token=hf_token,
+                )
+                break
+            except Exception as e:  # noqa: BLE001 - try next split name
+                last_err = e
+        if ds is None:
+            # Fall back: load the whole DatasetDict and pick the single split
+            try:
+                from datasets import DatasetDict
+                dsd = load_dataset(
+                    "lmms-lab/VideoMMMU", cfg, token=hf_token,
+                )
+                if isinstance(dsd, DatasetDict) and len(dsd) >= 1:
+                    only_split = next(iter(dsd.keys()))
+                    ds = dsd[only_split]
+                    print(f"  (using inner split '{only_split}')")
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(
+                    f"Failed to load config {cfg}: {e}; previous error: "
+                    f"{last_err}") from e
+        if ds is None:
+            raise RuntimeError(f"Could not load config {cfg}")
+
         for row in ds:
             url = row.get("link_selected")
             if url:
