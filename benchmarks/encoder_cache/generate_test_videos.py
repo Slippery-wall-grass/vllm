@@ -27,20 +27,25 @@ Usage:
 import argparse
 import json
 import os
+import random
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-# Default resolutions for video. Smaller than max image resolution because
-# total m_i = num_frames * tokens_per_frame, so even at 224x224 a 16-frame
-# video is much larger than any single image.
+# Pool of 8 candidate resolutions. Each generated video samples one
+# (with replacement) so the same V can produce variable m_i across
+# types. Resolutions are kept moderate so 16-frame videos still fit in
+# the encoder worker's KV cache.
 DEFAULT_VIDEO_RESOLUTIONS = [
     (224, 224),
     (252, 252),
     (280, 280),
     (308, 308),
     (336, 336),
+    (364, 364),
+    (392, 392),
+    (448, 448),
 ]
 
 
@@ -106,9 +111,20 @@ def main():
     parser.add_argument("--num-videos", type=int, default=2,
                         help="Number of distinct video types V")
     parser.add_argument("--duration-s", type=float, default=2.0,
-                        help="Video duration in seconds")
+                        help="Fixed video duration in seconds. Ignored if "
+                             "both --duration-min-s and --duration-max-s are "
+                             "provided.")
+    parser.add_argument("--duration-min-s", type=float, default=None,
+                        help="If set together with --duration-max-s, each "
+                             "video gets a random duration sampled uniformly "
+                             "in [min, max] (seconds).")
+    parser.add_argument("--duration-max-s", type=float, default=None,
+                        help="See --duration-min-s.")
     parser.add_argument("--fps", type=int, default=8,
                         help="Frames per second")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for resolution sampling and "
+                             "duration sampling (when ranged).")
     parser.add_argument("--output-dir", type=str,
                         default="/tmp/encoder_cache_test_images",
                         help="Directory to save mp4 files")
@@ -140,30 +156,45 @@ def main():
                     continue
         start_idx = max(existing_indices, default=-1) + 1
 
-    # Pick V resolutions
-    if V <= len(DEFAULT_VIDEO_RESOLUTIONS):
-        resolutions = DEFAULT_VIDEO_RESOLUTIONS[:V]
+    rng = random.Random(args.seed)
+
+    # Determine duration sampling mode
+    if args.duration_min_s is not None and args.duration_max_s is not None:
+        dur_min = float(args.duration_min_s)
+        dur_max = float(args.duration_max_s)
+        if dur_min > dur_max:
+            dur_min, dur_max = dur_max, dur_min
+        duration_mode = "random"
     else:
-        min_res = DEFAULT_VIDEO_RESOLUTIONS[0][0]
-        max_res = DEFAULT_VIDEO_RESOLUTIONS[-1][0]
-        step = (max_res - min_res) / (V - 1) if V > 1 else 0
-        resolutions = [
-            (round(min_res + i * step), round(min_res + i * step))
-            for i in range(V)
-        ]
+        dur_min = dur_max = float(args.duration_s)
+        duration_mode = "fixed"
+
+    print(f"Resolution: random sample (with replacement) from "
+          f"{len(DEFAULT_VIDEO_RESOLUTIONS)} candidates")
+    print(f"Duration: {duration_mode} "
+          f"({dur_min:.2f}s - {dur_max:.2f}s)")
 
     for i in range(V):
         type_idx = start_idx + i
         type_id = f"type_{type_idx}"
-        resolution = resolutions[i]
+
+        # Random resolution from the pool (with replacement)
+        resolution = rng.choice(DEFAULT_VIDEO_RESOLUTIONS)
         w, h = resolution
-        filename = (f"{type_id}_{w}x{h}_d{args.duration_s}s_"
+
+        # Random or fixed duration per video
+        if duration_mode == "random":
+            duration_s = round(rng.uniform(dur_min, dur_max), 2)
+        else:
+            duration_s = dur_min
+
+        filename = (f"{type_id}_{w}x{h}_d{duration_s}s_"
                     f"fps{args.fps}.mp4")
         filepath = str(output_dir / filename)
 
         num_frames = generate_video(
             resolution=resolution,
-            duration_s=args.duration_s,
+            duration_s=duration_s,
             fps=args.fps,
             type_id=type_id,
             color_seed=type_idx * 1000 + 7,
@@ -175,11 +206,11 @@ def main():
             "path": os.path.abspath(filepath),
             "resolution": list(resolution),
             "filename": filename,
-            "duration_s": args.duration_s,
+            "duration_s": duration_s,
             "fps": args.fps,
             "num_frames": num_frames,
         }
-        print(f"Generated {type_id}: {w}x{h} {args.duration_s}s "
+        print(f"Generated {type_id}: {w}x{h} {duration_s}s "
               f"@ {args.fps}fps ({num_frames} frames) -> {filepath}")
 
     with open(manifest_path, "w") as f:

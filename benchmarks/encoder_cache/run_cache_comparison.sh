@@ -39,7 +39,11 @@ set -euo pipefail
 MODEL="${MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"
 NUM_TYPES="${NUM_TYPES:-5}"            # number of image types K
 NUM_VIDEOS="${NUM_VIDEOS:-0}"          # number of video types V (0 = no video)
+# Fixed duration (used when min/max are not both set)
 VIDEO_DURATION_S="${VIDEO_DURATION_S:-2}"
+# When both set, each video gets a random duration uniformly in [min, max]
+VIDEO_DURATION_MIN_S="${VIDEO_DURATION_MIN_S:-}"
+VIDEO_DURATION_MAX_S="${VIDEO_DURATION_MAX_S:-}"
 VIDEO_FPS="${VIDEO_FPS:-8}"
 NUM_REQUESTS="${NUM_REQUESTS:-2000}"
 # Load mode: "closed" drives the server to saturation for throughput
@@ -338,12 +342,25 @@ else
     # Step 1.5: Generate test videos (if NUM_VIDEOS > 0) and append to manifest
     ###########################################################################
     if [ "$NUM_VIDEOS" -gt 0 ]; then
-        echo "Generating $NUM_VIDEOS test video types "
-        echo "(duration=${VIDEO_DURATION_S}s, fps=$VIDEO_FPS)..."
+        duration_args=(--duration-s "$VIDEO_DURATION_S")
+        if [ -n "$VIDEO_DURATION_MIN_S" ] && \
+           [ -n "$VIDEO_DURATION_MAX_S" ]; then
+            duration_args=(
+                --duration-min-s "$VIDEO_DURATION_MIN_S"
+                --duration-max-s "$VIDEO_DURATION_MAX_S"
+            )
+            echo "Generating $NUM_VIDEOS test video types "
+            echo "(duration in [${VIDEO_DURATION_MIN_S}s, "
+            echo "${VIDEO_DURATION_MAX_S}s], fps=$VIDEO_FPS)..."
+        else
+            echo "Generating $NUM_VIDEOS test video types "
+            echo "(duration=${VIDEO_DURATION_S}s, fps=$VIDEO_FPS)..."
+        fi
         python "$SCRIPT_DIR/generate_test_videos.py" \
             --num-videos "$NUM_VIDEOS" \
-            --duration-s "$VIDEO_DURATION_S" \
+            "${duration_args[@]}" \
             --fps "$VIDEO_FPS" \
+            --seed "$SEED" \
             --output-dir "$IMAGE_DIR" \
             --manifest-path "$MANIFEST_PATH" \
             --start-type-id "$NUM_TYPES"
