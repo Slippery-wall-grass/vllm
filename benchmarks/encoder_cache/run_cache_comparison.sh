@@ -58,7 +58,11 @@ NUM_ROUNDS="${NUM_ROUNDS:-3}"
 # to remove outliers (e.g. residual first-round warmup effects).
 TRIM="${TRIM:-0}"
 SEED="${SEED:-42}"
-CACHE_BUDGET="${CACHE_BUDGET:-2000}"
+# CACHE_BUDGET is informational only: solve_lambda.py uses it to print an
+# offline preview of lambda*, but at runtime DistributionAwareCacheManager
+# re-solves lambda* using vLLM's actual encoder cache size. Leave empty
+# to let solve_lambda.py pick a placeholder (M // 2).
+CACHE_BUDGET="${CACHE_BUDGET:-}"
 
 ENCODE_PORT="${ENCODE_PORT:-19534}"
 PREFILL_PORT="${PREFILL_PORT:-19535}"
@@ -397,10 +401,15 @@ echo "============================================================"
 echo "Step 4: Solving for optimal lambda*"
 echo "============================================================"
 
+cache_budget_arg=()
+if [ -n "$CACHE_BUDGET" ]; then
+    cache_budget_arg=(--cache-budget "$CACHE_BUDGET")
+fi
+
 python "$SCRIPT_DIR/solve_lambda.py" \
     --profile-path "$PROFILE_PATH" \
     --distribution "$DISTRIBUTION" \
-    --cache-budget "$CACHE_BUDGET" \
+    "${cache_budget_arg[@]}" \
     --output-path "$WORK_DIR/lambda_config.json"
 
 LAMBDA_CONFIG_PATH="$WORK_DIR/lambda_config.json"

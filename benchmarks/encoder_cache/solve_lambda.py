@@ -142,8 +142,13 @@ def main():
                         help="Path to profile JSON from profile_encoder.py")
     parser.add_argument("--distribution", type=str, required=True,
                         help="JSON dict mapping type_id -> p_i probability")
-    parser.add_argument("--cache-budget", type=int, required=True,
-                        help="Cache budget B in number of encoder embeddings")
+    parser.add_argument("--cache-budget", type=int, default=None,
+                        help="Cache budget B in number of encoder embeddings. "
+                        "INFORMATIONAL ONLY: the runtime cache manager "
+                        "re-solves lambda* using vLLM's actual encoder "
+                        "cache size, so this value only affects the offline "
+                        "report printed here. If omitted, the offline solve "
+                        "uses B = sum(m_i) // 2 as a placeholder.")
     parser.add_argument("--output-path", type=str, default=None,
                         help="Path for output config JSON")
     args = parser.parse_args()
@@ -175,7 +180,17 @@ def main():
         for t in types:
             t["p_i"] /= total_p
 
-    result = solve_lambda(types, args.cache_budget)
+    cache_budget = args.cache_budget
+    if cache_budget is None:
+        # Placeholder only: the runtime manager re-solves with vLLM's real
+        # cache size. Using M // 2 gives a reasonable offline preview.
+        M = sum(t["m_i"] for t in types)
+        cache_budget = max(1, M // 2)
+        print(f"NOTE: --cache-budget not provided; using placeholder "
+              f"B = M//2 = {cache_budget} for offline reporting only. "
+              "Runtime lambda* is re-computed with vLLM's actual cache size.")
+
+    result = solve_lambda(types, cache_budget)
     print_analysis(result)
 
     # Save output config
