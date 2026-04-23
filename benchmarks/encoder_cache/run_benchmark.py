@@ -80,6 +80,52 @@ def generate_workload(
     return workload
 
 
+def build_guaranteed_warmup_workload(
+    manifest: dict,
+    distribution: dict[str, float],
+    target_count: int,
+    seed: int = 0,
+) -> list[dict]:
+    """Build a warmup workload that includes at least one request per type.
+
+    The first len(types) entries are exactly one of each type (in
+    deterministic order: type_0, type_1, ...). Any remaining slots up to
+    target_count are filled by sampling from `distribution` as usual.
+
+    If target_count < num_types, the workload still has one of each type
+    so all kernels get warmed - the actual length may exceed target_count
+    in that case.
+    """
+    rng = random.Random(seed)
+    type_ids = list(distribution.keys())
+
+    # First: one of each type, in manifest order
+    workload: list[dict] = []
+    for tid in type_ids:
+        if tid not in manifest:
+            continue
+        entry = manifest[tid]
+        workload.append({
+            "type_id": tid,
+            "media_path": entry["path"],
+            "media_type": entry.get("media_type", "image"),
+            "image_path": entry["path"],
+        })
+
+    # Then: fill remaining slots with sampled requests (if any)
+    weights = [distribution[t] for t in type_ids]
+    while len(workload) < target_count:
+        tid = rng.choices(type_ids, weights=weights, k=1)[0]
+        entry = manifest[tid]
+        workload.append({
+            "type_id": tid,
+            "media_path": entry["path"],
+            "media_type": entry.get("media_type", "image"),
+            "image_path": entry["path"],
+        })
+    return workload
+
+
 def _build_media_content(media_path: str, media_type: str) -> dict:
     """Build the OpenAI-style content part for an image or video."""
     if media_type == "video":
@@ -593,6 +639,13 @@ def main():
                         "warm up CUDA kernels, cuDNN autotuning, and TCP "
                         "connections. These are fully discarded and do not "
                         "appear in any metrics. Set to 0 to skip.")
+    parser.add_argument("--guarantee-each-type-warmup", action="store_true",
+                        default=False,
+                        help="Force the global warmup workload to include at "
+                        "least one request per type in the manifest. Useful "
+                        "when some types have very low p_i and would "
+                        "otherwise be missed by random sampling, leaving "
+                        "their kernels cold for the first measured round.")
     parser.add_argument("--output-path", type=str, default=None,
                         help="Path for output results JSON")
     parser.add_argument("--label", type=str, default="",
@@ -615,15 +668,23 @@ def main():
     # cuDNN autotuning, PyTorch memory allocator, and TCP connection pools.
     # Without this, the first round has ~5x higher TTFT than subsequent ones.
     if args.global_warmup > 0:
-        print(f"\nGlobal warmup: sending {args.global_warmup} throwaway "
-              f"requests to warm up CUDA / cuDNN / connections...")
-        warmup_wl = generate_workload(
-            manifest, distribution, args.global_warmup, seed=0,
-        )
+        if args.guarantee_each_type_warmup:
+            warmup_wl = build_guaranteed_warmup_workload(
+                manifest, distribution, args.global_warmup, seed=0,
+            )
+            print(f"\nGlobal warmup: sending {len(warmup_wl)} throwaway "
+                  f"requests (covers each of {len(distribution)} types "
+                  f"at least once)...")
+        else:
+            warmup_wl = generate_workload(
+                manifest, distribution, args.global_warmup, seed=0,
+            )
+            print(f"\nGlobal warmup: sending {len(warmup_wl)} throwaway "
+                  f"requests to warm up CUDA / cuDNN / connections...")
         if args.mode == "closed":
             asyncio.run(run_benchmark_closed(
                 warmup_wl, args.server_url, args.model,
-                min(args.concurrency, args.global_warmup),
+                min(args.concurrency, len(warmup_wl)),
                 warmup_requests=0, max_tokens=args.max_tokens,
             ))
         else:

@@ -61,6 +61,16 @@ NUM_ROUNDS="${NUM_ROUNDS:-3}"
 # when aggregating across rounds. Recommended TRIM=1 for NUM_ROUNDS>=5
 # to remove outliers (e.g. residual first-round warmup effects).
 TRIM="${TRIM:-0}"
+# Global warmup before round 1 — throwaway requests to warm up CUDA / cuDNN.
+GLOBAL_WARMUP="${GLOBAL_WARMUP:-20}"
+# When 1, force the global warmup workload to include each type at least
+# once (useful when some types have very low p_i and would otherwise be
+# missed by random sampling).
+GUARANTEE_EACH_TYPE_WARMUP="${GUARANTEE_EACH_TYPE_WARMUP:-0}"
+GUARANTEE_EACH_TYPE_WARMUP_FLAG=""
+if [ "$GUARANTEE_EACH_TYPE_WARMUP" = "1" ]; then
+    GUARANTEE_EACH_TYPE_WARMUP_FLAG="--guarantee-each-type-warmup"
+fi
 SEED="${SEED:-42}"
 # CACHE_BUDGET is informational only: solve_lambda.py uses it to print an
 # offline preview of lambda*, but at runtime DistributionAwareCacheManager
@@ -492,6 +502,8 @@ run_trial() {
         --warmup-requests "$WARMUP_REQUESTS" \
         --num-rounds "$NUM_ROUNDS" \
         --trim "$TRIM" \
+        --global-warmup "$GLOBAL_WARMUP" \
+        $GUARANTEE_EACH_TYPE_WARMUP_FLAG \
         --encoder-url "http://localhost:$ENCODE_PORT" \
         --seed "$SEED" \
         --label "$label" \
