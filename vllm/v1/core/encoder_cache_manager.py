@@ -80,17 +80,34 @@ class EncoderCacheManager:
         self.freeable: OrderedDict[str, int] = OrderedDict()
         self.freed: list[str] = []
 
+        # Hit / miss counters used by external benchmarks. Logged on reset()
+        # and cleared so each measurement window has clean numbers.
+        self.cache_hits: int = 0
+        self.cache_misses: int = 0
+
     def reset(self) -> None:
         """Reset the encoder cache to its initial state.
 
         This clears all cached encoder outputs and resets capacity tracking.
         Called when model weights are updated to invalidate stale embeddings.
         """
+        # Log hit/miss stats before clearing them so external tools (e.g.
+        # the encoder-cache benchmark) can grep them out of the worker log.
+        total = self.cache_hits + self.cache_misses
+        hit_rate = self.cache_hits / total if total > 0 else 0.0
+        logger.info(
+            "Encoder cache stats before reset: "
+            "hits=%d misses=%d total=%d hit_rate=%.4f",
+            self.cache_hits, self.cache_misses, total, hit_rate,
+        )
+
         self.cached.clear()
         self.freeable.clear()
         self.freed.clear()
         self.num_free_slots = self.cache_size
         self.num_freeable_slots = self.cache_size
+        self.cache_hits = 0
+        self.cache_misses = 0
 
     def check_and_update_cache(self, request: Request, input_id: int) -> bool:
         """Check if encoder output for a specific multimodal input is cached.
@@ -110,6 +127,7 @@ class EncoderCacheManager:
         mm_hash = request.mm_features[input_id].identifier
         # Not cached at all
         if mm_hash not in self.cached:
+            self.cache_misses += 1
             return False
 
         # Cached but currently not referenced by any request
@@ -118,6 +136,7 @@ class EncoderCacheManager:
             self.num_freeable_slots -= num_encoder_embeds
 
         self.cached[mm_hash].add(request.request_id)
+        self.cache_hits += 1
         return True
 
     def can_allocate(
@@ -320,17 +339,14 @@ class DistributionAwareCacheManager(EncoderCacheManager):
         # Per-entry evictability: mm_hash -> is_evictable
         self.evictability: dict[str, bool] = {}
 
-        # Cache hit/miss statistics
-        self.cache_hits: int = 0
-        self.cache_misses: int = 0
+        # cache_hits / cache_misses are inherited from the base class.
 
         self._rng = random.Random(42)
 
     def reset(self) -> None:
         super().reset()
         self.evictability.clear()
-        self.cache_hits = 0
-        self.cache_misses = 0
+        # Counters are reset by the base class.
 
     def configure_distribution(
         self,
@@ -514,13 +530,8 @@ class DistributionAwareCacheManager(EncoderCacheManager):
         cost = meta.m_i * self.lambda_star * d - meta.c_i
         return cost >= 0  # evictable if keeping cost >= recompute cost
 
-    def check_and_update_cache(self, request: Request, input_id: int) -> bool:
-        result = super().check_and_update_cache(request, input_id)
-        if result:
-            self.cache_hits += 1
-        else:
-            self.cache_misses += 1
-        return result
+    # check_and_update_cache: inherited from base class which now maintains
+    # cache_hits / cache_misses for all manager flavors.
 
     def free_encoder_input(self, request: Request, input_id: int) -> None:
         mm_hash = request.mm_features[input_id].identifier
@@ -618,23 +629,9 @@ class NoCacheEncoderManager(EncoderCacheManager):
     in time will always recompute.
     """
 
-    def __init__(self, cache_size: int):
-        super().__init__(cache_size)
-        self.cache_hits: int = 0
-        self.cache_misses: int = 0
-
-    def reset(self) -> None:
-        super().reset()
-        self.cache_hits = 0
-        self.cache_misses = 0
-
-    def check_and_update_cache(self, request: Request, input_id: int) -> bool:
-        result = super().check_and_update_cache(request, input_id)
-        if result:
-            self.cache_hits += 1
-        else:
-            self.cache_misses += 1
-        return result
+    # __init__: inherited; cache_hits / cache_misses are set up in the base
+    # class. reset() is also inherited and now logs stats before clearing.
+    # check_and_update_cache: inherited; the base class maintains counters.
 
     def free_encoder_input(self, request: Request, input_id: int) -> None:
         req_id = request.request_id

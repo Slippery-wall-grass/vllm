@@ -505,6 +505,7 @@ run_trial() {
         --global-warmup "$GLOBAL_WARMUP" \
         $GUARANTEE_EACH_TYPE_WARMUP_FLAG \
         --encoder-url "http://localhost:$ENCODE_PORT" \
+        --encoder-log-path "${LOG_PATH}/encoder_${label}_${START_TIME}.log" \
         --seed "$SEED" \
         --label "$label" \
         --output-path "$WORK_DIR/results_${label}.json"
@@ -602,6 +603,7 @@ metrics = [
     ('ttft_p99_ms',      'TTFT P99 (ms)',      False),
     ('latency_mean_ms',  'Latency Mean (ms)',  False),
     ('throughput_rps',   'Throughput (req/s)', True),
+    ('cache_hit_rate',   'Cache Hit Rate',     True),
 ]
 
 for key, label, higher in metrics:

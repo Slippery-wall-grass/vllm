@@ -18,7 +18,9 @@ import argparse
 import asyncio
 import base64
 import json
+import os
 import random
+import re
 import statistics
 import time
 from pathlib import Path
@@ -27,6 +29,43 @@ import aiohttp
 
 
 import requests as http_requests
+
+
+_CACHE_STATS_RE = re.compile(
+    r"Encoder cache stats before reset:\s*"
+    r"hits=(\d+)\s+misses=(\d+)\s+total=(\d+)\s+hit_rate=([\d.]+)"
+)
+
+
+def parse_latest_cache_stats(log_path: str) -> dict | None:
+    """Scan an encoder-worker log file for the latest cache-stats line.
+
+    Returns a dict with cache_hits / cache_misses / cache_total /
+    cache_hit_rate, or None if the file is missing / no stats line found.
+    Reads the file in chunks from the end so it stays cheap on big logs.
+    """
+    if not log_path or not os.path.exists(log_path):
+        return None
+    try:
+        size = os.path.getsize(log_path)
+        if size == 0:
+            return None
+        chunk = min(size, 65536)
+        with open(log_path, "rb") as f:
+            f.seek(max(0, size - chunk))
+            tail = f.read().decode("utf-8", errors="replace")
+        matches = _CACHE_STATS_RE.findall(tail)
+        if not matches:
+            return None
+        hits, misses, total, hit_rate = matches[-1]
+        return {
+            "cache_hits": int(hits),
+            "cache_misses": int(misses),
+            "cache_total": int(total),
+            "cache_hit_rate": float(hit_rate),
+        }
+    except OSError:
+        return None
 
 
 def reset_encoder_cache(encoder_url: str) -> None:
@@ -492,6 +531,7 @@ def aggregate_rounds(round_metrics: list[dict], trim: int = 0) -> dict:
         "ttft_mean_ms", "ttft_median_ms",
         "ttft_p95_ms", "ttft_p99_ms",
         "latency_mean_ms", "latency_median_ms",
+        "cache_hit_rate", "cache_hits", "cache_misses",
     )
     keys_count = ("successful", "failed")
 
@@ -549,6 +589,8 @@ def print_results(metrics: dict, label: str = "",
         print(f"Throughput (eff):   {fmt_agg('throughput_rps')} req/s")
         print(f"Throughput (offer): {fmt_agg('throughput_offered_rps')} req/s")
         print(f"Throughput (cap):  {fmt_agg('throughput_capacity_rps')} req/s")
+        if "cache_hit_rate" in aggregated:
+            print(f"Cache hit rate:    {fmt_agg('cache_hit_rate')}")
         print(f"TTFT mean:         {fmt_agg('ttft_mean_ms')} ms")
         print(f"TTFT median:       {fmt_agg('ttft_median_ms')} ms")
         print(f"TTFT p95:          {fmt_agg('ttft_p95_ms')} ms")
@@ -562,6 +604,9 @@ def print_results(metrics: dict, label: str = "",
         print(f"Throughput (eff):   {metrics.get('throughput_rps', 0):.2f} req/s")
         print(f"Throughput (offer): {metrics.get('throughput_offered_rps', 0):.2f} req/s")
         print(f"Throughput (cap):  {metrics.get('throughput_capacity_rps', 0):.2f} req/s")
+        if "cache_hit_rate" in metrics:
+            print(f"Cache hit rate:    "
+                  f"{metrics.get('cache_hit_rate', 0):.4f}")
         print(f"TTFT mean:         {metrics.get('ttft_mean_ms', 'N/A'):.2f} ms")
         print(f"TTFT median:       {metrics.get('ttft_median_ms', 'N/A'):.2f} ms")
         print(f"TTFT p95:          {metrics.get('ttft_p95_ms', 'N/A'):.2f} ms")
@@ -634,6 +679,11 @@ def main():
                         "cache is reset via POST /reset_encoder_cache "
                         "before each round (requires VLLM_SERVER_DEV_MODE=1 "
                         "on the encoder worker).")
+    parser.add_argument("--encoder-log-path", type=str, default=None,
+                        help="Path to the encoder worker's log file. When "
+                        "set, after each round we trigger a reset (which "
+                        "logs the round's hit/miss stats) and parse the "
+                        "latest stats line into per-round metrics.")
     parser.add_argument("--global-warmup", type=int, default=20,
                         help="Number of requests to send before round 1 to "
                         "warm up CUDA kernels, cuDNN autotuning, and TCP "
@@ -708,8 +758,11 @@ def main():
             print(f"Round {round_idx + 1}/{num_rounds} (seed={round_seed})")
             print(f"{'='*60}")
 
-        # Reset encoder cache before each round so all rounds start cold
-        if args.encoder_url:
+        # Reset encoder cache before round 1 so rounds always start cold.
+        # For subsequent rounds the previous-round-end reset already cleared
+        # the cache; resetting again is harmless but skipped to avoid
+        # logging an empty stats line.
+        if args.encoder_url and round_idx == 0:
             reset_encoder_cache(args.encoder_url)
 
         if args.mode == "closed":
@@ -753,6 +806,25 @@ def main():
             )
 
         metrics = compute_metrics(results, wall_clock)
+
+        # Capture per-round cache hit/miss stats by triggering a reset
+        # (which causes the encoder worker to log this round's stats)
+        # and then parsing the latest stats line from the worker log.
+        # This also resets the cache for the next round.
+        if args.encoder_url:
+            reset_encoder_cache(args.encoder_url)
+            if args.encoder_log_path:
+                # Allow log buffer to flush
+                time.sleep(0.3)
+                stats = parse_latest_cache_stats(args.encoder_log_path)
+                if stats is not None:
+                    metrics.update(stats)
+                    print(f"  Cache stats: hits={stats['cache_hits']} "
+                          f"misses={stats['cache_misses']} "
+                          f"hit_rate={stats['cache_hit_rate']:.4f}")
+                else:
+                    print("  Cache stats: (could not parse encoder log)")
+
         per_round_metrics.append(metrics)
         last_metrics = metrics
         last_results = results
