@@ -48,21 +48,41 @@ def _run_vision_encoder(model, pixel_values, extra_kwargs,
         )
 
 
-def _load_video_frames(video_path: str) -> list:
-    """Load all frames from an mp4 as a list of HxWx3 uint8 numpy arrays
-    in RGB order (compatible with HF Qwen2.5-VL processor)."""
+def _load_video_frames(video_path: str, num_frames: int = 32) -> list:
+    """Load frames from an mp4, uniformly sampled to `num_frames` to match
+    vLLM's runtime VideoMediaIO behavior. Pass num_frames=-1 to load all.
+
+    Returns a list of HxWx3 uint8 numpy arrays in RGB order (compatible with
+    HF Qwen2.5-VL processor)."""
     import cv2
+    import numpy as np
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video {video_path}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        # Fall back to read-all if metadata is missing
+        target_idx_set: set[int] | None = None
+    elif num_frames > 0 and num_frames < total_frames:
+        target_idx_set = set(
+            np.linspace(0, total_frames - 1, num_frames, dtype=int).tolist()
+        )
+    else:
+        target_idx_set = None  # use all frames
+
     frames = []
+    idx = 0
     while True:
-        ok, frame_bgr = cap.read()
+        ok = cap.grab()
         if not ok:
             break
-        # OpenCV gives BGR; processor expects RGB
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        frames.append(frame_rgb)
+        if target_idx_set is None or idx in target_idx_set:
+            ret, frame_bgr = cap.retrieve()
+            if ret:
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                frames.append(frame_rgb)
+        idx += 1
     cap.release()
     if not frames:
         raise RuntimeError(f"No frames decoded from {video_path}")
@@ -127,16 +147,21 @@ def profile_image(model, processor, image: Image.Image, device: str,
 
 
 def profile_video(model, processor, video_path: str, device: str,
-                  num_warmup: int, num_iterations: int
+                  num_warmup: int, num_iterations: int,
+                  num_frames: int = 32,
                   ) -> tuple[list[float], int]:
     """Run the vision encoder on a video.
+
+    Frames are uniformly sampled to `num_frames` to match what vLLM's
+    runtime VideoMediaIO produces (default 32). Mismatching this value
+    will produce m_i in profile.json that doesn't match the runtime cache.
 
     Returns (per_iteration_times, m_i). For Qwen2.5-VL the processor
     accepts `videos=[list_of_frames]` and emits pixel_values_videos plus
     video_grid_thw. The visual encoder itself is the same module used for
     images, but with the video grid.
     """
-    frames = _load_video_frames(video_path)
+    frames = _load_video_frames(video_path, num_frames=num_frames)
     inputs = processor(
         videos=[frames],
         text="Describe this video.",
@@ -199,6 +224,10 @@ def main():
     parser.add_argument("--output-path", type=str, default=None)
     parser.add_argument("--m-i-override", type=str, default=None,
                         help="JSON mapping type_id -> m_i")
+    parser.add_argument("--video-num-frames", type=int, default=32,
+                        help="Frames to sample per video before encoding. "
+                             "Must match VideoMediaIO at serve time (default "
+                             "32). Pass -1 to use all frames.")
     args = parser.parse_args()
 
     with open(args.manifest_path) as f:
@@ -236,6 +265,7 @@ def main():
             times, m_i = profile_video(
                 model, processor, media_path, device,
                 args.num_warmup, args.num_iterations,
+                num_frames=args.video_num_frames,
             )
         else:
             print(f"Profiling {type_id} (image {info['resolution']})...")

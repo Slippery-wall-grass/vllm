@@ -51,7 +51,7 @@ decode_session: aiohttp.ClientSession | None = None
 ###############################################################################
 
 
-MM_TYPES = {"image_url", "audio_url", "input_audio"}
+MM_TYPES = {"image_url", "audio_url", "input_audio", "video_url"}
 
 
 def extract_mm_items(request_data: dict) -> list[dict]:
