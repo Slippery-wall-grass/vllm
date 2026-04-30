@@ -20,12 +20,23 @@ Dependencies:
 
 Note: VideoMMMU is gated (CC-BY-NC-SA-4.0). Run `huggingface-cli login`
 once and accept the dataset's license at https://huggingface.co/
-datasets/lmms-lab/VideoMMMU before using this script.
+datasets/lmms-lab/VideoMMMU before using this script — OR `git clone`
+the dataset locally and pass the path via --dataset-path. By default,
+the script auto-detects ./video-mmmu next to this file.
 
 Usage:
-    python preprocess_videommmu.py \
-        --num-types 5 \
-        --output-dir /tmp/vmmu_data
+    # Use HF Hub (gated; needs huggingface-cli login)
+    python preprocess_videommmu.py --num-types 5 --output-dir /tmp/vmmu_data
+
+    # Use a local clone (recommended; avoids re-fetching metadata)
+    git clone https://huggingface.co/datasets/lmms-lab/VideoMMMU \
+        benchmarks/encoder_cache/video-mmmu
+    python preprocess_videommmu.py --num-types 5 --output-dir /tmp/vmmu_data \
+        --dataset-path benchmarks/encoder_cache/video-mmmu
+
+Note on videos: the dataset only stores YouTube-style URLs in
+`link_selected`, not the video files themselves, so yt-dlp is still
+required even with --dataset-path.
 """
 
 import argparse
@@ -51,53 +62,110 @@ def _normalize_split_name(s: str) -> str:
     raise ValueError(f"unknown split {s}")
 
 
-def collect_url_counts(split: str, hf_token: str | None) -> Counter:
+def _load_config(
+    cfg: str,
+    dataset_path: str | None,
+    hf_token: str | None,
+):
+    """Load one VideoMMMU config from a local clone or from HF Hub.
+
+    Tries (in order): HF `load_dataset` on the local path, direct parquet
+    glob on the local path, then HF Hub.
+    """
+    from datasets import load_dataset
+
+    if dataset_path is not None:
+        # 1) Let HF resolve the local repo (works if the clone has
+        # dataset_infos.json or a README with YAML metadata that names the
+        # configs).
+        last_err: Exception | None = None
+        for inner in ("test", "train", "validation"):
+            try:
+                return load_dataset(
+                    dataset_path, cfg, split=inner, token=hf_token,
+                )
+            except Exception as e:  # noqa: BLE001 - try next split name
+                last_err = e
+        try:
+            from datasets import DatasetDict
+            dsd = load_dataset(dataset_path, cfg, token=hf_token)
+            if isinstance(dsd, DatasetDict) and len(dsd) >= 1:
+                only_split = next(iter(dsd.keys()))
+                print(f"  (using inner split '{only_split}')")
+                return dsd[only_split]
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+
+        # 2) Fall back to globbing parquet files directly. Try the typical
+        # HF dataset layouts.
+        import glob
+        from pathlib import Path
+        candidates = [
+            Path(dataset_path) / cfg,
+            Path(dataset_path) / "data" / cfg,
+            Path(dataset_path) / cfg.lower(),
+        ]
+        for cand in candidates:
+            files = sorted(glob.glob(str(cand / "*.parquet")))
+            if files:
+                print(f"  loading parquet files from {cand}")
+                ds = load_dataset(
+                    "parquet", data_files=files, split="train",
+                )
+                return ds
+        raise RuntimeError(
+            f"Could not load config {cfg} from local path "
+            f"{dataset_path!r}: {last_err}"
+        )
+
+    # No local path: load from HF Hub as before.
+    last_err = None
+    for inner in ("test", "train", "validation"):
+        try:
+            return load_dataset(
+                "lmms-lab/VideoMMMU", cfg, split=inner, token=hf_token,
+            )
+        except Exception as e:  # noqa: BLE001 - try next split name
+            last_err = e
+    try:
+        from datasets import DatasetDict
+        dsd = load_dataset("lmms-lab/VideoMMMU", cfg, token=hf_token)
+        if isinstance(dsd, DatasetDict) and len(dsd) >= 1:
+            only_split = next(iter(dsd.keys()))
+            print(f"  (using inner split '{only_split}')")
+            return dsd[only_split]
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            f"Failed to load config {cfg}: {e}; previous error: {last_err}"
+        ) from e
+    raise RuntimeError(f"Could not load config {cfg}")
+
+
+def collect_url_counts(
+    split: str,
+    hf_token: str | None,
+    dataset_path: str | None = None,
+) -> Counter:
     """Stream the dataset and count occurrences of each link_selected URL.
 
     VideoMMMU exposes three *configurations* (not splits): Perception,
     Comprehension, Adaptation. Each config has a single "test" split.
     We pass the config name via the second positional argument and the
     inner split via split="test".
-    """
-    from datasets import load_dataset
 
+    When `dataset_path` is provided, the dataset is loaded from that
+    local directory (e.g. a `git clone` of lmms-lab/VideoMMMU) instead
+    of HF Hub.
+    """
     counts: Counter = Counter()
     configs_to_scan = (
         ["Perception", "Comprehension", "Adaptation"]
         if split == "all" else [_normalize_split_name(split)]
     )
+    src = dataset_path if dataset_path else "lmms-lab/VideoMMMU"
     for cfg in configs_to_scan:
-        print(f"Loading lmms-lab/VideoMMMU config={cfg}...")
-        # Try the most common HF inner split names; fall back to picking
-        # whatever single split this config actually exposes.
-        ds = None
-        last_err: Exception | None = None
-        for inner in ("test", "train", "validation"):
-            try:
-                ds = load_dataset(
-                    "lmms-lab/VideoMMMU", cfg, split=inner, token=hf_token,
-                )
-                break
-            except Exception as e:  # noqa: BLE001 - try next split name
-                last_err = e
-        if ds is None:
-            # Fall back: load the whole DatasetDict and pick the single split
-            try:
-                from datasets import DatasetDict
-                dsd = load_dataset(
-                    "lmms-lab/VideoMMMU", cfg, token=hf_token,
-                )
-                if isinstance(dsd, DatasetDict) and len(dsd) >= 1:
-                    only_split = next(iter(dsd.keys()))
-                    ds = dsd[only_split]
-                    print(f"  (using inner split '{only_split}')")
-            except Exception as e:  # noqa: BLE001
-                raise RuntimeError(
-                    f"Failed to load config {cfg}: {e}; previous error: "
-                    f"{last_err}") from e
-        if ds is None:
-            raise RuntimeError(f"Could not load config {cfg}")
-
+        print(f"Loading {src} config={cfg}...")
+        ds = _load_config(cfg, dataset_path, hf_token)
         for row in ds:
             url = row.get("link_selected")
             if url:
@@ -267,7 +335,29 @@ def main():
     parser.add_argument("--hf-token", type=str, default=None,
                         help="HuggingFace token (or use huggingface-cli "
                              "login). VideoMMMU is gated.")
+    parser.add_argument("--dataset-path", type=str, default=None,
+                        help="Path to a local clone of "
+                             "lmms-lab/VideoMMMU. When set, dataset "
+                             "metadata is read from this directory "
+                             "instead of HF Hub. Defaults to "
+                             "<script_dir>/video-mmmu if it exists. "
+                             "(Note: video files themselves are still "
+                             "fetched via yt-dlp since the dataset only "
+                             "stores URLs.)")
     args = parser.parse_args()
+
+    # Auto-detect a local clone next to this script if --dataset-path was
+    # not explicitly set.
+    dataset_path = args.dataset_path
+    if dataset_path is None:
+        default_local = Path(__file__).resolve().parent / "video-mmmu"
+        if default_local.is_dir():
+            dataset_path = str(default_local)
+            print(f"Auto-detected local dataset clone at {dataset_path}")
+    elif not Path(dataset_path).is_dir():
+        raise RuntimeError(
+            f"--dataset-path {dataset_path!r} is not a directory"
+        )
 
     if not have_yt_dlp():
         print("WARNING: yt-dlp not found; downloads will fail. "
@@ -278,7 +368,7 @@ def main():
     video_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = args.manifest_path or str(output_dir / "manifest.json")
 
-    counts = collect_url_counts(args.split, args.hf_token)
+    counts = collect_url_counts(args.split, args.hf_token, dataset_path)
     if not counts:
         raise RuntimeError("No videos found in dataset")
 
