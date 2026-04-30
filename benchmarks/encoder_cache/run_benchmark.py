@@ -165,20 +165,33 @@ def build_guaranteed_warmup_workload(
     return workload
 
 
-def _build_media_content(media_path: str, media_type: str) -> dict:
-    """Build the OpenAI-style content part for an image or video."""
+def _build_media_content(
+    media_path: str, media_type: str, type_id: str | None = None
+) -> dict:
+    """Build the OpenAI-style content part for an image or video.
+
+    When `type_id` is provided, it is attached as the OpenAI-extension
+    `uuid` field. vLLM uses that uuid directly as the mm_hash (when no
+    hf_processor_mm_kwargs are set), which keeps the benchmark's notion
+    of "type" aligned with the runtime's notion of "cache key" — needed
+    for the distribution-aware cache to look up `hash_to_type` correctly.
+    """
     if media_type == "video":
         b64 = encode_file_to_base64(media_path)
-        return {
+        item = {
             "type": "video_url",
             "video_url": {"url": f"data:video/mp4;base64,{b64}"},
         }
-    # Default to image
-    b64 = encode_file_to_base64(media_path)
-    return {
-        "type": "image_url",
-        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-    }
+    else:
+        # Default to image
+        b64 = encode_file_to_base64(media_path)
+        item = {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+        }
+    if type_id is not None:
+        item["uuid"] = type_id
+    return item
 
 
 async def send_request(
@@ -188,14 +201,16 @@ async def send_request(
     image_path: str,
     max_tokens: int = 20,
     media_type: str = "image",
+    type_id: str | None = None,
 ) -> dict:
     """Send a single streaming request and measure TTFT and total latency.
 
     `image_path` is kept as the parameter name for backwards compatibility
     but accepts any media path (image or video). `media_type` controls the
-    payload type sent to the server.
+    payload type sent to the server. `type_id`, if provided, is sent as the
+    `uuid` of the MM content part so vLLM uses it as the mm_hash.
     """
-    media_content = _build_media_content(image_path, media_type)
+    media_content = _build_media_content(image_path, media_type, type_id=type_id)
     prompt_text = (
         "Describe this video briefly." if media_type == "video"
         else "Describe this image briefly."
@@ -298,7 +313,8 @@ async def run_benchmark_open(
             task = asyncio.create_task(
                 send_request(session, server_url, model,
                              item["image_path"], max_tokens,
-                             media_type=item.get("media_type", "image"))
+                             media_type=item.get("media_type", "image"),
+                             type_id=item["type_id"])
             )
             tasks.append((i, item["type_id"], task))
 
@@ -367,6 +383,7 @@ async def run_benchmark_closed(
                 session, server_url, model,
                 item["image_path"], max_tokens,
                 media_type=item.get("media_type", "image"),
+                type_id=item["type_id"],
             )
             result["request_id"] = i
             result["type_id"] = item["type_id"]

@@ -465,10 +465,13 @@ for t in lam_config['types']:
         'c_i': t['c_i'],
     }
 
-# Map image paths to type_ids. Note: at runtime the cache uses real mm_hashes,
-# this mapping is used by tests / debugging.
-for tid, info in manifest.items():
-    config['hash_to_type'][info['path']] = tid
+# run_benchmark.py sends each MM part with uuid=<type_id>. With no
+# hf_processor_mm_kwargs set, vLLM uses that uuid verbatim as the
+# mm_hash, so the runtime lookup key is the type_id itself.
+# (Without this, the mapping was keyed by file path and never matched
+# the runtime mm_hash, silently degrading distribution-aware to FIFO.)
+for tid in manifest.keys():
+    config['hash_to_type'][tid] = tid
 
 with open('$DIST_CONFIG_PATH', 'w') as f:
     json.dump(config, f, indent=2)
