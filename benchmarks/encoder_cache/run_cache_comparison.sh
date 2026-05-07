@@ -113,8 +113,26 @@ IMAGE_DIR="${WORK_DIR}/images"
 LOG_PATH="${WORK_DIR}/logs"
 
 # Distribution: JSON mapping type_id -> p_i
-# Default: generate a skewed Zipf-like distribution
+# Either pass DISTRIBUTION as a JSON string directly, OR pick a preset
+# via DISTRIBUTION_PRESET (uniform, zipf, zipf-light, zipf-heavy/skewed,
+# extreme, pareto-80-20, bimodal). DISTRIBUTION takes precedence; the
+# preset is only used when DISTRIBUTION is empty. Default behaviour
+# (both empty) falls back to a built-in zipf below.
 DISTRIBUTION="${DISTRIBUTION:-}"
+DISTRIBUTION_PRESET="${DISTRIBUTION_PRESET:-}"
+
+# How to ship media to the server. "file" (default) uses file:// URLs
+# so the server reads the media directly from disk via
+# --allowed-local-media-path; request bodies stay tiny so TTFT isn't
+# dominated by base64 upload + JSON parse. "base64" inlines the file
+# (slower; needed when client and server don't share a filesystem).
+MEDIA_MODE="${MEDIA_MODE:-file}"
+
+# Approximate target text-prompt length in tokens (~4 chars/token).
+# 0 = keep the original short "Describe this video briefly." prompt.
+# Use this to study how prefill cost scales with prompt length and to
+# shift the relative weight of encoder vs prefill in TTFT.
+PROMPT_TOKENS="${PROMPT_TOKENS:-0}"
 
 export UCX_TLS=all
 export UCX_NET_DEVICES=all
@@ -391,10 +409,19 @@ else
     # Step 2: Generate distribution if not provided
     ###########################################################################
     if [ -z "$DISTRIBUTION" ]; then
-        echo "Generating Zipf-like distribution for $NUM_TYPES types..."
-        DISTRIBUTION=$(python -c "
+        K_TOTAL=$(( NUM_TYPES + NUM_VIDEOS ))
+        if [ -n "$DISTRIBUTION_PRESET" ]; then
+            echo "Generating distribution from preset '$DISTRIBUTION_PRESET' "
+            echo "for $K_TOTAL types..."
+            DISTRIBUTION=$(python "$SCRIPT_DIR/gen_distribution.py" \
+                --preset "$DISTRIBUTION_PRESET" \
+                --num-types "$K_TOTAL")
+        else
+            echo "Generating default Zipf-like distribution for "
+            echo "$K_TOTAL types (no DISTRIBUTION / DISTRIBUTION_PRESET set)..."
+            DISTRIBUTION=$(python -c "
 import json, random
-K = $NUM_TYPES + $NUM_VIDEOS
+K = $K_TOTAL
 # Zipf weights: 1/1, 1/2, ..., 1/K (covers both image and video types)
 raw = [1.0/(i+1) for i in range(K)]
 # Shuffle so the highest probability is NOT always on the smallest
@@ -409,10 +436,13 @@ first_key = f'type_0'
 dist[first_key] = round(dist[first_key] + remainder, 4)
 print(json.dumps(dist))
 ")
+        fi
     fi
 fi
 
 echo "Distribution: $DISTRIBUTION"
+echo "Media mode: $MEDIA_MODE"
+echo "Prompt tokens: $PROMPT_TOKENS"
 
 ###############################################################################
 # Step 3: Profile encoder computation time (c_i)
@@ -522,6 +552,8 @@ run_trial() {
         --encoder-log-path "${LOG_PATH}/encoder_${label}_${START_TIME}.log" \
         --seed "$SEED" \
         --label "$label" \
+        --media-mode "$MEDIA_MODE" \
+        --prompt-tokens "$PROMPT_TOKENS" \
         --output-path "$WORK_DIR/results_${label}.json"
 
     cleanup_servers

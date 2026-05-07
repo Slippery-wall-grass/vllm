@@ -166,9 +166,23 @@ def build_guaranteed_warmup_workload(
 
 
 def _build_media_content(
-    media_path: str, media_type: str, type_id: str | None = None
+    media_path: str,
+    media_type: str,
+    type_id: str | None = None,
+    media_mode: str = "file",
 ) -> dict:
     """Build the OpenAI-style content part for an image or video.
+
+    `media_mode` controls how the media is referenced:
+
+    * "file" (default): emit a `file://<absolute_path>` URL. The server
+      reads the file directly from disk via `--allowed-local-media-path`.
+      This keeps request bodies tiny so TTFT isn't dominated by base64
+      upload + JSON parse — important for measuring encoder cache
+      effects, which would otherwise be drowned in transport overhead.
+    * "base64": inline the file as a base64 data URL. Useful when the
+      server can't share a filesystem with the client (containerized
+      remote setups).
 
     When `type_id` is provided, it is attached as the OpenAI-extension
     `uuid` field. vLLM uses that uuid directly as the mm_hash (when no
@@ -176,22 +190,75 @@ def _build_media_content(
     of "type" aligned with the runtime's notion of "cache key" — needed
     for the distribution-aware cache to look up `hash_to_type` correctly.
     """
-    if media_type == "video":
-        b64 = encode_file_to_base64(media_path)
-        item = {
-            "type": "video_url",
-            "video_url": {"url": f"data:video/mp4;base64,{b64}"},
-        }
+    media_mode = (media_mode or "file").lower()
+    if media_mode not in ("file", "base64"):
+        raise ValueError(
+            f"media_mode must be 'file' or 'base64', got {media_mode!r}")
+
+    if media_mode == "file":
+        # Use file:// so server short-circuits to local disk read. Make
+        # the path absolute so it's unambiguous regardless of the
+        # server's CWD, and forward-slash-normalised so it works on
+        # Windows clients too.
+        abs_path = os.path.abspath(media_path).replace("\\", "/")
+        url = f"file://{abs_path}"
     else:
-        # Default to image
         b64 = encode_file_to_base64(media_path)
-        item = {
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-        }
+        if media_type == "video":
+            url = f"data:video/mp4;base64,{b64}"
+        else:
+            url = f"data:image/jpeg;base64,{b64}"
+
+    if media_type == "video":
+        item = {"type": "video_url", "video_url": {"url": url}}
+    else:
+        item = {"type": "image_url", "image_url": {"url": url}}
+
     if type_id is not None:
         item["uuid"] = type_id
     return item
+
+
+# A long deterministic English passage used to pad prompts to a target
+# token count. Repeats a fixed paragraph so the same target_tokens
+# always yields the same string (no randomness across runs).
+_LOREM_PARAGRAPH = (
+    "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do "
+    "eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut "
+    "enim ad minim veniam, quis nostrud exercitation ullamco laboris "
+    "nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in "
+    "reprehenderit in voluptate velit esse cillum dolore eu fugiat "
+    "nulla pariatur. Excepteur sint occaecat cupidatat non proident, "
+    "sunt in culpa qui officia deserunt mollit anim id est laborum. "
+)
+
+
+def make_prompt_text(media_type: str, target_tokens: int = 0) -> str:
+    """Construct the text part of the prompt with a target length.
+
+    `target_tokens` is approximate (uses ~4 characters/token rule of
+    thumb). When 0 (the default), returns the original short prompt so
+    behaviour is unchanged for callers that don't care.
+
+    The text uses a fixed lorem-ipsum-like paragraph so the same
+    `target_tokens` produces the same string every run — no per-request
+    variability that would muddy the encoder-cache measurement.
+    """
+    suffix = (
+        "Describe this video briefly."
+        if media_type == "video"
+        else "Describe this image briefly."
+    )
+    if target_tokens <= 0:
+        return suffix
+
+    # ~4 chars per token (English BPE rule-of-thumb).
+    target_chars = max(0, target_tokens * 4 - len(suffix))
+    if target_chars <= 0:
+        return suffix
+    n_repeats = (target_chars // len(_LOREM_PARAGRAPH)) + 1
+    body = (_LOREM_PARAGRAPH * n_repeats)[:target_chars]
+    return f"{body} {suffix}"
 
 
 async def send_request(
@@ -202,6 +269,8 @@ async def send_request(
     max_tokens: int = 20,
     media_type: str = "image",
     type_id: str | None = None,
+    media_mode: str = "file",
+    prompt_text: str | None = None,
 ) -> dict:
     """Send a single streaming request and measure TTFT and total latency.
 
@@ -209,12 +278,24 @@ async def send_request(
     but accepts any media path (image or video). `media_type` controls the
     payload type sent to the server. `type_id`, if provided, is sent as the
     `uuid` of the MM content part so vLLM uses it as the mm_hash.
+
+    `media_mode` is "file" (default) or "base64" — see
+    `_build_media_content` for details. `prompt_text`, if not None,
+    overrides the default short prompt; pre-build it via
+    `make_prompt_text(media_type, target_tokens)` to avoid recomputing
+    it on every call.
+
+    TTFT is measured as the time from POST dispatch to the first SSE
+    chunk that carries a non-empty `delta.content` field. This excludes
+    the leading role chunk (`{"delta": {"role": "assistant"}}`) that
+    OpenAI-compatible servers usually send first, so the metric is a
+    true Time-To-First-Token instead of Time-To-First-Chunk.
     """
-    media_content = _build_media_content(image_path, media_type, type_id=type_id)
-    prompt_text = (
-        "Describe this video briefly." if media_type == "video"
-        else "Describe this image briefly."
+    media_content = _build_media_content(
+        image_path, media_type, type_id=type_id, media_mode=media_mode,
     )
+    if prompt_text is None:
+        prompt_text = make_prompt_text(media_type, target_tokens=0)
 
     payload = {
         "model": model,
@@ -248,19 +329,27 @@ async def send_request(
                     continue
                 for part in decoded.split("\n"):
                     part = part.strip()
-                    if part.startswith("data: ") and part != "data: [DONE]":
-                        if ttft is None:
-                            ttft = time.perf_counter() - start_time
-                        try:
-                            chunk = json.loads(part[6:])
-                            choices = chunk.get("choices", [])
-                            if choices:
-                                delta = choices[0].get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    output_tokens += 1
-                        except json.JSONDecodeError:
-                            pass
+                    if not (part.startswith("data: ")
+                            and part != "data: [DONE]"):
+                        continue
+                    try:
+                        chunk = json.loads(part[6:])
+                    except json.JSONDecodeError:
+                        continue
+                    choices = chunk.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+                    content = delta.get("content", "")
+                    # Only count chunks that carry actual generated
+                    # text. This skips the leading {"role": "assistant"}
+                    # chunk so TTFT measures Time-To-First-Token, not
+                    # Time-To-First-Chunk.
+                    if not content:
+                        continue
+                    if ttft is None:
+                        ttft = time.perf_counter() - start_time
+                    output_tokens += 1
 
         end_time = time.perf_counter()
         total_latency = end_time - start_time
@@ -292,6 +381,8 @@ async def run_benchmark_open(
     model: str,
     qps: float,
     max_tokens: int = 20,
+    media_mode: str = "file",
+    prompt_tokens: int = 0,
 ) -> tuple[list[dict], float]:
     """Open-loop benchmark: dispatch requests at a fixed QPS regardless of
     downstream latency. Useful for measuring steady-state TTFT at a given
@@ -302,6 +393,13 @@ async def run_benchmark_open(
     results = []
     interval = 1.0 / qps if qps > 0 else 0
 
+    # Pre-build prompt strings once per media_type so we don't recompute
+    # the lorem-padded text on every request.
+    prompt_cache = {
+        mt: make_prompt_text(mt, target_tokens=prompt_tokens)
+        for mt in {item.get("media_type", "image") for item in workload}
+    }
+
     connector = aiohttp.TCPConnector(limit=1000)
     bench_start = time.perf_counter()
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -310,11 +408,14 @@ async def run_benchmark_open(
             if i > 0 and interval > 0:
                 await asyncio.sleep(interval)
 
+            mt = item.get("media_type", "image")
             task = asyncio.create_task(
                 send_request(session, server_url, model,
                              item["image_path"], max_tokens,
-                             media_type=item.get("media_type", "image"),
-                             type_id=item["type_id"])
+                             media_type=mt,
+                             type_id=item["type_id"],
+                             media_mode=media_mode,
+                             prompt_text=prompt_cache[mt])
             )
             tasks.append((i, item["type_id"], task))
 
@@ -336,6 +437,8 @@ async def run_benchmark_closed(
     concurrency: int,
     warmup_requests: int,
     max_tokens: int = 20,
+    media_mode: str = "file",
+    prompt_tokens: int = 0,
 ) -> tuple[list[dict], float]:
     """Closed-loop (saturation) benchmark: N workers continuously pull from a
     shared queue and fire requests as fast as the server accepts them. This
@@ -363,6 +466,12 @@ async def run_benchmark_closed(
     connector = aiohttp.TCPConnector(limit=max(concurrency * 2, 100))
     total = len(workload)
 
+    # Pre-build prompt strings once per media_type.
+    prompt_cache = {
+        mt: make_prompt_text(mt, target_tokens=prompt_tokens)
+        for mt in {item.get("media_type", "image") for item in workload}
+    }
+
     async def worker(session: aiohttp.ClientSession, worker_id: int) -> None:
         nonlocal next_idx, measure_start, measure_end
         while True:
@@ -379,11 +488,14 @@ async def run_benchmark_closed(
             if not is_warmup and measure_start is None:
                 measure_start = time.perf_counter()
 
+            mt = item.get("media_type", "image")
             result = await send_request(
                 session, server_url, model,
                 item["image_path"], max_tokens,
-                media_type=item.get("media_type", "image"),
+                media_type=mt,
                 type_id=item["type_id"],
+                media_mode=media_mode,
+                prompt_text=prompt_cache[mt],
             )
             result["request_id"] = i
             result["type_id"] = item["type_id"]
@@ -718,6 +830,24 @@ def main():
     parser.add_argument("--label", type=str, default="",
                         help="Label for this benchmark run (e.g., 'fifo' or "
                         "'distribution_aware')")
+    parser.add_argument("--media-mode", type=str, default="file",
+                        choices=("file", "base64"),
+                        help="How to send media references. 'file' (default) "
+                        "uses file:// URLs so the server reads from "
+                        "local disk via --allowed-local-media-path; "
+                        "request bodies stay tiny so TTFT isn't "
+                        "dominated by base64 upload + JSON parse. "
+                        "'base64' inlines the file as a data URL "
+                        "(needed when client and server don't share a "
+                        "filesystem).")
+    parser.add_argument("--prompt-tokens", type=int, default=0,
+                        help="Approximate target length of the text part of "
+                        "the prompt, in tokens (~4 chars/token). 0 "
+                        "(default) keeps the original short prompt. "
+                        "Useful for studying how prefill cost scales "
+                        "with prompt length, since longer prompts "
+                        "increase TTFT and shift the relative weight "
+                        "of encoder vs prefill.")
     args = parser.parse_args()
 
     with open(args.manifest_path) as f:
@@ -753,11 +883,15 @@ def main():
                 warmup_wl, args.server_url, args.model,
                 min(args.concurrency, len(warmup_wl)),
                 warmup_requests=0, max_tokens=args.max_tokens,
+                media_mode=args.media_mode,
+                prompt_tokens=args.prompt_tokens,
             ))
         else:
             asyncio.run(run_benchmark_open(
                 warmup_wl, args.server_url, args.model,
                 args.qps, args.max_tokens,
+                media_mode=args.media_mode,
+                prompt_tokens=args.prompt_tokens,
             ))
         print("Global warmup done.\n")
 
@@ -812,6 +946,8 @@ def main():
                 run_benchmark_closed(
                     workload, args.server_url, args.model,
                     args.concurrency, args.warmup_requests, args.max_tokens,
+                    media_mode=args.media_mode,
+                    prompt_tokens=args.prompt_tokens,
                 )
             )
         else:
@@ -819,6 +955,8 @@ def main():
                 run_benchmark_open(
                     workload, args.server_url, args.model,
                     args.qps, args.max_tokens,
+                    media_mode=args.media_mode,
+                    prompt_tokens=args.prompt_tokens,
                 )
             )
 
