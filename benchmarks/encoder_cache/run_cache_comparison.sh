@@ -94,6 +94,13 @@ GPU_MEM_E="${GPU_MEM_E:-0.10}"
 GPU_MEM_P="${GPU_MEM_P:-0.60}"
 GPU_MEM_D="${GPU_MEM_D:-0.70}"
 
+# Encoder cache size knob. vLLM derives encoder_cache_size from
+# --max-num-batched-tokens (see vllm/config/scheduler.py:228), so this
+# value also caps how many encoder embedding tokens fit in the cache.
+# Lower values create cache pressure (good for seeing policy
+# differences); higher values let everything fit (all policies tie).
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-114688}"
+
 # Use /dev/shm (tmpfs in memory) by default to avoid disk IO jitter on
 # every encoder->prefill transfer. /dev/shm is a built-in tmpfs on almost
 # every Linux system - no mount / sudo required.
@@ -236,7 +243,7 @@ start_1e1p1d() {
         --enforce-eager \
         --enable-request-id-headers \
         --no-enable-prefix-caching \
-        --max-num-batched-tokens 114688 \
+        --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
         --max-num-seqs 128 \
         --allowed-local-media-path "$IMAGE_DIR" \
         $mm_limit_arg \
