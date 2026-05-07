@@ -128,6 +128,7 @@ class EncoderCacheManager:
         # Not cached at all
         if mm_hash not in self.cached:
             self.cache_misses += 1
+            self._maybe_log_trace(request, mm_hash, hit=False)
             return False
 
         # Cached but currently not referenced by any request
@@ -137,7 +138,27 @@ class EncoderCacheManager:
 
         self.cached[mm_hash].add(request.request_id)
         self.cache_hits += 1
+        self._maybe_log_trace(request, mm_hash, hit=True)
         return True
+
+    def _maybe_log_trace(
+        self, request: Request, mm_hash: str, hit: bool,
+    ) -> None:
+        """Emit one INFO line per cache check when VLLM_ENCODER_CACHE_TRACE
+        is enabled. Benchmarks parse these to reconstruct per-request
+        hit/miss curves. Format is stable; do not change without updating
+        parse_encoder_trace.py.
+        """
+        # Lazy-imported to avoid circular import overhead in hot path.
+        import vllm.envs as envs
+        if not envs.VLLM_ENCODER_CACHE_TRACE:
+            return
+        logger.info(
+            "EncoderCacheTrace req_id=%s mm_hash=%s hit=%d "
+            "cum_hits=%d cum_misses=%d",
+            request.request_id, mm_hash, int(hit),
+            self.cache_hits, self.cache_misses,
+        )
 
     def can_allocate(
         self,

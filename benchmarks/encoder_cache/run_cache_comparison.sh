@@ -232,11 +232,15 @@ start_1e1p1d() {
         mm_limit_arg='--limit-mm-per-prompt={"image":1,"video":1}'
     fi
 
-    # Encoder worker (dev mode enables /reset_encoder_cache endpoint)
+    # Encoder worker (dev mode enables /reset_encoder_cache endpoint).
+    # VLLM_ENCODER_CACHE_TRACE=1 makes the encoder cache manager log
+    # one INFO line per check_and_update_cache call so plot_real_hitrate
+    # can reconstruct the per-request hit rate. Set EC_TRACE=0 to skip.
     CUDA_VISIBLE_DEVICES="$GPU_E" \
     VLLM_SERVER_DEV_MODE=1 \
     VLLM_ENCODER_CACHE_POLICY="$policy" \
     VLLM_ENCODER_CACHE_CONFIG_PATH="$config_path" \
+    VLLM_ENCODER_CACHE_TRACE="${EC_TRACE:-1}" \
     vllm serve "$MODEL" \
         --gpu-memory-utilization "$GPU_MEM_E" \
         --port "$ENCODE_PORT" \

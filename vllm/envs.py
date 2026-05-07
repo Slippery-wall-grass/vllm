@@ -246,6 +246,7 @@ if TYPE_CHECKING:
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
     VLLM_ENCODER_CACHE_POLICY: str = "fifo"
     VLLM_ENCODER_CACHE_CONFIG_PATH: str | None = None
+    VLLM_ENCODER_CACHE_TRACE: bool = False
 
 
 def get_default_cache_root():
@@ -1643,6 +1644,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENCODER_CACHE_CONFIG_PATH": lambda: os.getenv(
         "VLLM_ENCODER_CACHE_CONFIG_PATH", None
     ),
+    # When set to "1"/"true", EncoderCacheManager.check_and_update_cache
+    # logs one INFO line per call ("EncoderCacheTrace ..."), enabling
+    # benchmarks to reconstruct per-request hit/miss curves. Off by
+    # default since it produces one log line per multimodal item.
+    "VLLM_ENCODER_CACHE_TRACE": lambda: os.getenv(
+        "VLLM_ENCODER_CACHE_TRACE", "0"
+    ).lower() in ("1", "true", "yes"),
 }
 
 
