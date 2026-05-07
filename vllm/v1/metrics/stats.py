@@ -352,6 +352,32 @@ class IterationStats:
             self.time_to_first_tokens_iter.append(first_token_latency)
             req_stats.first_token_latency = first_token_latency
 
+            # When VLLM_REQUEST_TIMING_TRACE is on, emit one INFO line at
+            # the moment first_token_latency is computed for this request.
+            # This is the prefill engine's view of: arrival -> queue ->
+            # schedule -> first token. Combined with the encoder side's
+            # EncoderForwardTrace and the client-side TTFT, you can
+            # decompose end-to-end TTFT into its constituent phases.
+            if envs.VLLM_REQUEST_TIMING_TRACE:
+                # All timestamps are CLOCK_MONOTONIC seconds (not
+                # wall-clock) — they're only meaningful as deltas.
+                arrival = req_stats.arrival_time
+                queued = req_stats.queued_ts or arrival
+                scheduled = req_stats.scheduled_ts or queued
+                first_token = engine_core_timestamp
+                queued_ms = max(0.0, (scheduled - queued) * 1000.0)
+                prefill_ms = max(0.0, (first_token - scheduled) * 1000.0)
+                pre_queue_ms = max(0.0, (queued - arrival) * 1000.0)
+                from vllm.logger import init_logger
+                _trace_logger = init_logger("vllm.v1.metrics.stats.trace")
+                _trace_logger.info(
+                    "RequestPhases req_id=%s arrival=%.6f "
+                    "pre_queue_ms=%.3f queued_ms=%.3f prefill_ms=%.3f "
+                    "first_token_latency_ms=%.3f prompt_len=%d",
+                    output.request_id, arrival, pre_queue_ms, queued_ms,
+                    prefill_ms, first_token_latency * 1000.0, prompt_len,
+                )
+
         req_stats.num_generation_tokens += num_new_generation_tokens
 
         # Track if this request is corrupted (only check once per request)

@@ -259,6 +259,7 @@ start_1e1p1d() {
     VLLM_ENCODER_CACHE_POLICY="$policy" \
     VLLM_ENCODER_CACHE_CONFIG_PATH="$config_path" \
     VLLM_ENCODER_CACHE_TRACE="${EC_TRACE:-1}" \
+    VLLM_REQUEST_TIMING_TRACE="${TIMING_TRACE:-1}" \
     vllm serve "$MODEL" \
         --gpu-memory-utilization "$GPU_MEM_E" \
         --port "$ENCODE_PORT" \
@@ -286,6 +287,7 @@ start_1e1p1d() {
     VLLM_NIXL_SIDE_CHANNEL_PORT=5559 \
     VLLM_ENCODER_CACHE_POLICY="$policy" \
     VLLM_ENCODER_CACHE_CONFIG_PATH="$config_path" \
+    VLLM_REQUEST_TIMING_TRACE="${TIMING_TRACE:-1}" \
     vllm serve "$MODEL" \
         --gpu-memory-utilization "$GPU_MEM_P" \
         --port "$PREFILL_PORT" \

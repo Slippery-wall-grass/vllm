@@ -315,6 +315,7 @@ async def send_request(
     start_time = time.perf_counter()
     ttft = None
     output_tokens = 0
+    server_request_id: str | None = None
 
     try:
         async with session.post(
@@ -323,6 +324,13 @@ async def send_request(
             timeout=aiohttp.ClientTimeout(total=120),
         ) as response:
             response.raise_for_status()
+            # The server emits X-Request-Id when --enable-request-id-headers
+            # is set on the prefill worker. Capture it so we can correlate
+            # with VLLM_REQUEST_TIMING_TRACE log lines on the server side.
+            server_request_id = (
+                response.headers.get("X-Request-Id")
+                or response.headers.get("x-request-id")
+            )
             async for line in response.content:
                 decoded = line.decode("utf-8").strip()
                 if not decoded:
@@ -361,6 +369,7 @@ async def send_request(
             "success": ttft is not None,
             "send_time": start_time,
             "complete_time": end_time,
+            "server_request_id": server_request_id,
         }
     except Exception as e:
         end_time = time.perf_counter()
@@ -372,6 +381,7 @@ async def send_request(
             "error": str(e),
             "send_time": start_time,
             "complete_time": end_time,
+            "server_request_id": server_request_id,
         }
 
 

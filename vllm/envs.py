@@ -247,6 +247,7 @@ if TYPE_CHECKING:
     VLLM_ENCODER_CACHE_POLICY: str = "fifo"
     VLLM_ENCODER_CACHE_CONFIG_PATH: str | None = None
     VLLM_ENCODER_CACHE_TRACE: bool = False
+    VLLM_REQUEST_TIMING_TRACE: bool = False
 
 
 def get_default_cache_root():
@@ -1650,6 +1651,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # default since it produces one log line per multimodal item.
     "VLLM_ENCODER_CACHE_TRACE": lambda: os.getenv(
         "VLLM_ENCODER_CACHE_TRACE", "0"
+    ).lower() in ("1", "true", "yes"),
+    # When set, emits per-request phase timing log lines on encoder
+    # ("EncoderForwardTrace req_id=... duration_ms=...") and prefill
+    # ("RequestPhases req_id=... arrival=... queued_ms=... "
+    # "prefill_ms=... first_token_latency_ms=...") sides so a benchmark
+    # can break TTFT into network / queue / encoder forward / prefill /
+    # decode components per request. One line per phase per request —
+    # not free at high QPS but cheap below ~100 req/s.
+    "VLLM_REQUEST_TIMING_TRACE": lambda: os.getenv(
+        "VLLM_REQUEST_TIMING_TRACE", "0"
     ).lower() in ("1", "true", "yes"),
 }
 

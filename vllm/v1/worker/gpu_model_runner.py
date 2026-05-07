@@ -6286,6 +6286,21 @@ class GPUModelRunner(
                     stats.encoder_forward_secs += per_request_time
                     stats.num_encoder_calls += 1
 
+            # When VLLM_REQUEST_TIMING_TRACE is on, emit one INFO line per
+            # encoder forward group so a benchmark can reconstruct the
+            # encoder portion of TTFT per request. (Cache HITs do not call
+            # _execute_mm_encoder, so absence of this line for a given
+            # req_id implies "encoder skipped — cache hit".)
+            import vllm.envs as envs
+            if envs.VLLM_REQUEST_TIMING_TRACE:
+                logger.info(
+                    "EncoderForwardTrace req_ids=%s num_items=%d "
+                    "duration_ms=%.3f per_request_ms=%.3f",
+                    ",".join(sorted(group_request_ids)),
+                    num_items, elapsed * 1000.0,
+                    per_request_time * 1000.0,
+                )
+
 
 @dataclass
 class EncoderTimingStats:
