@@ -160,6 +160,46 @@ class EncoderCacheManager:
             self.cache_hits, self.cache_misses,
         )
 
+    def _maybe_log_occupancy(self, event: str) -> None:
+        """Emit one INFO line whenever pinned/freeable/free occupancy
+        changes (controlled by VLLM_ENCODER_CACHE_TRACE).
+
+        The three categories are derived from the manager's internal
+        counters:
+            pinned   = cache_size - num_freeable_slots
+                       (held by in-flight requests, cannot evict)
+            freeable = num_freeable_slots - num_free_slots
+                       (no live ref but still resident; evictable)
+            free     = num_free_slots
+                       (physically empty)
+
+        `event` is one of "allocate" | "free" | "evict" so we can see
+        which transition produced this snapshot.
+        """
+        import vllm.envs as envs
+        if not envs.VLLM_ENCODER_CACHE_TRACE:
+            return
+        # `_occupancy_t0` is set on first call; later timestamps are
+        # relative to it so the log is timezone- and clock-skew-free.
+        import time
+        t0 = getattr(self, "_occupancy_t0", None)
+        if t0 is None:
+            t0 = time.monotonic()
+            self._occupancy_t0 = t0
+        t_rel = time.monotonic() - t0
+        pinned = self.cache_size - self.num_freeable_slots
+        freeable_only = self.num_freeable_slots - self.num_free_slots
+        free = self.num_free_slots
+        logger.info(
+            "EncoderCacheOccupancy event=%s t=%.6f cache_size=%d "
+            "pinned=%d freeable=%d free=%d num_pinned_entries=%d "
+            "num_freeable_entries=%d",
+            event, t_rel, self.cache_size,
+            pinned, freeable_only, free,
+            sum(1 for v in self.cached.values() if v),
+            len(self.freeable),
+        )
+
     def can_allocate(
         self,
         request: Request,
@@ -214,11 +254,15 @@ class EncoderCacheManager:
         # Not enough free slots but enough reclaimable slots
         # NOTE: Eviction takes place here, but physical memory is not freed
         # until model runner is notified by the scheduler output.
+        evicted_any = False
         while num_embeds > self.num_free_slots:
             mm_hash, num_free_embeds = self.freeable.popitem(last=False)
             del self.cached[mm_hash]
             self.freed.append(mm_hash)
             self.num_free_slots += num_free_embeds
+            evicted_any = True
+        if evicted_any:
+            self._maybe_log_occupancy("evict")
         return True
 
     def allocate(self, request: Request, input_id: int) -> None:
@@ -247,6 +291,7 @@ class EncoderCacheManager:
         self.cached[mm_hash].add(request_id)
         self.num_free_slots -= num_encoder_embeds
         self.num_freeable_slots -= num_encoder_embeds
+        self._maybe_log_occupancy("allocate")
 
     def get_cached_input_ids(self, request: Request) -> set[int]:
         """Get all cached multimodal input IDs for a request.
@@ -282,6 +327,9 @@ class EncoderCacheManager:
             num_encoder_embeds = request.get_num_encoder_embeds(input_id)
             self.freeable[mm_hash] = num_encoder_embeds
             self.num_freeable_slots += num_encoder_embeds
+            # Pinned shrunk; freeable grew. Log so plot_occupancy.py
+            # can render the over-time stacked-area chart.
+            self._maybe_log_occupancy("free")
 
     def free(self, request: Request) -> None:
         """Free all encoder input cache reference held by *request*.
@@ -593,6 +641,7 @@ class DistributionAwareCacheManager(EncoderCacheManager):
             h for h in self.freeable
             if self.evictability.get(h, True)
         ]
+        evicted_any = False
         for mm_hash in evictable_hashes:
             if num_embeds <= self.num_free_slots:
                 break
@@ -601,6 +650,7 @@ class DistributionAwareCacheManager(EncoderCacheManager):
             self.evictability.pop(mm_hash, None)
             self.freed.append(mm_hash)
             self.num_free_slots += num_free_embeds
+            evicted_any = True
 
         # Phase 2: if still not enough, fall back to FIFO on non-evictables
         while num_embeds > self.num_free_slots:
@@ -609,7 +659,10 @@ class DistributionAwareCacheManager(EncoderCacheManager):
             self.evictability.pop(mm_hash, None)
             self.freed.append(mm_hash)
             self.num_free_slots += num_free_embeds
+            evicted_any = True
 
+        if evicted_any:
+            self._maybe_log_occupancy("evict")
         return True
 
     def get_hit_rate(self) -> float:
