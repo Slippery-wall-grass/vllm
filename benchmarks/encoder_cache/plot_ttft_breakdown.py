@@ -72,13 +72,34 @@ def _parse_logs(work_dir: Path, strat: str
     encoder_per_req_ms: rid -> per_request_ms (sum if multiple groups)
     prefill_phases_per_req: rid -> {pre_queue_ms, queued_ms, prefill_ms,
                                     first_token_latency_ms, prompt_len}
+
+    EncoderForwardTrace lives on the encoder worker. RequestPhases is
+    emitted by the engine that processes the EngineCoreOutput which
+    carries the first generated token; in disagg 1E1P1D this is
+    typically the **decode** worker (the prefill engine produces KV
+    only; the decode engine takes over and is what actually runs the
+    output_processor that fires RequestPhases). We therefore search
+    every {prefill,decode,encoder}_<strat>_*.log so it works regardless
+    of which side runs the OutputProcessor.
     """
-    enc_logs = sorted((work_dir / "logs").glob(f"encoder_{strat}_*.log"))
-    pref_logs = sorted((work_dir / "logs").glob(f"prefill_{strat}_*.log"))
+    log_dir = work_dir / "logs"
+    enc_logs = sorted(log_dir.glob(f"encoder_{strat}_*.log"))
+    # Try decode first (the most likely location), then prefill, then
+    # encoder, then any *_<strat>_*.log as a last resort.
+    phase_candidates: list[Path] = []
+    for prefix in ("decode", "prefill", "encoder"):
+        phase_candidates.extend(sorted(log_dir.glob(f"{prefix}_{strat}_*.log")))
+    # Dedup while preserving order
+    seen_paths: set[Path] = set()
+    phase_logs: list[Path] = []
+    for p in phase_candidates:
+        if p not in seen_paths:
+            seen_paths.add(p)
+            phase_logs.append(p)
 
     encoder: dict[str, float] = {}
-    if enc_logs:
-        with enc_logs[-1].open(encoding="utf-8", errors="replace") as f:
+    for path in enc_logs:
+        with path.open(encoding="utf-8", errors="replace") as f:
             for line in f:
                 m = ENC_RE.search(line)
                 if not m:
@@ -90,8 +111,8 @@ def _parse_logs(work_dir: Path, strat: str
                         encoder[rid] = encoder.get(rid, 0.0) + per_req
 
     prefill: dict[str, dict] = {}
-    if pref_logs:
-        with pref_logs[-1].open(encoding="utf-8", errors="replace") as f:
+    for path in phase_logs:
+        with path.open(encoding="utf-8", errors="replace") as f:
             for line in f:
                 m = PHASE_RE.search(line)
                 if not m:
@@ -105,7 +126,10 @@ def _parse_logs(work_dir: Path, strat: str
                     "prefill_ms": float(m.group("pf")),
                     "first_token_latency_ms": float(m.group("lat")),
                     "prompt_len": int(m.group("plen")),
+                    "_source": path.name,
                 }
+        if prefill:
+            break  # found a log file with phase data; don't double-count
     return encoder, prefill
 
 
@@ -212,8 +236,10 @@ def main() -> None:
             continue
         encoder, prefill = _parse_logs(work_dir, key)
         if not prefill:
-            print(f"  {key:<10} no RequestPhases in prefill log "
-                  f"(VLLM_REQUEST_TIMING_TRACE off?)")
+            print(f"  {key:<10} no RequestPhases lines found in any "
+                  f"{{encoder,prefill,decode}}_{key}_*.log file. "
+                  f"Likely VLLM_REQUEST_TIMING_TRACE wasn't set on the "
+                  f"workers; restart workers and re-run.")
             continue
         rows = _build_breakdown(raw, encoder, prefill)
         if args.exclude_warmup:
@@ -222,7 +248,11 @@ def main() -> None:
             continue
         breakdowns[key] = rows
         n_hit = sum(1 for r in rows if r["cache_hit"])
+        # Sample one phase row to show where it was sourced
+        src = next(iter(prefill.values())).get("_source", "?")
         print(f"  {key:<10} merged={len(rows)} of {len(raw)} requests; "
+              f"phases from {src}; "
+              f"encoder-trace lines={len(encoder)}; "
               f"cache hits in trace = {n_hit} "
               f"({n_hit/len(rows)*100:.1f}%)")
 

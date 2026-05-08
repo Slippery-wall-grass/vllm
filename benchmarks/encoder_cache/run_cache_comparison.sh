@@ -314,6 +314,7 @@ start_1e1p1d() {
     CUDA_VISIBLE_DEVICES="$GPU_D" \
     UCX_NET_DEVICES=all \
     VLLM_NIXL_SIDE_CHANNEL_PORT=6000 \
+    VLLM_REQUEST_TIMING_TRACE="${TIMING_TRACE:-1}" \
     vllm serve "$MODEL" \
         --gpu-memory-utilization "$GPU_MEM_D" \
         --port "$DECODE_PORT" \
