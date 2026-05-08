@@ -359,12 +359,26 @@ class IterationStats:
             # EncoderForwardTrace and the client-side TTFT, you can
             # decompose end-to-end TTFT into its constituent phases.
             if envs.VLLM_REQUEST_TIMING_TRACE:
-                # All timestamps are CLOCK_MONOTONIC seconds (not
-                # wall-clock) — they're only meaningful as deltas.
+                # In disagg P/D, queued_ts and scheduled_ts events only
+                # fire on the engine that actually queued/scheduled the
+                # request (prefill side). Decode-side stats inherit
+                # zeros for those fields, so pre_queue_ms / queued_ms /
+                # prefill_ms can all be 0 even when first_token_latency
+                # is non-zero. That's expected, not a bug — first_token
+                # latency on the decode side IS basically the time from
+                # arrival-at-decode to first sampled token, which lumps
+                # P→D KV transfer + first decode forward together.
+                #
+                # We log raw timestamps too so the parser can decide
+                # whether each delta is meaningful (>0) or inherited (=0).
                 arrival = req_stats.arrival_time
-                queued = req_stats.queued_ts or arrival
-                scheduled = req_stats.scheduled_ts or queued
+                queued_raw = req_stats.queued_ts
+                scheduled_raw = req_stats.scheduled_ts
                 first_token = engine_core_timestamp
+                # Anchor every delta against arrival when the upstream
+                # event timestamp is zero (decode side).
+                queued = queued_raw if queued_raw > 0 else arrival
+                scheduled = scheduled_raw if scheduled_raw > 0 else queued
                 queued_ms = max(0.0, (scheduled - queued) * 1000.0)
                 prefill_ms = max(0.0, (first_token - scheduled) * 1000.0)
                 pre_queue_ms = max(0.0, (queued - arrival) * 1000.0)
@@ -372,10 +386,13 @@ class IterationStats:
                 _trace_logger = init_logger("vllm.v1.metrics.stats.trace")
                 _trace_logger.info(
                     "RequestPhases req_id=%s arrival=%.6f "
+                    "queued_raw=%.6f scheduled_raw=%.6f "
+                    "first_token=%.6f "
                     "pre_queue_ms=%.3f queued_ms=%.3f prefill_ms=%.3f "
                     "first_token_latency_ms=%.3f prompt_len=%d",
-                    output.request_id, arrival, pre_queue_ms, queued_ms,
-                    prefill_ms, first_token_latency * 1000.0, prompt_len,
+                    output.request_id, arrival, queued_raw, scheduled_raw,
+                    first_token, pre_queue_ms, queued_ms, prefill_ms,
+                    first_token_latency * 1000.0, prompt_len,
                 )
 
         req_stats.num_generation_tokens += num_new_generation_tokens

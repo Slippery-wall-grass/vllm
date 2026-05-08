@@ -51,6 +51,11 @@ PHASE_RE = re.compile(
     r"RequestPhases\s+"
     r"req_id=(?P<rid>\S+)\s+"
     r"arrival=(?P<arr>[\d.]+)\s+"
+    # Newer log format includes raw timestamps (queued_raw, scheduled_raw,
+    # first_token); older format omits them. Make them optional.
+    r"(?:queued_raw=(?P<qraw>[\d.]+)\s+"
+    r"scheduled_raw=(?P<sraw>[\d.]+)\s+"
+    r"first_token=(?P<ftraw>[\d.]+)\s+)?"
     r"pre_queue_ms=(?P<pre>[\d.]+)\s+"
     r"queued_ms=(?P<q>[\d.]+)\s+"
     r"prefill_ms=(?P<pf>[\d.]+)\s+"
@@ -121,6 +126,13 @@ def _parse_logs(work_dir: Path, strat: str
                 if rid in prefill:
                     continue  # only first occurrence per rid
                 prefill[rid] = {
+                    "arrival": float(m.group("arr")),
+                    "queued_raw": (float(m.group("qraw"))
+                                   if m.group("qraw") else 0.0),
+                    "scheduled_raw": (float(m.group("sraw"))
+                                      if m.group("sraw") else 0.0),
+                    "first_token_raw": (float(m.group("ftraw"))
+                                        if m.group("ftraw") else 0.0),
                     "pre_queue_ms": float(m.group("pre")),
                     "queued_ms": float(m.group("q")),
                     "prefill_ms": float(m.group("pf")),
@@ -162,6 +174,25 @@ def _build_breakdown(results: list[dict], encoder: dict[str, float],
     `chatcmpl-` and may append further mangling. We index server logs
     by the embedded uuid substring so the join is robust to those
     transformations.
+
+    Decomposition (works in both monolithic and disagg E/P/D):
+      * encoder_ms  — from EncoderForwardTrace on the encoder worker
+        (0 ⇒ this request hit the cache and skipped encoder forward)
+      * engine_ttft_ms — first_token_latency_ms from RequestPhases.
+        On a monolithic engine: full server-internal time from request
+        arrival to first sampled token (queue + prefill + first decode).
+        On disagg D: time from "request landed on D" to first sampled
+        token, i.e. KV-transfer-wait + first decode forward. The
+        prefill compute itself happens on P and is NOT counted here;
+        it falls into 'other' below.
+      * other_ms = client_ttft − encoder_ms − engine_ttft_ms.
+        Catches everything else: proxy hops, P-side prefill (in disagg),
+        EC save+load, network. Can be negative if encoder runs in
+        parallel with downstream work or if clocks drift.
+
+    queued_ms / prefill_ms from the log are also stored on each row
+    for inspection, but they're typically zero on the disagg D side
+    because QUEUED/SCHEDULED engine-core events fire on P, not D.
     """
     encoder_idx = _index_by_substring(encoder)
     prefill_idx = _index_by_substring(prefill)
@@ -177,24 +208,21 @@ def _build_breakdown(results: list[dict], encoder: dict[str, float],
             # request still in flight at log read time). Skip.
             continue
         client_ttft_ms = r["ttft"] * 1000.0
-        queue_ms = ph["queued_ms"]
-        prefill_ms = ph["prefill_ms"]
-        # 'other' captures everything we don't have explicit numbers for:
-        # client→proxy network, proxy→encoder hop, EC save+load, proxy→
-        # prefill hop, prefill→client first chunk send, etc. Can be
-        # negative if clocks drift or encoder forward overlaps; floor at 0
-        # for stacked plot but keep raw for printing.
-        other_ms = client_ttft_ms - enc_ms - queue_ms - prefill_ms
+        engine_ttft_ms = ph["first_token_latency_ms"]
+        other_ms = client_ttft_ms - enc_ms - engine_ttft_ms
         out.append({
             "request_id": rid,
             "type_id": r.get("type_id"),
             "send_time": r["send_time"],
             "client_ttft_ms": client_ttft_ms,
             "encoder_ms": enc_ms,
-            "queue_ms": queue_ms,
-            "prefill_ms": prefill_ms,
+            "engine_ttft_ms": engine_ttft_ms,
+            # Sub-breakdown of engine_ttft_ms (mostly informational —
+            # zero on disagg D side):
+            "queue_ms": ph["queued_ms"],
+            "prefill_ms": ph["prefill_ms"],
             "other_ms": other_ms,
-            "cache_hit": enc_ms == 0.0,  # no encoder forward → hit
+            "cache_hit": enc_ms == 0.0,
             "phase": r.get("phase", "measure"),
         })
     return out
@@ -262,11 +290,16 @@ def main() -> None:
     # ---------- Figure ----------
     fig, (ax_bar, ax_time) = plt.subplots(2, 1, figsize=(11, 9))
 
-    # Top: stacked-bar of mean phase durations per strategy
-    phase_keys = ["encoder_ms", "queue_ms", "prefill_ms", "other_ms"]
-    phase_labels = ["Encoder fwd", "Queue (prefill)", "Prefill→1st tok",
-                    "Other (transport/EC/network)"]
-    phase_colors = ["tab:red", "tab:orange", "tab:purple", "lightgray"]
+    # Top: stacked-bar of mean phase durations per strategy. Three
+    # components that always sum (modulo clipping) to client_ttft:
+    #   encoder_ms (E side, 0 on hit)
+    #   engine_ttft_ms (D side: arrival→first sampled token)
+    #   other_ms (everything else: P prefill, EC, proxy hops, net)
+    phase_keys = ["encoder_ms", "engine_ttft_ms", "other_ms"]
+    phase_labels = ["Encoder forward (E)",
+                    "Engine arrival→1st token (D)",
+                    "Other (P prefill / EC / proxy / net)"]
+    phase_colors = ["tab:red", "tab:purple", "lightgray"]
 
     strat_keys = [k for k, *_ in STRATS if k in breakdowns]
     strat_pretty = {k: lbl for k, lbl, _ in STRATS}
@@ -320,19 +353,16 @@ def main() -> None:
         rows = rows[::step][:args.sample]
     xs = list(range(len(rows)))
     enc = [r["encoder_ms"] for r in rows]
-    pf = [r["prefill_ms"] for r in rows]
-    q = [r["queue_ms"] for r in rows]
+    eng = [r["engine_ttft_ms"] for r in rows]
     other = [max(0.0, r["other_ms"]) for r in rows]
     ttft = [r["client_ttft_ms"] for r in rows]
 
-    ax_time.bar(xs, enc, color="tab:red", alpha=0.75, label="Encoder fwd",
-                width=1.0, edgecolor="none")
-    ax_time.bar(xs, q, bottom=enc, color="tab:orange", alpha=0.75,
-                label="Queue", width=1.0, edgecolor="none")
-    ax_time.bar(xs, pf, bottom=[a + b for a, b in zip(enc, q)],
-                color="tab:purple", alpha=0.75, label="Prefill",
-                width=1.0, edgecolor="none")
-    ax_time.bar(xs, other, bottom=[a + b + c for a, b, c in zip(enc, q, pf)],
+    ax_time.bar(xs, enc, color="tab:red", alpha=0.75,
+                label="Encoder forward", width=1.0, edgecolor="none")
+    ax_time.bar(xs, eng, bottom=enc, color="tab:purple", alpha=0.75,
+                label="Engine arrival→1st token (D)", width=1.0,
+                edgecolor="none")
+    ax_time.bar(xs, other, bottom=[a + b for a, b in zip(enc, eng)],
                 color="lightgray", alpha=0.6, label="Other",
                 width=1.0, edgecolor="none")
     ax_time.plot(xs, ttft, color="black", linewidth=0.8, alpha=0.6,
@@ -352,8 +382,8 @@ def main() -> None:
 
     # Numerical summary
     print("\nMean phase breakdown per strategy (ms):")
-    header = (f"{'strategy':<22} {'TTFT':>7} {'enc':>7} {'queue':>7} "
-              f"{'prefill':>7} {'other':>7} {'hit%':>6}")
+    header = (f"{'strategy':<22} {'TTFT':>7} {'enc':>7} "
+              f"{'engine':>7} {'other':>7} {'hit%':>6}")
     print(header)
     print("-" * len(header))
     for k in strat_keys:
@@ -363,10 +393,20 @@ def main() -> None:
         print(f"{strat_pretty[k]:<22} "
               f"{m['client_ttft_ms']:>7.1f} "
               f"{m['encoder_ms']:>7.1f} "
-              f"{m['queue_ms']:>7.1f} "
-              f"{m['prefill_ms']:>7.1f} "
+              f"{m['engine_ttft_ms']:>7.1f} "
               f"{m['other_ms']:>7.1f} "
               f"{n_hit/len(rows)*100:>5.1f}%")
+    # Sub-breakdown of engine_ttft into queue / prefill (informational
+    # — these are non-zero only on the engine that owns the QUEUED /
+    # SCHEDULED events, i.e. monolithic engines or the prefill side).
+    print("\n  (engine_ttft sub-components on the engine that owns "
+          "queued/scheduled events; will be 0 on disagg D side):")
+    for k in strat_keys:
+        rows = breakdowns[k]
+        avg_q = statistics.mean(r["queue_ms"] for r in rows)
+        avg_pf = statistics.mean(r["prefill_ms"] for r in rows)
+        print(f"    {strat_pretty[k]:<22} queue={avg_q:>6.1f}ms  "
+              f"prefill={avg_pf:>6.1f}ms")
 
     if args.show:
         plt.show()
