@@ -298,9 +298,53 @@ def main() -> None:
             n_hit = sum(1 for r in rows if r["cache_hit"])
             hit_str = (f"cache hits in trace = {n_hit} "
                        f"({n_hit/len(rows)*100:.1f}%)")
+        # Count requests that actually had a non-zero encoder match.
+        # If encoder-trace lines > 0 but n_with_enc == 0 → uuid index
+        # is missing the client's server_request_id, almost always
+        # because the proxy forwarded a different x-request-id to the
+        # encoder than the one it returned to the client.
+        n_with_enc = sum(1 for r in rows if r["encoder_ms"] > 0.0)
         print(f"  {key:<10} merged={len(rows)} of {len(raw)} requests; "
               f"phases from {src}; "
-              f"encoder-trace lines={len(encoder)}; {hit_str}")
+              f"encoder-trace lines={len(encoder)}; "
+              f"with-enc={n_with_enc}; {hit_str}")
+        if encoder and n_with_enc == 0:
+            # Show one sample of each side so the mismatch is obvious.
+            sample_enc_keys = [
+                k for k in encoder.keys()
+                if not k.startswith(tuple(str(x) for x in range(10)))
+            ][:3] or list(encoder.keys())[:3]
+            sample_client_rids = [
+                r["server_request_id"] for r in raw
+                if r.get("server_request_id")
+            ][:3]
+            print(f"    DIAG: encoder log keys (sample): "
+                  f"{sample_enc_keys}")
+            print(f"    DIAG: client server_request_ids (sample): "
+                  f"{sample_client_rids}")
+            # Check: does any client uuid appear as substring of any
+            # encoder key? If yes, the lookup logic is broken; if no,
+            # it's a request_id propagation issue at the proxy.
+            client_uuid_set = {r["server_request_id"] for r in raw
+                               if r.get("server_request_id")}
+            n_overlap = sum(
+                1 for k in encoder.keys()
+                if any(uid in k for uid in client_uuid_set)
+            )
+            print(f"    DIAG: encoder keys whose string contains some "
+                  f"client uuid: {n_overlap}/{len(encoder)}")
+            if n_overlap == 0:
+                print(f"    → Proxy is generating different uuids for "
+                      f"the client response and the encoder hop. "
+                      f"Check disagg_epd_proxy.py — the "
+                      f"`fanout_encoder_primer` child_req_id should "
+                      f"embed the parent `req_id` but apparently "
+                      f"doesn't reach the encoder unchanged.")
+            else:
+                print(f"    → Some overlap exists; my UUID extraction "
+                      f"regex may be too narrow. Run this to "
+                      f"reproduce: grep 'EncoderForwardTrace' "
+                      f"<encoder_log> | head -1")
 
     if not breakdowns:
         raise SystemExit("Nothing to plot — no merged breakdowns")
