@@ -248,6 +248,7 @@ if TYPE_CHECKING:
     VLLM_ENCODER_CACHE_CONFIG_PATH: str | None = None
     VLLM_ENCODER_CACHE_TRACE: bool = False
     VLLM_REQUEST_TIMING_TRACE: bool = False
+    VLLM_EC_DELETE_AFTER_LOAD: bool = False
 
 
 def get_default_cache_root():
@@ -1661,6 +1662,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # not free at high QPS but cheap below ~100 req/s.
     "VLLM_REQUEST_TIMING_TRACE": lambda: os.getenv(
         "VLLM_REQUEST_TIMING_TRACE", "0"
+    ).lower() in ("1", "true", "yes"),
+    # When set, the EC connector consumer (prefill side in disagg E/P)
+    # deletes each encoder-cache file from shared storage immediately
+    # after loading it. This degrades the EC connector from a
+    # "persistent shared cache" to a one-shot transfer channel — so the
+    # encoder vLLM engine actually has to re-run encoder forward when
+    # its in-memory EncoderCacheManager misses, instead of being
+    # silently rescued by leftover files in /dev/shm. Useful for
+    # benchmarking different VLLM_ENCODER_CACHE_POLICY values, since
+    # otherwise the persistent file cache dominates and policies look
+    # identical.
+    "VLLM_EC_DELETE_AFTER_LOAD": lambda: os.getenv(
+        "VLLM_EC_DELETE_AFTER_LOAD", "0"
     ).lower() in ("1", "true", "yes"),
 }
 

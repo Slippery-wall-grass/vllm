@@ -288,6 +288,7 @@ start_1e1p1d() {
     VLLM_ENCODER_CACHE_POLICY="$policy" \
     VLLM_ENCODER_CACHE_CONFIG_PATH="$config_path" \
     VLLM_REQUEST_TIMING_TRACE="${TIMING_TRACE:-1}" \
+    VLLM_EC_DELETE_AFTER_LOAD="${EC_DELETE_AFTER_LOAD:-1}" \
     vllm serve "$MODEL" \
         --gpu-memory-utilization "$GPU_MEM_P" \
         --port "$PREFILL_PORT" \
