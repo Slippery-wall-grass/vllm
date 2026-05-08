@@ -577,9 +577,27 @@ lock_gpu_clocks
 run_trial "none" "none"
 
 ###############################################################################
-# Step 6: Benchmark FIFO policy
+# Step 6: Benchmark FIFO policy (with EC connector cleanup — apples-to-apples)
 ###############################################################################
 run_trial "fifo" "fifo"
+
+###############################################################################
+# Step 6a: Benchmark FIFO + persistent EC connector files
+#
+# This is the "today's vLLM ships like this" baseline: in-memory FIFO
+# eviction in EncoderCacheManager, but EC connector files in /dev/shm
+# persist forever. The persistent file cache silently rescues every
+# in-memory miss, so this configuration tends to look much faster than
+# real FIFO would in a longer-running deployment where /dev/shm
+# eventually fills up (or where prefill and encoder do not share a
+# filesystem). Useful as a stress baseline for our delete-after-load
+# fix.
+#
+# Skip with SKIP_FIFO_PERSISTENT=1.
+###############################################################################
+if [ "${SKIP_FIFO_PERSISTENT:-0}" != "1" ]; then
+    EC_DELETE_AFTER_LOAD=0 run_trial "fifo" "fifo_persistent"
+fi
 
 ###############################################################################
 # Step 6.5: Benchmark Distribution-Aware policy
@@ -597,6 +615,7 @@ echo "============================================================"
 
 python -c "
 import json
+import os
 
 with open('$WORK_DIR/results_none.json') as f:
     none_data = json.load(f)
@@ -604,6 +623,13 @@ with open('$WORK_DIR/results_fifo.json') as f:
     fifo_data = json.load(f)
 with open('$WORK_DIR/results_dist_aware.json') as f:
     dist_data = json.load(f)
+
+# fifo_persistent is optional (may have been skipped via SKIP_FIFO_PERSISTENT=1)
+fifo_pers_path = '$WORK_DIR/results_fifo_persistent.json'
+fifo_pers_data = None
+if os.path.exists(fifo_pers_path):
+    with open(fifo_pers_path) as f:
+        fifo_pers_data = json.load(f)
 
 # Use aggregated means when available (multi-round), fall back to metrics
 def get_val(data, key):
@@ -638,12 +664,14 @@ def imp(base_data, new_data, key, higher_is_better=False):
     return f'{-delta:+.1f}%'
 
 print()
-print('=' * 100)
+print('=' * 130)
 print(f'Encoder Cache Policy Comparison (vs no-cache baseline, {num_rounds} round(s))')
-print('=' * 100)
-print(f\"{'Metric':<22} {'None':<18} {'FIFO':<18} {'Dist-Aware':<18}\"
-      f\"{'FIFO vs None':<12} {'Dist vs None':<12}\")
-print('-' * 100)
+print('=' * 130)
+header_cols = [('Metric', 22), ('None', 16), ('FIFO+EC-clean', 16),
+               ('FIFO+EC-persist', 18), ('Dist-Aware', 16),
+               ('FIFO vs None', 14), ('Dist vs FIFO+pers', 18)]
+print(''.join(f'{name:<{w}}' for name, w in header_cols))
+print('-' * 130)
 
 # (metric_key, label, higher_is_better)
 metrics = [
@@ -657,20 +685,30 @@ metrics = [
 ]
 
 for key, label, higher in metrics:
-    print(f'{label:<22} {fmt(none_data, key):<18} '
-          f'{fmt(fifo_data, key):<18} {fmt(dist_data, key):<18}'
-          f'{imp(none_data, fifo_data, key, higher):<12} '
-          f'{imp(none_data, dist_data, key, higher):<12}')
+    fp_str = fmt(fifo_pers_data, key) if fifo_pers_data else 'skipped'
+    # Headline: how much does our algorithm (dist-aware + EC clean)
+    # improve over the today's-vLLM baseline (FIFO + persistent EC)?
+    if fifo_pers_data is not None:
+        dist_vs_pers = imp(fifo_pers_data, dist_data, key, higher)
+    else:
+        dist_vs_pers = 'N/A'
+    print(f'{label:<22} {fmt(none_data, key):<16} '
+          f'{fmt(fifo_data, key):<16} {fp_str:<18} '
+          f'{fmt(dist_data, key):<16}'
+          f'{imp(none_data, fifo_data, key, higher):<14} '
+          f'{dist_vs_pers:<18}')
 
 print()
 ns = fmt(none_data, 'successful')
 fs = fmt(fifo_data, 'successful')
+fps = fmt(fifo_pers_data, 'successful') if fifo_pers_data else 'skipped'
 ds = fmt(dist_data, 'successful')
-print(f\"{'Successful':<22} {ns:<18} {fs:<18} {ds:<18}\")
+print(f\"{'Successful':<22} {ns:<16} {fs:<16} {fps:<18} {ds:<16}\")
 nf = fmt(none_data, 'failed')
 ff = fmt(fifo_data, 'failed')
+fpf = fmt(fifo_pers_data, 'failed') if fifo_pers_data else 'skipped'
 df = fmt(dist_data, 'failed')
-print(f\"{'Failed':<22} {nf:<18} {ff:<18} {df:<18}\")
+print(f\"{'Failed':<22} {nf:<16} {ff:<16} {fpf:<18} {df:<16}\")
 
 # Per-type breakdown uses last-round metrics (not aggregated)
 none_r = none_data['metrics']
@@ -710,8 +748,10 @@ print(f'Full results saved in: $WORK_DIR/')
 
 echo ""
 echo "Done! Results are in $WORK_DIR/"
-echo "  - results_none.json       (no-cache baseline)"
-echo "  - results_fifo.json       (FIFO/LRU)"
+echo "  - results_none.json             (no-cache baseline)"
+echo "  - results_fifo.json             (FIFO/LRU + EC delete-after-load)"
+echo "  - results_fifo_persistent.json  (FIFO/LRU + persistent EC files;"
+echo "                                    skipped if SKIP_FIFO_PERSISTENT=1)"
 echo "  - results_dist_aware.json (distribution-aware)"
 echo "  - lambda_config.json"
 echo "  - profile.json"

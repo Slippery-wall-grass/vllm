@@ -49,7 +49,8 @@ RESET_RE = re.compile(
 
 STRATS = [
     ("none", "No cache", "tab:gray"),
-    ("fifo", "FIFO", "tab:blue"),
+    ("fifo", "FIFO + EC clean", "tab:blue"),
+    ("fifo_persistent", "FIFO + EC persist", "tab:cyan"),
     ("dist_aware", "Distribution-Aware", "tab:red"),
 ]
 
