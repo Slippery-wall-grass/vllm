@@ -397,13 +397,20 @@ async def chat_completions(request: Request):
 
         is_streaming = req_data.get("stream", False)
 
+        # Echo the request id back to the client so benchmarks /
+        # tracing tools can correlate the client-side TTFT with E and P
+        # worker logs (which use this same id when
+        # --enable-request-id-headers is set).
+        response_headers = {"x-request-id": req_id}
+
         if is_streaming:
             return StreamingResponse(
                 forward_stream(req_data, req_id, e_urls, p_url, d_url),
                 media_type="text/event-stream",
+                headers=response_headers,
             )
         result = await forward_non_stream(req_data, req_id, e_urls, p_url, d_url)
-        return JSONResponse(content=result)
+        return JSONResponse(content=result, headers=response_headers)
 
     except HTTPException:
         raise

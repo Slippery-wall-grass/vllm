@@ -39,7 +39,10 @@ from pathlib import Path
 
 ENC_RE = re.compile(
     r"EncoderForwardTrace\s+"
-    r"req_ids=(?P<ids>[\w,\-]+)\s+"
+    # req_ids contains comma-separated request ids; each id may include
+    # the chatcmpl- prefix, dashes (uuid), and colon-separated suffixes
+    # (input_id, mm hash chunks). Stop at whitespace.
+    r"req_ids=(?P<ids>\S+)\s+"
     r"num_items=(?P<n>\d+)\s+"
     r"duration_ms=(?P<dur>[\d.]+)\s+"
     r"per_request_ms=(?P<per>[\d.]+)"
@@ -106,16 +109,45 @@ def _parse_logs(work_dir: Path, strat: str
     return encoder, prefill
 
 
+def _index_by_substring(d: dict[str, "T"]) -> dict[str, "T"]:
+    """Build a lookup by 'core uuid' substring of each log key.
+
+    Server-side log keys look like `chatcmpl-<uuid>:<input_id>:<8hex>-<8hex>`
+    (or with `-<8hex>` suffix from input_processor). The client only sees
+    the bare `<uuid>` from the proxy's X-Request-Id header. We canonicalise
+    by extracting the longest UUID-shaped substring from each key.
+    """
+    import re
+    uuid_re = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
+                         r"-[0-9a-f]{4}-[0-9a-f]{12}")
+    out: dict[str, "T"] = {}
+    for k, v in d.items():
+        m = uuid_re.search(k)
+        if m:
+            out[m.group(0)] = v
+        out[k] = v  # also keep exact form
+    return out
+
+
 def _build_breakdown(results: list[dict], encoder: dict[str, float],
                      prefill: dict[str, dict]) -> list[dict]:
-    """Join client raw_results with server-side phase logs by request_id."""
+    """Join client raw_results with server-side phase logs by request_id.
+
+    The client captures the proxy's X-Request-Id (a bare uuid). The
+    server-side logs use vLLM's internal request_id which prepends
+    `chatcmpl-` and may append further mangling. We index server logs
+    by the embedded uuid substring so the join is robust to those
+    transformations.
+    """
+    encoder_idx = _index_by_substring(encoder)
+    prefill_idx = _index_by_substring(prefill)
     out = []
     for r in results:
         rid = r.get("server_request_id")
         if not rid or not r.get("success") or r.get("ttft") is None:
             continue
-        enc_ms = encoder.get(rid, 0.0)
-        ph = prefill.get(rid)
+        enc_ms = encoder_idx.get(rid, 0.0)
+        ph = prefill_idx.get(rid)
         if ph is None:
             # Server-side trace missing for this rid (e.g. log rotated or
             # request still in flight at log read time). Skip.
