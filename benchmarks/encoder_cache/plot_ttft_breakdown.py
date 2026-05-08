@@ -166,7 +166,8 @@ def _index_by_substring(d: dict[str, "T"]) -> dict[str, "T"]:
 
 
 def _build_breakdown(results: list[dict], encoder: dict[str, float],
-                     prefill: dict[str, dict]) -> list[dict]:
+                     prefill: dict[str, dict],
+                     encoder_was_parsed: bool = True) -> list[dict]:
     """Join client raw_results with server-side phase logs by request_id.
 
     The client captures the proxy's X-Request-Id (a bare uuid). The
@@ -210,6 +211,14 @@ def _build_breakdown(results: list[dict], encoder: dict[str, float],
         client_ttft_ms = r["ttft"] * 1000.0
         engine_ttft_ms = ph["first_token_latency_ms"]
         other_ms = client_ttft_ms - enc_ms - engine_ttft_ms
+        # cache_hit: only meaningful when we actually parsed at least
+        # one EncoderForwardTrace line. Otherwise enc_ms is 0 for
+        # everyone (parse failure ≠ cache hit) and the column is
+        # unknowable — set to None and let the printer show "?".
+        if encoder_was_parsed:
+            cache_hit: bool | None = (enc_ms == 0.0)
+        else:
+            cache_hit = None
         out.append({
             "request_id": rid,
             "type_id": r.get("type_id"),
@@ -222,7 +231,7 @@ def _build_breakdown(results: list[dict], encoder: dict[str, float],
             "queue_ms": ph["queued_ms"],
             "prefill_ms": ph["prefill_ms"],
             "other_ms": other_ms,
-            "cache_hit": enc_ms == 0.0,
+            "cache_hit": cache_hit,
             "phase": r.get("phase", "measure"),
         })
     return out
@@ -269,20 +278,29 @@ def main() -> None:
                   f"Likely VLLM_REQUEST_TIMING_TRACE wasn't set on the "
                   f"workers; restart workers and re-run.")
             continue
-        rows = _build_breakdown(raw, encoder, prefill)
+        if not encoder:
+            print(f"  {key:<10} WARNING: 0 EncoderForwardTrace lines "
+                  f"found in encoder_{key}_*.log. cache hit% will be "
+                  f"reported as '?' since enc_ms=0 cannot be "
+                  f"distinguished from a true cache hit.")
+        rows = _build_breakdown(raw, encoder, prefill,
+                                encoder_was_parsed=bool(encoder))
         if args.exclude_warmup:
             rows = [r for r in rows if r["phase"] != "warmup"]
         if not rows:
             continue
         breakdowns[key] = rows
-        n_hit = sum(1 for r in rows if r["cache_hit"])
         # Sample one phase row to show where it was sourced
         src = next(iter(prefill.values())).get("_source", "?")
+        if rows and rows[0]["cache_hit"] is None:
+            hit_str = "hit%=? (no encoder trace)"
+        else:
+            n_hit = sum(1 for r in rows if r["cache_hit"])
+            hit_str = (f"cache hits in trace = {n_hit} "
+                       f"({n_hit/len(rows)*100:.1f}%)")
         print(f"  {key:<10} merged={len(rows)} of {len(raw)} requests; "
               f"phases from {src}; "
-              f"encoder-trace lines={len(encoder)}; "
-              f"cache hits in trace = {n_hit} "
-              f"({n_hit/len(rows)*100:.1f}%)")
+              f"encoder-trace lines={len(encoder)}; {hit_str}")
 
     if not breakdowns:
         raise SystemExit("Nothing to plot — no merged breakdowns")
@@ -388,14 +406,18 @@ def main() -> None:
     print("-" * len(header))
     for k in strat_keys:
         rows = breakdowns[k]
-        n_hit = sum(1 for r in rows if r["cache_hit"])
         m = means[k]
+        if rows and rows[0]["cache_hit"] is None:
+            hit_col = "    ?"
+        else:
+            n_hit = sum(1 for r in rows if r["cache_hit"])
+            hit_col = f"{n_hit/len(rows)*100:>5.1f}%"
         print(f"{strat_pretty[k]:<22} "
               f"{m['client_ttft_ms']:>7.1f} "
               f"{m['encoder_ms']:>7.1f} "
               f"{m['engine_ttft_ms']:>7.1f} "
               f"{m['other_ms']:>7.1f} "
-              f"{n_hit/len(rows)*100:>5.1f}%")
+              f"{hit_col:>6}")
     # Sub-breakdown of engine_ttft into queue / prefill (informational
     # — these are non-zero only on the engine that owns the QUEUED /
     # SCHEDULED events, i.e. monolithic engines or the prefill side).
