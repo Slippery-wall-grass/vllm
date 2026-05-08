@@ -391,6 +391,12 @@ async def chat_completions(request: Request):
         req_data = await request.json()
         req_id = request.headers.get("x-request-id", str(uuid.uuid4()))
 
+        # Debug: log the req_id that's being used for both the encoder
+        # fanout and the client response. Search this in the proxy log
+        # to verify a given client server_request_id matches what was
+        # forwarded to the encoder worker.
+        logger.info("[ChatCompletionsReqId] proxy_req_id=%s", req_id)
+
         e_urls = app.state.e_urls  # we want the full list for fan-out
         p_url = random.choice(app.state.p_urls) if app.state.p_urls else None
         d_url = random.choice(app.state.d_urls)
