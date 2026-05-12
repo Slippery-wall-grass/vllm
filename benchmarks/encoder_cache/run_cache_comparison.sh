@@ -565,6 +565,8 @@ run_trial() {
         --label "$label" \
         --media-mode "$MEDIA_MODE" \
         --prompt-tokens "$PROMPT_TOKENS" \
+        --workload-mode "${WORKLOAD_MODE:-prob}" \
+        ${HOT_FRACTION:+--hot-fraction "$HOT_FRACTION"} \
         --output-path "$WORK_DIR/results_${label}.json"
 
     cleanup_servers

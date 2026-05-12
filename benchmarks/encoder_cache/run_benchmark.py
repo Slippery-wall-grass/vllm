@@ -94,25 +94,118 @@ def generate_workload(
     distribution: dict[str, float],
     num_requests: int,
     seed: int = 42,
+    workload_mode: str = "prob",
+    hot_fraction: float | None = None,
 ) -> list[dict]:
-    """Generate a workload of requests following the specified distribution.
+    """Generate a workload of requests.
+
+    Two modes:
+
+    * "prob" (default):  Each request samples a type from `distribution`
+      with replacement. This is the original probabilistic mode — best
+      for measuring steady-state behaviour on a closed type set.
+
+    * "scan":  Per-request Bernoulli(hot_fraction) decides whether to
+      pick from the hot cohort (with replacement, weighted by p_i
+      restricted to hot types) or to consume the next unused cold type
+      (without replacement). Cold types are identified by
+      `manifest[tid].cohort == "cold"` (set by generate_scan_workload.py);
+      anything else is treated as hot.
+
+      This is the streaming scan-resistant workload: 80% of requests
+      revisit the working set, 20% bring in items that will never be
+      seen again. Classic adversarial pattern for LRU/FIFO; the
+      benchmark for our distribution-aware algorithm.
+
+      Requires num_cold_types >= ceil(num_requests * (1-hot_fraction)).
+
+    If `hot_fraction` is None in scan mode, it is computed as the sum
+    of probabilities of hot types in the distribution (e.g. 0.8 for a
+    distribution where hot types sum to 0.8 and cold types sum to 0.2).
 
     Returns list of dicts with type_id, media_path, and media_type.
     """
     rng = random.Random(seed)
 
-    type_ids = list(distribution.keys())
-    weights = [distribution[t] for t in type_ids]
+    if workload_mode == "prob":
+        type_ids = list(distribution.keys())
+        weights = [distribution[t] for t in type_ids]
+        workload = []
+        for _ in range(num_requests):
+            type_id = rng.choices(type_ids, weights=weights, k=1)[0]
+            entry = manifest[type_id]
+            workload.append({
+                "type_id": type_id,
+                "media_path": entry["path"],
+                "media_type": entry.get("media_type", "image"),
+                "image_path": entry["path"],
+            })
+        return workload
 
-    workload = []
+    if workload_mode != "scan":
+        raise ValueError(
+            f"workload_mode must be 'prob' or 'scan', got {workload_mode!r}")
+
+    # ---------------- scan mode ----------------
+    hot_types: list[str] = []
+    cold_types: list[str] = []
+    for tid in distribution.keys():
+        if tid not in manifest:
+            continue
+        cohort = (manifest[tid].get("cohort") or "hot").lower()
+        if cohort == "cold":
+            cold_types.append(tid)
+        else:
+            hot_types.append(tid)
+
+    if not hot_types:
+        raise ValueError(
+            "scan mode requires at least one hot type. Use "
+            "generate_scan_workload.py and ensure manifest entries "
+            "have cohort='hot' or cohort='cold'.")
+    if not cold_types:
+        raise ValueError(
+            "scan mode requires cold types in the manifest "
+            "(cohort='cold'). Got 0.")
+
+    # Hot picks are weighted by p_i restricted to hot types
+    hot_weights = [distribution[t] for t in hot_types]
+    if sum(hot_weights) <= 0:
+        # Fall back to uniform if all hot p_i were 0
+        hot_weights = [1.0] * len(hot_types)
+
+    if hot_fraction is None:
+        hot_fraction = sum(distribution[t] for t in hot_types)
+        hot_fraction = max(0.0, min(1.0, hot_fraction))
+    expected_cold = int(round(num_requests * (1.0 - hot_fraction)))
+    if expected_cold > len(cold_types):
+        raise ValueError(
+            f"scan mode needs at least {expected_cold} cold types for "
+            f"{num_requests} requests at hot_fraction={hot_fraction}, "
+            f"but only {len(cold_types)} are available. Regenerate "
+            f"the workload with --num-cold >= {expected_cold} (use "
+            f"generate_scan_workload.py).")
+
+    # Shuffle cold types so the one-shot order isn't always the same
+    rng.shuffle(cold_types)
+    cold_iter = iter(cold_types)
+
+    workload: list[dict] = []
     for _ in range(num_requests):
-        type_id = rng.choices(type_ids, weights=weights, k=1)[0]
-        entry = manifest[type_id]
+        if rng.random() < hot_fraction:
+            tid = rng.choices(hot_types, weights=hot_weights, k=1)[0]
+        else:
+            try:
+                tid = next(cold_iter)
+            except StopIteration:
+                # Fewer cold visits than the pool ratio predicted — fall
+                # back to a hot pick rather than crash mid-run.
+                tid = rng.choices(hot_types, weights=hot_weights, k=1)[0]
+        entry = manifest[tid]
         workload.append({
-            "type_id": type_id,
+            "type_id": tid,
             "media_path": entry["path"],
             "media_type": entry.get("media_type", "image"),
-            # Backwards-compat alias for older code paths
             "image_path": entry["path"],
         })
 
@@ -799,6 +892,21 @@ def main():
                         help="Max output tokens per request")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for workload generation")
+    parser.add_argument("--workload-mode", type=str, default="prob",
+                        choices=["prob", "scan"],
+                        help="'prob' = sample each request from "
+                             "`distribution` with replacement (default). "
+                             "'scan' = per-request Bernoulli(hot_fraction) "
+                             "picks hot-vs-cold; hot picks are weighted "
+                             "by distribution restricted to "
+                             "cohort=='hot' types, cold picks are taken "
+                             "WITHOUT replacement from cohort=='cold' "
+                             "types. Use this with manifests produced "
+                             "by generate_scan_workload.py.")
+    parser.add_argument("--hot-fraction", type=float, default=None,
+                        help="[scan mode] Probability that each request "
+                             "is a hot pick. Default: sum of p_i over "
+                             "hot types in the distribution.")
     parser.add_argument("--num-rounds", type=int, default=1,
                         help="Number of independent rounds to run. "
                         "Results are aggregated with mean ± std.")
@@ -883,8 +991,11 @@ def main():
                   f"requests (covers each of {len(distribution)} types "
                   f"at least once)...")
         else:
+            # Global warmup always uses prob mode so that warmup doesn't
+            # consume cold types we need for the measured rounds.
             warmup_wl = generate_workload(
                 manifest, distribution, args.global_warmup, seed=0,
+                workload_mode="prob",
             )
             print(f"\nGlobal warmup: sending {len(warmup_wl)} throwaway "
                   f"requests to warm up CUDA / cuDNN / connections...")
@@ -936,7 +1047,20 @@ def main():
 
         workload = generate_workload(
             manifest, distribution, args.num_requests, round_seed,
+            workload_mode=args.workload_mode,
+            hot_fraction=args.hot_fraction,
         )
+        if args.workload_mode == "scan":
+            n_cold_in_workload = sum(
+                1 for w in workload
+                if (manifest.get(w["type_id"]) or {}).get("cohort", "hot")
+                == "cold"
+            )
+            print(f"  scan mode: {n_cold_in_workload}/{len(workload)} "
+                  f"requests are one-shot cold "
+                  f"(target = {1 - (args.hot_fraction or 0.0):.2f} of "
+                  f"requests if hot_fraction given; otherwise derived "
+                  f"from distribution)")
 
         # Print distribution summary (only on first round)
         if round_idx == 0:
