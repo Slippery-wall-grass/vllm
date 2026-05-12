@@ -72,6 +72,14 @@ class EncoderCacheManager:
         self.cache_size = cache_size
         self.num_free_slots = cache_size
         self.num_freeable_slots = cache_size
+        # Single greppable line for benchmarks / sanity checks: confirms
+        # vLLM's effective encoder cache size at startup. Useful when
+        # offline tools (solve_lambda.py) assumed a different B and the
+        # runtime re-solves with this value instead.
+        logger.info(
+            "EncoderCacheManagerInit class=%s cache_size=%d",
+            type(self).__name__, cache_size,
+        )
 
         # mm_hash of mm_data => ids of requests that reference the mm_data
         self.cached: dict[str, set[str]] = {}
@@ -432,13 +440,34 @@ class DistributionAwareCacheManager(EncoderCacheManager):
         self.hash_to_type = hash_to_type
         self.lambda_star = self._solve_lambda()
         self._configured = True
+        # High-level summary
+        M = sum(meta.m_i for meta in type_metadata.values())
         logger.info(
             "Distribution-aware cache configured: lambda*=%.6f, "
+            "cache_size=%d, sum_m_i=%d (fits=%s), "
             "%d types, %d hash mappings",
-            self.lambda_star,
-            len(type_metadata),
-            len(hash_to_type),
+            self.lambda_star, self.cache_size, M,
+            "yes" if M <= self.cache_size else "no",
+            len(type_metadata), len(hash_to_type),
         )
+        # Per-type detail. The "keep_threshold_d" is the smallest geom
+        # sample `d` at which evictability flips from False to True
+        # (cost >= 0), i.e. how many "waits" before this type's entry
+        # becomes safe to evict. Lower = evicted sooner.
+        # E[d] = (1-p)/p, so we also print that as a workload-only
+        # baseline.
+        for tid, meta in type_metadata.items():
+            if self.lambda_star * meta.m_i > 0:
+                d0 = max(0, int(math.ceil(
+                    meta.c_i / (meta.m_i * self.lambda_star))))
+            else:
+                d0 = -1  # never evict
+            e_d = ((1 - meta.p_i) / meta.p_i) if meta.p_i > 0 else float("inf")
+            logger.info(
+                "DistAwareTypeConfig type=%s p_i=%.4f m_i=%d c_i=%.4f "
+                "E[d]=%.1f keep_threshold_d=%d",
+                tid, meta.p_i, meta.m_i, meta.c_i, e_d, d0,
+            )
 
     @classmethod
     def from_config_file(cls, cache_size: int,

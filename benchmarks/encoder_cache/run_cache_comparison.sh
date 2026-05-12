@@ -473,15 +473,22 @@ echo "============================================================"
 echo "Step 4: Solving for optimal lambda*"
 echo "============================================================"
 
-cache_budget_arg=()
-if [ -n "$CACHE_BUDGET" ]; then
-    cache_budget_arg=(--cache-budget "$CACHE_BUDGET")
-fi
+# Default cache budget = MAX_NUM_BATCHED_TOKENS, which is exactly what
+# vLLM uses for encoder_cache_size (vllm/config/scheduler.py:228). Using
+# the same value here keeps solve_lambda's offline analysis (printed
+# reservations, lambda*) consistent with what the runtime
+# DistributionAwareCacheManager will re-derive. Without this, the
+# offline analysis used a placeholder of M//2, which made
+# lambda_config.json look unrelated to runtime behaviour — exactly the
+# "diagnosis 4" symptom we hit in the QPS sweep.
+CACHE_BUDGET="${CACHE_BUDGET:-$MAX_NUM_BATCHED_TOKENS}"
+echo "Cache budget for solver: $CACHE_BUDGET (matches "
+echo "  vLLM's encoder_cache_size = max-num-batched-tokens)"
 
 python "$SCRIPT_DIR/solve_lambda.py" \
     --profile-path "$PROFILE_PATH" \
     --distribution "$DISTRIBUTION" \
-    "${cache_budget_arg[@]}" \
+    --cache-budget "$CACHE_BUDGET" \
     --output-path "$WORK_DIR/lambda_config.json"
 
 LAMBDA_CONFIG_PATH="$WORK_DIR/lambda_config.json"
