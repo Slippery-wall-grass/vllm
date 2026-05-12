@@ -36,9 +36,9 @@ from pathlib import Path
 
 STRATS = [
     ("none", "No cache", "tab:gray", "o"),
-    ("fifo", "FIFO + EC clean", "tab:blue", "s"),
-    ("fifo_persistent", "FIFO + EC persist", "tab:cyan", "D"),
-    ("dist_aware", "Distribution-Aware", "tab:red", "^"),
+    ("fifo", "LRU + EC clean", "tab:blue", "s"),
+    ("fifo_persistent", "LRU + EC persist", "tab:cyan", "D"),
+    ("dist_aware", "OUR", "tab:red", "^"),
 ]
 
 

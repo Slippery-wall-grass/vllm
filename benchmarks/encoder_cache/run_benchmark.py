@@ -36,6 +36,15 @@ _CACHE_STATS_RE = re.compile(
     r"hits=(\d+)\s+misses=(\d+)\s+total=(\d+)\s+hit_rate=([\d.]+)"
 )
 
+# Pulls per-group encoder-forward timing from the encoder worker log.
+# Emitted by gpu_model_runner.py:timed_encoder_operation when
+# VLLM_REQUEST_TIMING_TRACE=1. duration_ms is total wallclock for the
+# group; per_request_ms is duration_ms / num_items.
+_ENCODER_FWD_RE = re.compile(
+    r"EncoderForwardTrace\s+req_ids=\S+\s+num_items=(\d+)\s+"
+    r"duration_ms=([\d.]+)\s+per_request_ms=([\d.]+)"
+)
+
 
 def parse_latest_cache_stats(log_path: str) -> dict | None:
     """Scan an encoder-worker log file for the latest cache-stats line.
@@ -66,6 +75,62 @@ def parse_latest_cache_stats(log_path: str) -> dict | None:
         }
     except OSError:
         return None
+
+
+def parse_encoder_forward_stats(
+    log_path: str, after_byte_offset: int = 0,
+) -> tuple[dict | None, int]:
+    """Parse EncoderForwardTrace lines from `log_path` starting at byte
+    offset `after_byte_offset`. Used to compute per-round encoder
+    forward statistics — call once before a round to record the file
+    size, then again after the round with that offset to scope reads.
+
+    Returns:
+        (stats_dict_or_None, new_byte_offset)
+
+        stats_dict has:
+          encoder_forward_events:   # of EncoderForwardTrace lines
+          encoder_forward_items:    sum of num_items across events
+          encoder_forward_total_ms: sum of duration_ms across events
+          encoder_forward_mean_ms:  total_ms / items
+                                    (= mean GPU forward time per mm
+                                    item that went through the encoder
+                                    — the work cache hits avoid)
+        Returns None when the file is missing.
+
+    Endpoints measured:
+        START: model.embed_multimodal(**mm_kwargs_group) invocation
+        END:   embed_multimodal() returns (after torch.cuda.synchronize)
+    Cache HITs never call embed_multimodal → emit no event → counted
+    as 0 implicitly when downstream code divides by N_measured_requests.
+    """
+    if not log_path or not os.path.exists(log_path):
+        return None, after_byte_offset
+    try:
+        size = os.path.getsize(log_path)
+        if size <= after_byte_offset:
+            return {
+                "encoder_forward_events": 0,
+                "encoder_forward_items": 0,
+                "encoder_forward_total_ms": 0.0,
+                "encoder_forward_mean_ms": 0.0,
+            }, size
+        with open(log_path, "rb") as f:
+            f.seek(after_byte_offset)
+            chunk = f.read().decode("utf-8", errors="replace")
+        events = _ENCODER_FWD_RE.findall(chunk)
+        n_events = len(events)
+        n_items = sum(int(e[0]) for e in events)
+        total_ms = sum(float(e[1]) for e in events)
+        mean_per_item = (total_ms / n_items) if n_items > 0 else 0.0
+        return {
+            "encoder_forward_events": n_events,
+            "encoder_forward_items": n_items,
+            "encoder_forward_total_ms": total_ms,
+            "encoder_forward_mean_ms": mean_per_item,
+        }, size
+    except OSError:
+        return None, after_byte_offset
 
 
 def reset_encoder_cache(encoder_url: str) -> None:
@@ -764,6 +829,10 @@ def aggregate_rounds(round_metrics: list[dict], trim: int = 0) -> dict:
         "ttft_p95_ms", "ttft_p99_ms",
         "latency_mean_ms", "latency_median_ms",
         "cache_hit_rate", "cache_hits", "cache_misses",
+        # Per-round encoder forward stats (parsed from encoder log).
+        "encoder_forward_mean_per_req_ms",
+        "encoder_forward_mean_per_miss_ms",
+        "encoder_forward_events", "encoder_forward_items",
     )
     keys_count = ("successful", "failed")
 
@@ -1037,6 +1106,17 @@ def main():
         if args.encoder_url and round_idx == 0:
             reset_encoder_cache(args.encoder_url)
 
+        # Snapshot encoder log size so per-round encoder forward stats
+        # only count events emitted during this round.
+        encoder_log_offset_before_round = 0
+        if args.encoder_log_path and os.path.exists(args.encoder_log_path):
+            try:
+                encoder_log_offset_before_round = os.path.getsize(
+                    args.encoder_log_path
+                )
+            except OSError:
+                encoder_log_offset_before_round = 0
+
         if args.mode == "closed":
             print(f"Generating workload: {args.num_requests} requests "
                   f"(warmup={args.warmup_requests}), "
@@ -1113,6 +1193,36 @@ def main():
                           f"hit_rate={stats['cache_hit_rate']:.4f}")
                 else:
                     print("  Cache stats: (could not parse encoder log)")
+
+                # Encoder forward time (this round only): scope by byte
+                # offset captured at the start of the round.
+                fwd_stats, _new_off = parse_encoder_forward_stats(
+                    args.encoder_log_path,
+                    after_byte_offset=encoder_log_offset_before_round,
+                )
+                if fwd_stats is not None:
+                    n_meas = metrics.get("measured_requests", 0) or 1
+                    # Two related views:
+                    # 1) mean over all measured requests (hits == 0):
+                    #    expected encoder cost per request given policy
+                    # 2) mean over only the requests that ran encoder
+                    #    (= forward time per miss, ~constant per type)
+                    metrics["encoder_forward_mean_per_req_ms"] = (
+                        fwd_stats["encoder_forward_total_ms"] / n_meas
+                    )
+                    metrics["encoder_forward_mean_per_miss_ms"] = (
+                        fwd_stats["encoder_forward_mean_ms"]
+                    )
+                    metrics["encoder_forward_events"] = (
+                        fwd_stats["encoder_forward_events"]
+                    )
+                    metrics["encoder_forward_items"] = (
+                        fwd_stats["encoder_forward_items"]
+                    )
+                    print(f"  Encoder fwd: {fwd_stats['encoder_forward_events']} "
+                          f"events, {fwd_stats['encoder_forward_items']} items, "
+                          f"per_req={metrics['encoder_forward_mean_per_req_ms']:.2f}ms "
+                          f"per_miss={metrics['encoder_forward_mean_per_miss_ms']:.2f}ms")
 
         per_round_metrics.append(metrics)
         last_metrics = metrics

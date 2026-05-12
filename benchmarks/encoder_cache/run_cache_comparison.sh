@@ -676,21 +676,25 @@ print()
 print('=' * 130)
 print(f'Encoder Cache Policy Comparison (vs no-cache baseline, {num_rounds} round(s))')
 print('=' * 130)
-header_cols = [('Metric', 22), ('None', 16), ('FIFO+EC-clean', 16),
-               ('FIFO+EC-persist', 18), ('Dist-Aware', 16),
-               ('FIFO vs None', 14), ('Dist vs FIFO+pers', 18)]
+header_cols = [('Metric', 22), ('None', 16), ('LRU+EC-clean', 16),
+               ('LRU+EC-persist', 18), ('OUR', 16),
+               ('LRU vs None', 14), ('OUR vs LRU+pers', 18)]
 print(''.join(f'{name:<{w}}' for name, w in header_cols))
 print('-' * 130)
 
 # (metric_key, label, higher_is_better)
+# Encoder fwd metrics measure GPU work between
+# model.embed_multimodal() entry and return (synchronized).
 metrics = [
-    ('ttft_mean_ms',     'TTFT Mean (ms)',     False),
-    ('ttft_median_ms',   'TTFT Median (ms)',   False),
-    ('ttft_p95_ms',      'TTFT P95 (ms)',      False),
-    ('ttft_p99_ms',      'TTFT P99 (ms)',      False),
-    ('latency_mean_ms',  'Latency Mean (ms)',  False),
-    ('throughput_rps',   'Throughput (req/s)', True),
-    ('cache_hit_rate',   'Cache Hit Rate',     True),
+    ('ttft_mean_ms',                     'TTFT Mean (ms)',           False),
+    ('ttft_median_ms',                   'TTFT Median (ms)',         False),
+    ('ttft_p95_ms',                      'TTFT P95 (ms)',            False),
+    ('ttft_p99_ms',                      'TTFT P99 (ms)',            False),
+    ('latency_mean_ms',                  'Latency Mean (ms)',        False),
+    ('throughput_rps',                   'Throughput (req/s)',       True),
+    ('cache_hit_rate',                   'Cache Hit Rate',           True),
+    ('encoder_forward_mean_per_req_ms',  'Encoder fwd/req (ms)',     False),
+    ('encoder_forward_mean_per_miss_ms', 'Encoder fwd/miss (ms)',    False),
 ]
 
 for key, label, higher in metrics:
@@ -726,8 +730,8 @@ dist_r = dist_data['metrics']
 
 print()
 print('Per-Type TTFT Median (ms) [last round]:')
-print(f\"{'Type':<10} {'None':<14} {'FIFO':<14} {'Dist-Aware':<14}\"
-      f\"{'FIFO vs None':<14} {'Dist vs None':<14}\")
+print(f\"{'Type':<10} {'None':<14} {'LRU':<14} {'OUR':<14}\"
+      f\"{'LRU vs None':<14} {'OUR vs None':<14}\")
 print('-' * 80)
 
 def imp_val(base, new):

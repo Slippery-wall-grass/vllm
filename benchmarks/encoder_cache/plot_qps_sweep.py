@@ -33,9 +33,9 @@ from pathlib import Path
 
 STRATS = [
     ("none", "No cache", "tab:gray", "o"),
-    ("fifo", "FIFO + EC clean", "tab:blue", "s"),
-    ("fifo_persistent", "FIFO + EC persist", "tab:cyan", "D"),
-    ("dist_aware", "Distribution-Aware", "tab:red", "^"),
+    ("fifo", "LRU + EC clean", "tab:blue", "s"),
+    ("fifo_persistent", "LRU + EC persist", "tab:cyan", "D"),
+    ("dist_aware", "OUR", "tab:red", "^"),
 ]
 
 
@@ -135,6 +135,14 @@ def main() -> None:
         k: [] for k, *_ in STRATS}
     table_tput: dict[str, list[tuple[float, float, float]]] = {
         k: [] for k, *_ in STRATS}
+    # Mean encoder forward time (the GPU work cache hits save).
+    # Endpoints: model.embed_multimodal() entry → return.
+    # "per_req" averages over ALL measured requests (hits = 0); "per_miss"
+    # averages only over requests that actually ran encoder forward.
+    table_enc_per_req: dict[str, list[tuple[float, float, float]]] = {
+        k: [] for k, *_ in STRATS}
+    table_enc_per_miss: dict[str, list[tuple[float, float, float]]] = {
+        k: [] for k, *_ in STRATS}
 
     def _push(table, key, qps, d, metric_key):
         v = _extract(d, metric_key)
@@ -153,6 +161,10 @@ def main() -> None:
             _push(table_ttft_mean, key, qps, d, "ttft_mean_ms")
             _push(table_ttft_p95, key, qps, d, "ttft_p95_ms")
             _push(table_tput, key, qps, d, "throughput_rps")
+            _push(table_enc_per_req, key, qps, d,
+                  "encoder_forward_mean_per_req_ms")
+            _push(table_enc_per_miss, key, qps, d,
+                  "encoder_forward_mean_per_miss_ms")
             v = _extract(d, "cache_hit_rate")
             if v is not None:
                 # Convert to percent and re-fetch std in the same units
@@ -163,9 +175,12 @@ def main() -> None:
                     std = float(agg["cache_hit_rate"].get("std") or 0.0)
                 table_hit[key].append((qps, v * 100.0, std * 100.0))
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    # 3x2 layout: TTFT mean / P95 / encoder-per-req / encoder-per-miss /
+    # hit-rate / throughput
+    fig, axes = plt.subplots(3, 2, figsize=(13, 13))
     ax_mean, ax_p95 = axes[0]
-    ax_hit, ax_tput = axes[1]
+    ax_enc_req, ax_enc_miss = axes[1]
+    ax_hit, ax_tput = axes[2]
 
     def _plot(ax, table, ylabel, title, ylim=None):
         any_data = False
@@ -202,6 +217,14 @@ def main() -> None:
           "Mean TTFT vs offered QPS")
     _plot(ax_p95, table_ttft_p95, "P95 TTFT (ms)",
           "P95 TTFT vs offered QPS")
+    _plot(ax_enc_req, table_enc_per_req,
+          "Encoder forward (ms / request)",
+          "Mean encoder GPU work per request "
+          "(model.embed_multimodal entry→return; hit=0)")
+    _plot(ax_enc_miss, table_enc_per_miss,
+          "Encoder forward (ms / miss)",
+          "Mean encoder GPU work per miss "
+          "(only requests that actually ran the encoder)")
     _plot(ax_hit, table_hit, "Cache hit rate (%)",
           "Cache hit rate vs offered QPS", ylim=(0, 100))
     _plot(ax_tput, table_tput, "Throughput (req/s)",

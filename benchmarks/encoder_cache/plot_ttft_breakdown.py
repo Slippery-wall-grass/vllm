@@ -65,9 +65,9 @@ PHASE_RE = re.compile(
 
 STRATS = [
     ("none", "No cache", "tab:gray"),
-    ("fifo", "FIFO + EC clean", "tab:blue"),
-    ("fifo_persistent", "FIFO + EC persist (today's vLLM)", "tab:cyan"),
-    ("dist_aware", "Distribution-Aware", "tab:red"),
+    ("fifo", "LRU + EC clean", "tab:blue"),
+    ("fifo_persistent", "LRU + EC persist (today's vLLM)", "tab:cyan"),
+    ("dist_aware", "OUR", "tab:red"),
 ]
 
 
