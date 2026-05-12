@@ -678,7 +678,7 @@ print(f'Encoder Cache Policy Comparison (vs no-cache baseline, {num_rounds} roun
 print('=' * 130)
 header_cols = [('Metric', 22), ('None', 16), ('LRU+EC-clean', 16),
                ('LRU+EC-persist', 18), ('OUR', 16),
-               ('LRU vs None', 14), ('OUR vs LRU+pers', 18)]
+               ('LRU vs None', 14), ('OUR vs LRU+clean', 18)]
 print(''.join(f'{name:<{w}}' for name, w in header_cols))
 print('-' * 130)
 
@@ -700,16 +700,15 @@ metrics = [
 for key, label, higher in metrics:
     fp_str = fmt(fifo_pers_data, key) if fifo_pers_data else 'skipped'
     # Headline: how much does our algorithm (dist-aware + EC clean)
-    # improve over the today's-vLLM baseline (FIFO + persistent EC)?
-    if fifo_pers_data is not None:
-        dist_vs_pers = imp(fifo_pers_data, dist_data, key, higher)
-    else:
-        dist_vs_pers = 'N/A'
+    # improve over the apples-to-apples LRU+EC clean baseline?
+    # Both use the same EC-clean transport semantics, so the delta
+    # isolates the policy effect.
+    dist_vs_clean = imp(fifo_data, dist_data, key, higher)
     print(f'{label:<22} {fmt(none_data, key):<16} '
           f'{fmt(fifo_data, key):<16} {fp_str:<18} '
           f'{fmt(dist_data, key):<16}'
           f'{imp(none_data, fifo_data, key, higher):<14} '
-          f'{dist_vs_pers:<18}')
+          f'{dist_vs_clean:<18}')
 
 print()
 ns = fmt(none_data, 'successful')

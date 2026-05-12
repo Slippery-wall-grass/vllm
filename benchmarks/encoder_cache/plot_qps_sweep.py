@@ -131,10 +131,6 @@ def main() -> None:
         k: [] for k, *_ in STRATS}
     table_ttft_p95: dict[str, list[tuple[float, float, float]]] = {
         k: [] for k, *_ in STRATS}
-    table_hit: dict[str, list[tuple[float, float, float]]] = {
-        k: [] for k, *_ in STRATS}
-    table_tput: dict[str, list[tuple[float, float, float]]] = {
-        k: [] for k, *_ in STRATS}
     # Mean encoder forward time (the GPU work cache hits save).
     # Endpoints: model.embed_multimodal() entry → return.
     # "per_req" averages over ALL measured requests (hits = 0); "per_miss"
@@ -160,27 +156,15 @@ def main() -> None:
             d = _load_results(sub / f"results_{key}.json")
             _push(table_ttft_mean, key, qps, d, "ttft_mean_ms")
             _push(table_ttft_p95, key, qps, d, "ttft_p95_ms")
-            _push(table_tput, key, qps, d, "throughput_rps")
             _push(table_enc_per_req, key, qps, d,
                   "encoder_forward_mean_per_req_ms")
             _push(table_enc_per_miss, key, qps, d,
                   "encoder_forward_mean_per_miss_ms")
-            v = _extract(d, "cache_hit_rate")
-            if v is not None:
-                # Convert to percent and re-fetch std in the same units
-                agg = (d or {}).get("aggregated") or {}
-                std = 0.0
-                if "cache_hit_rate" in agg and isinstance(
-                        agg["cache_hit_rate"], dict):
-                    std = float(agg["cache_hit_rate"].get("std") or 0.0)
-                table_hit[key].append((qps, v * 100.0, std * 100.0))
 
-    # 3x2 layout: TTFT mean / P95 / encoder-per-req / encoder-per-miss /
-    # hit-rate / throughput
-    fig, axes = plt.subplots(3, 2, figsize=(13, 13))
+    # 2x2 layout: TTFT mean / P95 / encoder-per-req / encoder-per-miss
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
     ax_mean, ax_p95 = axes[0]
     ax_enc_req, ax_enc_miss = axes[1]
-    ax_hit, ax_tput = axes[2]
 
     def _plot(ax, table, ylabel, title, ylim=None):
         any_data = False
@@ -225,22 +209,9 @@ def main() -> None:
           "Encoder forward (ms / miss)",
           "Mean encoder GPU work per miss "
           "(only requests that actually ran the encoder)")
-    _plot(ax_hit, table_hit, "Cache hit rate (%)",
-          "Cache hit rate vs offered QPS", ylim=(0, 100))
-    _plot(ax_tput, table_tput, "Throughput (req/s)",
-          "Effective throughput vs offered QPS")
 
-    for ax in (ax_hit, ax_tput):
+    for ax in (ax_enc_req, ax_enc_miss):
         ax.set_xlabel("Offered QPS")
-
-    # Show ideal throughput=QPS reference line on the throughput panel
-    if points:
-        qps_min = points[0][0]
-        qps_max = points[-1][0]
-        ax_tput.plot([qps_min, qps_max], [qps_min, qps_max],
-                     linestyle=":", color="black", alpha=0.4,
-                     label="ideal (throughput = QPS)")
-        ax_tput.legend(loc="best", fontsize=8)
 
     if args.title:
         fig.suptitle(args.title)
@@ -254,26 +225,24 @@ def main() -> None:
     def _fmt(v: float | None, prec: int) -> str:
         return f"{v:.{prec}f}" if v is not None else "-"
 
-    print("\nNumerical summary (mean TTFT in ms / hit% / throughput):")
+    print("\nNumerical summary (TTFT mean / encoder fwd per request, ms):")
     header = (f"{'qps':>5}  "
-              f"{'none':>22}  {'fifo+clean':>22}  "
-              f"{'fifo+persist':>22}  {'dist_aware':>22}")
+              f"{'none':>22}  {'LRU+clean':>22}  "
+              f"{'LRU+persist':>22}  {'OUR':>22}")
     print(header)
     print("-" * len(header))
     for qps, _ in points:
         row = {}
         for key, *_ in STRATS:
             t = dict((q, v) for q, v, _s in table_ttft_mean[key]).get(qps)
-            h = dict((q, v) for q, v, _s in table_hit[key]).get(qps)
-            r = dict((q, v) for q, v, _s in table_tput[key]).get(qps)
-            row[key] = (t, h, r)
+            e = dict((q, v) for q, v, _s in table_enc_per_req[key]).get(qps)
+            row[key] = (t, e)
         cells = []
         for key, *_ in STRATS:
-            t, h, r = row[key]
+            t, e = row[key]
             cells.append(
                 f"ttft={_fmt(t, 0):>5} "
-                f"hr={_fmt(h, 1):>4}% "
-                f"rps={_fmt(r, 2):>4}"
+                f"enc/req={_fmt(e, 0):>5}"
             )
         print(f"{qps:>5.1f}  " + "  ".join(f"{c:>22}" for c in cells))
 
