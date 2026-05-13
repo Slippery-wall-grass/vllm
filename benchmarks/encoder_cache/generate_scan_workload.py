@@ -63,34 +63,19 @@ from generate_test_videos import (  # type: ignore[import-not-found]
 )
 
 
-def _build_distribution(
-    num_hot: int,
-    num_cold: int,
-    hot_fraction: float,
-    hot_skew: float,
-) -> dict[str, float]:
-    """Mixed-mass distribution: Zipfian over hot, uniform over cold."""
-    assert 0.0 < hot_fraction <= 1.0
+def _build_hot_distribution(num_hot: int, hot_skew: float) -> dict[str, float]:
+    """Distribution over the HOT pool only — Zipfian, sums to 1.0.
+
+    This is what feeds into solve_lambda / DistributionAwareCacheManager:
+    cold one-shot items are excluded entirely so the algorithm never
+    "reserves" cache for things that will never be revisited. Cold items
+    arrive at the manager without an entry in `type_metadata` and are
+    immediately marked evictable (see _compute_evictability).
+    """
     assert num_hot >= 1
-    assert num_cold >= 0
-
-    # Zipf within hot pool: weight_i ∝ 1/(i+1)^s
-    hot_weights = [1.0 / (i + 1) ** hot_skew for i in range(num_hot)]
-    hot_norm = sum(hot_weights)
-    hot_probs = [w / hot_norm * hot_fraction for w in hot_weights]
-
-    dist = {f"type_{i}": hot_probs[i] for i in range(num_hot)}
-
-    if num_cold > 0:
-        cold_each = (1.0 - hot_fraction) / num_cold
-        for j in range(num_cold):
-            dist[f"type_{num_hot + j}"] = cold_each
-
-    # Fix any rounding drift so values sum to exactly 1.0.
-    total = sum(dist.values())
-    if total != 1.0:
-        dist["type_0"] += 1.0 - total
-    return dist
+    weights = [1.0 / (i + 1) ** hot_skew for i in range(num_hot)]
+    norm = sum(weights)
+    return {f"type_{i}": w / norm for i, w in enumerate(weights)}
 
 
 def _pick_resolution(rng: random.Random,
@@ -229,33 +214,56 @@ def main() -> None:
         json.dump(manifest, f, indent=2)
     print(f"\nManifest written: {manifest_path}")
 
-    dist = _build_distribution(
+    # distribution.json contains ONLY the hot pool. Distribution-aware
+    # solver operates on this — cold one-shots are deliberately excluded
+    # so the algorithm doesn't waste reservation on items that will never
+    # be revisited. At runtime, cold items arrive at the cache manager
+    # without an entry in `type_metadata` and `_compute_evictability`
+    # returns True for them (immediately evictable).
+    dist = _build_hot_distribution(
         num_hot=args.num_hot,
-        num_cold=args.num_cold,
-        hot_fraction=args.hot_fraction,
         hot_skew=args.hot_skew,
     )
     with open(dist_path, "w") as f:
         json.dump(dist, f, indent=2)
-    print(f"Distribution written: {dist_path}")
+    print(f"Distribution written (hot only, sums to 1.0): {dist_path}")
+
+    # Sidecar metadata that run_benchmark.py reads to know the
+    # hot/cold mix ratio for the scan-mode workload.
+    meta_path = str(out_dir / "scan_meta.json")
+    meta = {
+        "num_hot": args.num_hot,
+        "num_cold": args.num_cold,
+        "hot_fraction": args.hot_fraction,
+        "hot_skew": args.hot_skew,
+        "schema_note": (
+            "distribution.json contains only hot types (sum=1.0). "
+            "Use hot_fraction here as the Bernoulli p for picking hot "
+            "vs cold per request in WORKLOAD_MODE=scan."
+        ),
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"Scan metadata written: {meta_path}")
 
     # Quick summary
     top_hot = dist.get("type_0", 0.0)
-    cold_each = (dist.get(f"type_{args.num_hot}", 0.0)
-                 if args.num_cold > 0 else 0.0)
     print()
-    print(f"Top hot p_i:  {top_hot:.4f}  "
-          f"({top_hot * 100:.1f}% of all requests)")
+    print(f"Top hot p_i (within hot pool):  {top_hot:.4f}")
+    print(f"Hot fraction (per-request Bernoulli): {args.hot_fraction:.2f}")
     if args.num_cold > 0:
-        print(f"Each cold p_i: {cold_each:.6f}  "
-              f"(~1 visit per {int(1 / cold_each):,} requests)")
+        cold_per_req = (1.0 - args.hot_fraction) / args.num_cold
+        print(f"Effective cold p_i: {cold_per_req:.6f}  "
+              f"(~1 visit per {int(1 / cold_per_req):,} requests)")
 
     print()
     print("Next step:")
     print(f"  SOURCE_DIR={out_dir} \\")
     print(f"  MANIFEST_PATH={manifest_path} \\")
     print(f"  DISTRIBUTION=\"$(cat {dist_path})\" \\")
+    print(f"  HOT_FRACTION={args.hot_fraction} \\")
     print(f"  NUM_VIDEOS={total} NUM_TYPES=0 SKIP_GENERATION=1 \\")
+    print(f"  WORKLOAD_MODE=scan \\")
     print("  bash run_cache_comparison.sh")
 
 

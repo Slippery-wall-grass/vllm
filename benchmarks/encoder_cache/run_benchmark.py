@@ -212,22 +212,28 @@ def generate_workload(
             f"workload_mode must be 'prob' or 'scan', got {workload_mode!r}")
 
     # ---------------- scan mode ----------------
+    # Classification source of truth is the manifest cohort tag.
+    # `distribution` contains ONLY hot types (sums to 1.0); cold types
+    # live in the manifest with cohort='cold' and are NOT in the
+    # distribution — they bypass dist-aware's reservation logic
+    # entirely. This matches the design intent that cold one-shot data
+    # should never participate in the policy decision.
     hot_types: list[str] = []
     cold_types: list[str] = []
-    for tid in distribution.keys():
-        if tid not in manifest:
-            continue
-        cohort = (manifest[tid].get("cohort") or "hot").lower()
+    for tid, entry in manifest.items():
+        cohort = (entry.get("cohort") or "hot").lower()
         if cohort == "cold":
             cold_types.append(tid)
-        else:
+        elif tid in distribution:
             hot_types.append(tid)
+        # else: hot in manifest but missing from distribution — ignore
+        #       to avoid silently changing the workload mix.
 
     if not hot_types:
         raise ValueError(
             "scan mode requires at least one hot type. Use "
-            "generate_scan_workload.py and ensure manifest entries "
-            "have cohort='hot' or cohort='cold'.")
+            "generate_scan_workload.py; hot types must appear in both "
+            "manifest (cohort='hot') and distribution.json.")
     if not cold_types:
         raise ValueError(
             "scan mode requires cold types in the manifest "
@@ -236,12 +242,21 @@ def generate_workload(
     # Hot picks are weighted by p_i restricted to hot types
     hot_weights = [distribution[t] for t in hot_types]
     if sum(hot_weights) <= 0:
-        # Fall back to uniform if all hot p_i were 0
         hot_weights = [1.0] * len(hot_types)
 
     if hot_fraction is None:
-        hot_fraction = sum(distribution[t] for t in hot_types)
-        hot_fraction = max(0.0, min(1.0, hot_fraction))
+        # No CLI override and distribution sums to 1.0 over hot only:
+        # we cannot infer the hot/cold mix from the distribution any
+        # more. Caller must pass --hot-fraction explicitly (the
+        # generate_scan_workload.py "Next step" hint includes it).
+        raise ValueError(
+            "scan mode needs --hot-fraction since distribution.json "
+            "now contains only the hot pool (sum=1.0). Pass it "
+            "explicitly or set the HOT_FRACTION env var via "
+            "run_cache_comparison.sh.")
+    if not 0.0 <= hot_fraction <= 1.0:
+        raise ValueError(
+            f"hot_fraction must be in [0, 1], got {hot_fraction}")
     expected_cold = int(round(num_requests * (1.0 - hot_fraction)))
     if expected_cold > len(cold_types):
         raise ValueError(
@@ -908,11 +923,19 @@ def print_results(metrics: dict, label: str = "",
         if "cache_hit_rate" in metrics:
             print(f"Cache hit rate:    "
                   f"{metrics.get('cache_hit_rate', 0):.4f}")
-        print(f"TTFT mean:         {metrics.get('ttft_mean_ms', 'N/A'):.2f} ms")
-        print(f"TTFT median:       {metrics.get('ttft_median_ms', 'N/A'):.2f} ms")
-        print(f"TTFT p95:          {metrics.get('ttft_p95_ms', 'N/A'):.2f} ms")
-        print(f"TTFT p99:          {metrics.get('ttft_p99_ms', 'N/A'):.2f} ms")
-        print(f"Latency mean:      {metrics.get('latency_mean_ms', 'N/A'):.2f} ms")
+        # `metrics.get(key, default)` returns either a float or the
+        # default ("N/A"); applying `:.2f` to the latter raises
+        # ValueError. Format only when we have a numeric value.
+        def _fmt_ms(key: str) -> str:
+            v = metrics.get(key)
+            if isinstance(v, (int, float)):
+                return f"{v:.2f} ms"
+            return "N/A"
+        print(f"TTFT mean:         {_fmt_ms('ttft_mean_ms')}")
+        print(f"TTFT median:       {_fmt_ms('ttft_median_ms')}")
+        print(f"TTFT p95:          {_fmt_ms('ttft_p95_ms')}")
+        print(f"TTFT p99:          {_fmt_ms('ttft_p99_ms')}")
+        print(f"Latency mean:      {_fmt_ms('latency_mean_ms')}")
 
     print()
     if "per_type" in metrics:

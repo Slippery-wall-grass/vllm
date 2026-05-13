@@ -528,7 +528,17 @@ for t in lam_config['types']:
 # mm_hash, so the runtime lookup key is the type_id itself.
 # (Without this, the mapping was keyed by file path and never matched
 # the runtime mm_hash, silently degrading distribution-aware to FIFO.)
-for tid in manifest.keys():
+#
+# Cold one-shot types (cohort='cold' in manifest) are deliberately
+# OMITTED from hash_to_type. When a cold mm_hash arrives at the
+# DistributionAwareCacheManager, the lookup fails → fall through to
+# `if type_id is None or type_id not in self.type_metadata: return True`
+# in _compute_evictability → entry is marked immediately evictable.
+# This is what the user asked for: cold one-shots don't consume
+# reservation capacity and don't survive their own request lifetime.
+for tid, entry in manifest.items():
+    if (entry or {}).get('cohort', 'hot') == 'cold':
+        continue
     config['hash_to_type'][tid] = tid
 
 with open('$DIST_CONFIG_PATH', 'w') as f:
