@@ -456,12 +456,17 @@ echo "Step 3: Profiling encoder computation times"
 echo "============================================================"
 
 # Directly load the vision encoder and time it. No server needed.
+# dtype + attn-impl default to vLLM-equivalent (bf16 + flash_attention_2
+# when available); previously this used fp16 + eager which gave c_i
+# values ~3x larger than what vLLM actually runs, biasing lambda*.
 CUDA_VISIBLE_DEVICES="$GPU_E" python "$SCRIPT_DIR/profile_encoder.py" \
     --manifest-path "$MANIFEST_PATH" \
     --model "$MODEL" \
     --device cuda:0 \
     --num-warmup 3 \
     --num-iterations 10 \
+    --dtype "${PROFILE_DTYPE:-bfloat16}" \
+    --attn-impl "${PROFILE_ATTN_IMPL:-auto}" \
     --output-path "$WORK_DIR/profile.json"
 
 PROFILE_PATH="$WORK_DIR/profile.json"
@@ -489,6 +494,7 @@ python "$SCRIPT_DIR/solve_lambda.py" \
     --profile-path "$PROFILE_PATH" \
     --distribution "$DISTRIBUTION" \
     --cache-budget "$CACHE_BUDGET" \
+    ${C_I_SCALE:+--c-i-scale "$C_I_SCALE"} \
     --output-path "$WORK_DIR/lambda_config.json"
 
 LAMBDA_CONFIG_PATH="$WORK_DIR/lambda_config.json"

@@ -224,6 +224,24 @@ def main():
     parser.add_argument("--output-path", type=str, default=None)
     parser.add_argument("--m-i-override", type=str, default=None,
                         help="JSON mapping type_id -> m_i")
+    parser.add_argument(
+        "--dtype", type=str, default="bfloat16",
+        choices=["bfloat16", "float16", "float32"],
+        help="torch_dtype for the profiled model. Default 'bfloat16' "
+             "to match what `vllm serve` uses on Ampere+ GPUs. The "
+             "previous default 'float16' caused profile c_i to be "
+             "noticeably larger than runtime c_i.",
+    )
+    parser.add_argument(
+        "--attn-impl", type=str, default="auto",
+        choices=["auto", "flash_attention_2", "sdpa", "eager"],
+        help="attn_implementation passed to HF from_pretrained. "
+             "Default 'auto' tries flash_attention_2 → sdpa → eager. "
+             "vLLM uses a FlashAttention-based kernel internally for "
+             "Qwen2.5-VL's vision tower; using flash_attention_2 here "
+             "puts the HF profile path on the same playing field. If "
+             "flash-attn isn't installed, sdpa is the next best.",
+    )
     parser.add_argument("--video-num-frames", type=int, default=32,
                         help="Frames to sample per video before encoding. "
                              "Must match VideoMediaIO at serve time (default "
@@ -243,15 +261,58 @@ def main():
         m_i_override = json.loads(args.m_i_override)
 
     device = args.device
-    print(f"Loading model {args.model} ...")
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    torch_dtype = dtype_map[args.dtype]
+
+    print(f"Loading model {args.model} (dtype={args.dtype}, "
+          f"attn_impl={args.attn_impl})...")
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
 
     # Load just the vision part — use AutoModel to get the full model,
-    # then access its vision encoder.
+    # then access its vision encoder. Try attn implementations in order
+    # so we get vLLM-comparable speed when flash-attn is available.
     from transformers import AutoModel
-    model = AutoModel.from_pretrained(
-        args.model, torch_dtype=torch.float16, trust_remote_code=True,
-    ).to(device).eval()
+    attn_chain = (
+        [args.attn_impl] if args.attn_impl != "auto"
+        else ["flash_attention_2", "sdpa", "eager"]
+    )
+    model = None
+    last_err: Exception | None = None
+    for attn in attn_chain:
+        try:
+            kwargs = dict(
+                torch_dtype=torch_dtype,
+                trust_remote_code=True,
+            )
+            # `attn_implementation` is supported on newer transformers
+            # versions; pass it only when meaningful.
+            if attn:
+                kwargs["attn_implementation"] = attn
+            model = AutoModel.from_pretrained(args.model, **kwargs)
+            print(f"  using attn_implementation={attn}")
+            break
+        except (ImportError, ValueError, RuntimeError) as e:
+            print(f"  attn_implementation={attn} unavailable: {e}")
+            last_err = e
+            continue
+    if model is None:
+        raise RuntimeError(
+            f"Could not load model with any attn_implementation in "
+            f"{attn_chain}. Last error: {last_err}"
+        )
+    model = model.to(device).eval()
+
+    # Warn if user is still on float16 — measured c_i will be ~3x
+    # larger than vLLM's runtime (which defaults to bfloat16 + flash
+    # attn). The downstream solve_lambda will be fed an inflated c_i.
+    if torch_dtype == torch.float16:
+        print("  WARNING: profiling in float16. vLLM uses bfloat16 by "
+              "default on Ampere+ GPUs; consider --dtype=bfloat16 for "
+              "an apples-to-apples c_i.")
 
     print(f"Model loaded on {device}\n")
 

@@ -151,10 +151,27 @@ def main():
                         "uses B = sum(m_i) // 2 as a placeholder.")
     parser.add_argument("--output-path", type=str, default=None,
                         help="Path for output config JSON")
+    parser.add_argument(
+        "--c-i-scale", type=float, default=1.0,
+        help="Multiplicative correction applied to every c_i loaded "
+             "from --profile-path. Useful when profile_encoder used a "
+             "different attn implementation / dtype than vLLM at "
+             "runtime (e.g. HF eager vs vLLM flash-attn). For a "
+             "Qwen2.5-VL profile in fp16 vs runtime in bf16+flash, "
+             "passing --c-i-scale=0.3 brings c_i in line with what the "
+             "runtime measures. Set to 1.0 (default) to keep raw "
+             "profile values.",
+    )
     args = parser.parse_args()
 
     with open(args.profile_path) as f:
         profile = json.load(f)
+
+    if args.c_i_scale != 1.0:
+        print(f"NOTE: scaling profile c_i by {args.c_i_scale} to "
+              f"align with runtime encoder speed.")
+        for t in profile.values():
+            t["c_i"] = t["c_i"] * args.c_i_scale
 
     distribution = json.loads(args.distribution)
 
