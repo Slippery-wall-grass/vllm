@@ -245,15 +245,15 @@ def generate_workload(
         hot_weights = [1.0] * len(hot_types)
 
     if hot_fraction is None:
-        # No CLI override and distribution sums to 1.0 over hot only:
-        # we cannot infer the hot/cold mix from the distribution any
-        # more. Caller must pass --hot-fraction explicitly (the
-        # generate_scan_workload.py "Next step" hint includes it).
-        raise ValueError(
-            "scan mode needs --hot-fraction since distribution.json "
-            "now contains only the hot pool (sum=1.0). Pass it "
-            "explicitly or set the HOT_FRACTION env var via "
-            "run_cache_comparison.sh.")
+        # No CLI override. distribution.json sums to 1.0 over hot only,
+        # so we cannot infer the hot/cold mix from it. Fall back to 0.8
+        # with a warning — that's the generate_scan_workload.py default.
+        print("WARNING: scan mode received no --hot-fraction. "
+              "distribution.json contains only the hot pool (sum=1.0) "
+              "so the hot/cold mix cannot be inferred from it. "
+              "Defaulting hot_fraction=0.8. Pass it explicitly or "
+              "write a scan_meta.json sidecar to silence this.")
+        hot_fraction = 0.8
     if not 0.0 <= hot_fraction <= 1.0:
         raise ValueError(
             f"hot_fraction must be in [0, 1], got {hot_fraction}")

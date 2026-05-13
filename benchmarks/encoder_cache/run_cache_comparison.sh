@@ -145,18 +145,31 @@ if [ "$WORKLOAD_MODE" = "scan" ] && [ -z "${HOT_FRACTION:-}" ]; then
     if [ -z "$SCAN_META_PATH" ] && [ -n "${SOURCE_DIR:-}" ]; then
         SCAN_META_PATH="$SOURCE_DIR/scan_meta.json"
     fi
+    HOT_FRACTION=""
     if [ -n "$SCAN_META_PATH" ] && [ -f "$SCAN_META_PATH" ]; then
         HOT_FRACTION=$(python -c "
-import json
-print(json.load(open('$SCAN_META_PATH'))['hot_fraction'])")
-        echo "Auto-loaded HOT_FRACTION=$HOT_FRACTION from $SCAN_META_PATH"
-    else
+import json, sys
+try:
+    v = json.load(open('$SCAN_META_PATH')).get('hot_fraction')
+    if v is None:
+        sys.exit(1)
+    print(v)
+except Exception as e:
+    sys.exit(1)
+" 2>/dev/null) || HOT_FRACTION=""
+        if [ -n "$HOT_FRACTION" ]; then
+            echo "Auto-loaded HOT_FRACTION=$HOT_FRACTION from $SCAN_META_PATH"
+        fi
+    fi
+    if [ -z "$HOT_FRACTION" ]; then
         HOT_FRACTION=0.8
-        echo "WARNING: WORKLOAD_MODE=scan but no scan_meta.json found "
-        echo "  (looked for $SCAN_META_PATH). Defaulting HOT_FRACTION=0.8."
-        echo "  Set HOT_FRACTION explicitly to silence this warning."
+        echo "WARNING: WORKLOAD_MODE=scan but no usable scan_meta.json "
+        echo "  (looked for ${SCAN_META_PATH:-<unset>}). "
+        echo "  Defaulting HOT_FRACTION=0.8. Set HOT_FRACTION env var or "
+        echo "  regenerate scan_data with generate_scan_workload.py to silence."
     fi
 fi
+echo "WORKLOAD_MODE=$WORKLOAD_MODE  HOT_FRACTION=${HOT_FRACTION:-<unset>}"
 
 export UCX_TLS=all
 export UCX_NET_DEVICES=all
@@ -556,7 +569,7 @@ for t in lam_config['types']:
 # Cold one-shot types (cohort='cold' in manifest) are deliberately
 # OMITTED from hash_to_type. When a cold mm_hash arrives at the
 # DistributionAwareCacheManager, the lookup fails → fall through to
-# `if type_id is None or type_id not in self.type_metadata: return True`
+# 'type_id is None or type_id not in self.type_metadata then True'
 # in _compute_evictability → entry is marked immediately evictable.
 # This is what the user asked for: cold one-shots don't consume
 # reservation capacity and don't survive their own request lifetime.
