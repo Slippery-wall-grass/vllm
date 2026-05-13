@@ -134,6 +134,30 @@ MEDIA_MODE="${MEDIA_MODE:-file}"
 # shift the relative weight of encoder vs prefill in TTFT.
 PROMPT_TOKENS="${PROMPT_TOKENS:-0}"
 
+# Scan workload knobs. WORKLOAD_MODE=scan needs HOT_FRACTION to know
+# the Bernoulli mix between hot (sampled from `distribution`) and
+# cold (one-shot from manifest cohort='cold'). If unset, we look for
+# scan_meta.json next to the manifest — generate_scan_workload.py
+# writes that as a sidecar. Fall back to 0.8 only as last resort.
+WORKLOAD_MODE="${WORKLOAD_MODE:-prob}"
+if [ "$WORKLOAD_MODE" = "scan" ] && [ -z "${HOT_FRACTION:-}" ]; then
+    SCAN_META_PATH="${SCAN_META_PATH:-}"
+    if [ -z "$SCAN_META_PATH" ] && [ -n "${SOURCE_DIR:-}" ]; then
+        SCAN_META_PATH="$SOURCE_DIR/scan_meta.json"
+    fi
+    if [ -n "$SCAN_META_PATH" ] && [ -f "$SCAN_META_PATH" ]; then
+        HOT_FRACTION=$(python -c "
+import json
+print(json.load(open('$SCAN_META_PATH'))['hot_fraction'])")
+        echo "Auto-loaded HOT_FRACTION=$HOT_FRACTION from $SCAN_META_PATH"
+    else
+        HOT_FRACTION=0.8
+        echo "WARNING: WORKLOAD_MODE=scan but no scan_meta.json found "
+        echo "  (looked for $SCAN_META_PATH). Defaulting HOT_FRACTION=0.8."
+        echo "  Set HOT_FRACTION explicitly to silence this warning."
+    fi
+fi
+
 export UCX_TLS=all
 export UCX_NET_DEVICES=all
 
