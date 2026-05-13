@@ -107,9 +107,22 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-114688}"
 EC_SHARED_STORAGE_PATH="${EC_SHARED_STORAGE_PATH:-/dev/shm/ec_cache}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-600}"
 
-# Working directories
+# Working directories.
+#
+# IMAGE_DIR is the directory the vllm server will allow reads from
+# (--allowed-local-media-path). Resolution order:
+#   1. explicit IMAGE_DIR (user override)
+#   2. SOURCE_DIR (used by scan / sweep workflows that point at a
+#      pre-built dataset under a different dir than WORK_DIR)
+#   3. fall back to $WORK_DIR/images for the legacy generate-here flow
+#
+# Without rule 2, running with SOURCE_DIR pointing at e.g. scan_data
+# would leave IMAGE_DIR = $WORK_DIR/images = tmp/images, the server
+# would reject the videos as outside the allowed root, and every
+# request would fail with
+#   ValueError: ... must be a subpath of '--allowed-local-media-path ...'
 WORK_DIR="${WORK_DIR:-/tmp/encoder_cache_benchmark}"
-IMAGE_DIR="${WORK_DIR}/images"
+IMAGE_DIR="${IMAGE_DIR:-${SOURCE_DIR:-${WORK_DIR}/images}}"
 LOG_PATH="${WORK_DIR}/logs"
 
 # Distribution: JSON mapping type_id -> p_i
