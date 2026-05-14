@@ -79,13 +79,34 @@ SEED="${SEED:-42}"
 CACHE_BUDGET="${CACHE_BUDGET:-}"
 
 ENCODE_PORT="${ENCODE_PORT:-19534}"
-PREFILL_PORT="${PREFILL_PORT:-19535}"
-DECODE_PORT="${DECODE_PORT:-19536}"
+# Base ports for P and D. With multi-replica P/D, port i = base + i.
+PREFILL_PORT_BASE="${PREFILL_PORT_BASE:-${PREFILL_PORT:-19535}}"
+DECODE_PORT_BASE="${DECODE_PORT_BASE:-${DECODE_PORT:-19536}}"
 PROXY_PORT="${PROXY_PORT:-10001}"
+# NIXL side channel ports — must be unique across all P and D workers
+# on the same host.
+PREFILL_NIXL_PORT_BASE="${PREFILL_NIXL_PORT_BASE:-5559}"
+DECODE_NIXL_PORT_BASE="${DECODE_NIXL_PORT_BASE:-6000}"
 
 GPU_E="${GPU_E:-2}"
-GPU_P="${GPU_P:-2}"
-GPU_D="${GPU_D:-3}"
+# Multi-replica P/D: space-separated GPU id lists.
+# Examples:
+#   GPU_P_LIST="0 1"  GPU_D_LIST="2 3"   → 1E + 2P + 2D
+#   GPU_P_LIST="0 1 2 3"  GPU_D_LIST="4" → 1E + 4P + 1D
+# Fall back to GPU_P / GPU_D for the legacy 1E+1P+1D layout.
+GPU_P_LIST="${GPU_P_LIST:-${GPU_P:-2}}"
+GPU_D_LIST="${GPU_D_LIST:-${GPU_D:-3}}"
+# Convert to arrays.
+read -r -a GPU_P_ARR <<< "$GPU_P_LIST"
+read -r -a GPU_D_ARR <<< "$GPU_D_LIST"
+NUM_P=${#GPU_P_ARR[@]}
+NUM_D=${#GPU_D_ARR[@]}
+# Backward-compat aliases for code further down that still references
+# GPU_P / GPU_D singularly (preserves old behaviour when no LIST set).
+GPU_P="${GPU_P_ARR[0]}"
+GPU_D="${GPU_D_ARR[0]}"
+PREFILL_PORT="$PREFILL_PORT_BASE"
+DECODE_PORT="$DECODE_PORT_BASE"
 
 # Encoder worker needs enough KV cache to fit visual tokens from test images.
 # With 0.01 utilization the KV cache is too small for most image sizes.
@@ -207,7 +228,8 @@ START_TIME=$(date +"%Y%m%d_%H%M%S")
 
 # Collect unique GPU IDs used by this benchmark
 declare -a USED_GPUS=()
-for g in "$GPU_E" "$GPU_P" "$GPU_D"; do
+ALL_GPUS=("$GPU_E" "${GPU_P_ARR[@]}" "${GPU_D_ARR[@]}")
+for g in "${ALL_GPUS[@]}"; do
     local_dup=false
     for existing in "${USED_GPUS[@]+"${USED_GPUS[@]}"}"; do
         if [ "$existing" = "$g" ]; then
@@ -330,69 +352,103 @@ start_1e1p1d() {
         >"${LOG_PATH}/encoder_${label}_${START_TIME}.log" 2>&1 &
     PIDS+=($!)
 
-    # Prefill worker (also reads encoder cache policy since it has its own
-    # scheduler / EncoderCacheManager that decides when to load from EC)
-    CUDA_VISIBLE_DEVICES="$GPU_P" \
-    UCX_NET_DEVICES=all \
-    VLLM_NIXL_SIDE_CHANNEL_PORT=5559 \
-    VLLM_ENCODER_CACHE_POLICY="$policy" \
-    VLLM_ENCODER_CACHE_CONFIG_PATH="$config_path" \
-    VLLM_REQUEST_TIMING_TRACE="${TIMING_TRACE:-1}" \
-    VLLM_EC_DELETE_AFTER_LOAD="${EC_DELETE_AFTER_LOAD:-1}" \
-    vllm serve "$MODEL" \
-        --gpu-memory-utilization "$GPU_MEM_P" \
-        --port "$PREFILL_PORT" \
-        --enforce-eager \
-        --enable-request-id-headers \
-        --max-num-seqs 128 \
-        --allowed-local-media-path "$IMAGE_DIR" \
-        $mm_limit_arg \
-        --ec-transfer-config '{
-            "ec_connector": "ECExampleConnector",
-            "ec_role": "ec_consumer",
-            "ec_connector_extra_config": {
-                "shared_storage_path": "'"$EC_SHARED_STORAGE_PATH"'"
-            }
-        }' \
-        --kv-transfer-config '{
-            "kv_connector": "NixlConnector",
-            "kv_role": "kv_producer"
-        }' \
-        >"${LOG_PATH}/prefill_${label}_${START_TIME}.log" 2>&1 &
-    PIDS+=($!)
+    # Prefill workers: launch one per entry in GPU_P_ARR. Each gets its
+    # own port (PREFILL_PORT_BASE + i) and NIXL side-channel port
+    # (PREFILL_NIXL_PORT_BASE + i). Logs land with a -<i> suffix when
+    # NUM_P > 1 so they don't overwrite each other.
+    PREFILL_URLS=()
+    for ((i=0; i<NUM_P; i++)); do
+        local p_gpu="${GPU_P_ARR[$i]}"
+        local p_port=$((PREFILL_PORT_BASE + i))
+        local p_nixl=$((PREFILL_NIXL_PORT_BASE + i))
+        local p_log_suffix=""
+        if [ "$NUM_P" -gt 1 ]; then p_log_suffix="-${i}"; fi
+        CUDA_VISIBLE_DEVICES="$p_gpu" \
+        UCX_NET_DEVICES=all \
+        VLLM_NIXL_SIDE_CHANNEL_PORT="$p_nixl" \
+        VLLM_ENCODER_CACHE_POLICY="$policy" \
+        VLLM_ENCODER_CACHE_CONFIG_PATH="$config_path" \
+        VLLM_REQUEST_TIMING_TRACE="${TIMING_TRACE:-1}" \
+        VLLM_EC_DELETE_AFTER_LOAD="${EC_DELETE_AFTER_LOAD:-1}" \
+        vllm serve "$MODEL" \
+            --gpu-memory-utilization "$GPU_MEM_P" \
+            --port "$p_port" \
+            --enforce-eager \
+            --enable-request-id-headers \
+            --max-num-seqs 128 \
+            --allowed-local-media-path "$IMAGE_DIR" \
+            $mm_limit_arg \
+            --ec-transfer-config '{
+                "ec_connector": "ECExampleConnector",
+                "ec_role": "ec_consumer",
+                "ec_connector_extra_config": {
+                    "shared_storage_path": "'"$EC_SHARED_STORAGE_PATH"'"
+                }
+            }' \
+            --kv-transfer-config '{
+                "kv_connector": "NixlConnector",
+                "kv_role": "kv_producer"
+            }' \
+            >"${LOG_PATH}/prefill${p_log_suffix}_${label}_${START_TIME}.log" 2>&1 &
+        PIDS+=($!)
+        PREFILL_URLS+=("http://localhost:${p_port}")
+    done
 
-    # Decode worker
-    CUDA_VISIBLE_DEVICES="$GPU_D" \
-    UCX_NET_DEVICES=all \
-    VLLM_NIXL_SIDE_CHANNEL_PORT=6000 \
-    VLLM_REQUEST_TIMING_TRACE="${TIMING_TRACE:-1}" \
-    vllm serve "$MODEL" \
-        --gpu-memory-utilization "$GPU_MEM_D" \
-        --port "$DECODE_PORT" \
-        --enforce-eager \
-        --enable-request-id-headers \
-        --max-num-seqs 128 \
-        --allowed-local-media-path "$IMAGE_DIR" \
-        $mm_limit_arg \
-        --kv-transfer-config '{
-            "kv_connector": "NixlConnector",
-            "kv_role": "kv_consumer"
-        }' \
-        >"${LOG_PATH}/decode_${label}_${START_TIME}.log" 2>&1 &
-    PIDS+=($!)
+    # Decode workers (NUM_D replicas with the same pattern).
+    DECODE_URLS=()
+    for ((i=0; i<NUM_D; i++)); do
+        local d_gpu="${GPU_D_ARR[$i]}"
+        local d_port=$((DECODE_PORT_BASE + i))
+        local d_nixl=$((DECODE_NIXL_PORT_BASE + i))
+        local d_log_suffix=""
+        if [ "$NUM_D" -gt 1 ]; then d_log_suffix="-${i}"; fi
+        CUDA_VISIBLE_DEVICES="$d_gpu" \
+        UCX_NET_DEVICES=all \
+        VLLM_NIXL_SIDE_CHANNEL_PORT="$d_nixl" \
+        VLLM_REQUEST_TIMING_TRACE="${TIMING_TRACE:-1}" \
+        vllm serve "$MODEL" \
+            --gpu-memory-utilization "$GPU_MEM_D" \
+            --port "$d_port" \
+            --enforce-eager \
+            --enable-request-id-headers \
+            --max-num-seqs 128 \
+            --allowed-local-media-path "$IMAGE_DIR" \
+            $mm_limit_arg \
+            --kv-transfer-config '{
+                "kv_connector": "NixlConnector",
+                "kv_role": "kv_consumer"
+            }' \
+            >"${LOG_PATH}/decode${d_log_suffix}_${label}_${START_TIME}.log" 2>&1 &
+        PIDS+=($!)
+        DECODE_URLS+=("http://localhost:${d_port}")
+    done
 
     # Wait for all workers
     wait_for_server "$ENCODE_PORT"
-    wait_for_server "$PREFILL_PORT"
-    wait_for_server "$DECODE_PORT"
+    for url in "${PREFILL_URLS[@]}"; do
+        local p_port="${url##*:}"
+        wait_for_server "$p_port"
+    done
+    for url in "${DECODE_URLS[@]}"; do
+        local d_port="${url##*:}"
+        wait_for_server "$d_port"
+    done
+    echo "1E + ${NUM_P}P + ${NUM_D}D workers up. "
+    echo "  P URLs: ${PREFILL_URLS[*]}"
+    echo "  D URLs: ${DECODE_URLS[*]}"
 
-    # Start proxy
+    # Start proxy. The proxy supports comma-separated URL lists and
+    # randomly load-balances across them for each request.
+    local p_urls_csv
+    local d_urls_csv
+    p_urls_csv=$(IFS=,; echo "${PREFILL_URLS[*]}")
+    d_urls_csv=$(IFS=,; echo "${DECODE_URLS[*]}")
     python "${GIT_ROOT}/examples/online_serving/disaggregated_encoder/disagg_epd_proxy.py" \
         --host "0.0.0.0" \
         --port "$PROXY_PORT" \
         --encode-servers-urls "http://localhost:$ENCODE_PORT" \
-        --prefill-servers-urls "http://localhost:$PREFILL_PORT" \
-        --decode-servers-urls "http://localhost:$DECODE_PORT" \
+        --prefill-servers-urls "$p_urls_csv" \
+        --decode-servers-urls "$d_urls_csv" \
         >"${LOG_PATH}/proxy_${label}_${START_TIME}.log" 2>&1 &
     PIDS+=($!)
 
