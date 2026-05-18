@@ -36,6 +36,7 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
+from vllm.v1.core.encoder_cache_policy import build_policy_from_env
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
@@ -200,10 +201,16 @@ class Scheduler(SchedulerInterface):
             mm_budget.encoder_compute_budget if mm_budget else 0
         )
         encoder_cache_size = mm_budget.encoder_cache_size if mm_budget else 0
+        encoder_cache_policy = (
+            build_policy_from_env() if not self.is_encoder_decoder else None
+        )
         self.encoder_cache_manager = (
             EncoderDecoderCacheManager(cache_size=encoder_cache_size)
             if self.is_encoder_decoder
-            else EncoderCacheManager(cache_size=encoder_cache_size)
+            else EncoderCacheManager(
+                cache_size=encoder_cache_size,
+                policy=encoder_cache_policy,
+            )
         )
 
         speculative_config = vllm_config.speculative_config
@@ -1879,6 +1886,8 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        if not self.is_encoder_decoder:
+            self.encoder_cache_manager.maybe_log_stats()
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),

@@ -1,11 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+import time
 from collections import OrderedDict
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from vllm.logger import init_logger
+from vllm.v1.core.encoder_cache_policy import (
+    EncoderCachePolicy,
+    FIFOEncoderCachePolicy,
+    build_policy_from_env,
+)
 from vllm.v1.request import Request
 
 if TYPE_CHECKING:
@@ -36,17 +43,19 @@ class EncoderCacheManager:
     item (identified by their hash value) between different requests,
     and eviction takes place at allocation time when there's no free
     space for new embeddings.
-    Oldest cached embeddings with no request referenced will be first evicted.
 
-    NOTE: The EncoderCacheManager operates on the level of multimodal embeddings
-    instead of encoder tokens (i.e. all tokens that represent the multimodal data
-    in the input sequence). This means all break/text tokens in-between multimodal
-    embeddings are not considered with respect to the cache size and the number
-    of free slots.
+    Eviction order over the freeable queue is delegated to an
+    :class:`EncoderCachePolicy` (``policy``). By default the legacy FIFO
+    behavior is preserved. Policies can pin freeable entries for a number
+    of mm-item ticks; pinned entries are skipped during eviction unless
+    the cache is fully pinned, in which case the earliest-inserted pinned
+    entry is force-evicted and ``forced_unpin_evictions`` is incremented.
 
     Args:
         cache_size: Limit the size of the cache, measured by the number of
                     encoder embeddings from the input sequence.
+        policy: Eviction-decision strategy. Defaults to
+            ``FIFOEncoderCachePolicy`` for legacy behavior.
 
     Attributes:
         cache_size: Total cache capacity in encoder embeddings.
@@ -62,9 +71,19 @@ class EncoderCacheManager:
             make space when needed.
         freed: List of mm_hash strings that were actually evicted since the
             last call to get_freed_mm_hashes(). This list is cleared on return.
+        policy: Active eviction policy.
+        current_tick: Monotonically increasing counter of mm-item arrival
+            events (both hits and successful allocations). Drives pin
+            timestamps so they are independent of wall clock.
+        hits / misses / forced_unpin_evictions: Cumulative counters surfaced
+            via :meth:`get_stats` for benchmarking.
     """
 
-    def __init__(self, cache_size: int):
+    def __init__(
+        self,
+        cache_size: int,
+        policy: Optional[EncoderCachePolicy] = None,
+    ):
         self.cache_size = cache_size
         self.num_free_slots = cache_size
         self.num_freeable_slots = cache_size
@@ -76,6 +95,26 @@ class EncoderCacheManager:
         self.freeable: OrderedDict[str, int] = OrderedDict()
         self.freed: list[str] = []
 
+        self.policy: EncoderCachePolicy = policy or FIFOEncoderCachePolicy()
+        # Per-mm_hash absolute tick before which this entry is protected
+        # from eviction. Missing key == 0 == evictable now.
+        self._unlock_tick: dict[str, int] = {}
+
+        # Metrics: mm-item-level arrivals and forced-eviction events.
+        self.current_tick: int = 0
+        self.hits: int = 0
+        self.misses: int = 0
+        self.forced_unpin_evictions: int = 0
+
+        # Periodic stats logging for benchmark observability.
+        try:
+            self._stats_log_interval = float(
+                os.environ.get("VLLM_ENCODER_CACHE_STATS_INTERVAL_SEC", "0")
+            )
+        except ValueError:
+            self._stats_log_interval = 0.0
+        self._last_stats_log_ts = time.monotonic()
+
     def reset(self) -> None:
         """Reset the encoder cache to its initial state.
 
@@ -85,8 +124,14 @@ class EncoderCacheManager:
         self.cached.clear()
         self.freeable.clear()
         self.freed.clear()
+        self._unlock_tick.clear()
         self.num_free_slots = self.cache_size
         self.num_freeable_slots = self.cache_size
+        self.current_tick = 0
+        self.hits = 0
+        self.misses = 0
+        self.forced_unpin_evictions = 0
+        self.policy.reset()
 
     def check_and_update_cache(self, request: Request, input_id: int) -> bool:
         """Check if encoder output for a specific multimodal input is cached.
@@ -114,6 +159,13 @@ class EncoderCacheManager:
             self.num_freeable_slots -= num_encoder_embeds
 
         self.cached[mm_hash].add(request.request_id)
+        # Hit: account for the arrival and let policy refresh the pin.
+        self.hits += 1
+        self.current_tick += 1
+        num_embeds = request.get_num_encoder_embeds(input_id)
+        self._unlock_tick[mm_hash] = self.policy.on_arrival(
+            mm_hash, num_embeds, self.current_tick
+        )
         return True
 
     def can_allocate(
@@ -130,7 +182,10 @@ class EncoderCacheManager:
         enough reclaimable space in `num_freeable_slots`, entries will be
         evicted from `freeable` (their mm_hash appended to `freed`) until
         enough space is available, and then this method returns True.
-        Older entries are evicted first.
+        The active :class:`EncoderCachePolicy` controls which entry to
+        evict next: pinned entries are skipped while any unpinned candidate
+        remains; if no unpinned candidate exists, the FIFO-front pinned
+        entry is force-evicted and ``forced_unpin_evictions`` is incremented.
 
         Returns False only if the requested number of tokens exceeds both
         the free and reclaimable capacities combined.
@@ -167,15 +222,40 @@ class EncoderCacheManager:
         if num_embeds > self.num_freeable_slots:
             return False
 
-        # Not enough free slots but enough reclaimable slots
+        # Not enough free slots but enough reclaimable slots.
         # NOTE: Eviction takes place here, but physical memory is not freed
         # until model runner is notified by the scheduler output.
         while num_embeds > self.num_free_slots:
-            mm_hash, num_free_embeds = self.freeable.popitem(last=False)
-            del self.cached[mm_hash]
-            self.freed.append(mm_hash)
-            self.num_free_slots += num_free_embeds
+            mm_hash = self._select_eviction_candidate(forced=False)
+            if mm_hash is None:
+                # All freeable entries are pinned; the policy must yield.
+                mm_hash = self._select_eviction_candidate(forced=True)
+                if mm_hash is None:
+                    # Should not happen since num_freeable_slots >= num_embeds.
+                    return False
+                self.forced_unpin_evictions += 1
+            self._evict(mm_hash)
         return True
+
+    def _select_eviction_candidate(self, forced: bool) -> Optional[str]:
+        """Pick the next mm_hash to evict from the freeable queue.
+
+        With ``forced=False`` skips entries whose unlock tick is in the
+        future. With ``forced=True`` ignores pinning entirely, falling
+        back to FIFO order over the freeable queue.
+        """
+        for mm_hash in self.freeable:
+            if forced or self._unlock_tick.get(mm_hash, 0) <= self.current_tick:
+                return mm_hash
+        return None
+
+    def _evict(self, mm_hash: str) -> None:
+        """Physically evict an entry from the cache bookkeeping."""
+        num_free_embeds = self.freeable.pop(mm_hash)
+        del self.cached[mm_hash]
+        self._unlock_tick.pop(mm_hash, None)
+        self.freed.append(mm_hash)
+        self.num_free_slots += num_free_embeds
 
     def allocate(self, request: Request, input_id: int) -> None:
         """Allocate cache space for a multimodal input's encoder output.
@@ -204,6 +284,14 @@ class EncoderCacheManager:
         self.num_free_slots -= num_encoder_embeds
         self.num_freeable_slots -= num_encoder_embeds
 
+        # Miss: this is the request that triggered allocation. Count
+        # exactly once per unique mm_item -> drives policy's view of d_i.
+        self.misses += 1
+        self.current_tick += 1
+        self._unlock_tick[mm_hash] = self.policy.on_arrival(
+            mm_hash, num_encoder_embeds, self.current_tick
+        )
+
     def get_cached_input_ids(self, request: Request) -> set[int]:
         """Get all cached multimodal input IDs for a request.
 
@@ -223,10 +311,12 @@ class EncoderCacheManager:
 
         When the reference set for the corresponding `mm_hash` becomes empty,
         the entry is appended to `freeable` and `num_freeable_slots` is
-        increased by the number of encoder embeddings for that input.
+        increased by the number of encoder embeddings for that input. If the
+        active policy declares ``evict_on_unreference`` (e.g. the no-cache
+        ablation), the entry is dropped immediately instead.
 
-        The entry is NOT physically freed until capacity is needed (e.g., by
-        `can_allocate`).
+        Outside of ``evict_on_unreference``, the entry is NOT physically freed
+        until capacity is needed (e.g., by `can_allocate`).
         """
         req_id = request.request_id
         mm_hash = request.mm_features[input_id].identifier
@@ -234,8 +324,19 @@ class EncoderCacheManager:
         if not self.cached.get(mm_hash, None):
             return
         self.cached[mm_hash].discard(req_id)
-        if not self.cached[mm_hash]:
-            num_encoder_embeds = request.get_num_encoder_embeds(input_id)
+        if self.cached[mm_hash]:
+            return
+        num_encoder_embeds = request.get_num_encoder_embeds(input_id)
+        if self.policy.evict_on_unreference:
+            # Ablation: drop immediately, no freeable buffer.
+            del self.cached[mm_hash]
+            self._unlock_tick.pop(mm_hash, None)
+            self.freed.append(mm_hash)
+            self.num_free_slots += num_encoder_embeds
+            # num_freeable_slots tracks num_free_slots in this mode since
+            # the freeable queue is never populated.
+            self.num_freeable_slots += num_encoder_embeds
+        else:
             self.freeable[mm_hash] = num_encoder_embeds
             self.num_freeable_slots += num_encoder_embeds
 
@@ -264,6 +365,52 @@ class EncoderCacheManager:
         freed = self.freed
         self.freed = []
         return freed
+
+    def maybe_log_stats(self) -> None:
+        """Emit a one-line summary at most every
+        ``VLLM_ENCODER_CACHE_STATS_INTERVAL_SEC`` seconds.
+
+        Disabled (no-op) when the interval is 0 or negative. Designed
+        to be called from the scheduler's per-step ``make_stats``.
+        """
+        if self._stats_log_interval <= 0.0:
+            return
+        now = time.monotonic()
+        if now - self._last_stats_log_ts < self._stats_log_interval:
+            return
+        self._last_stats_log_ts = now
+        stats = self.get_stats()
+        logger.info(
+            "encoder_cache policy=%s hits=%d misses=%d hit_rate=%.4f "
+            "forced_unpin=%d pinned=%d freeable=%d free_slots=%d",
+            stats["policy"],
+            stats["hits"],
+            stats["misses"],
+            stats["hit_rate"],
+            stats["forced_unpin_evictions"],
+            stats["num_pinned"],
+            stats["num_freeable"],
+            stats["num_free_slots"],
+        )
+
+    def get_stats(self) -> dict[str, int | float | str]:
+        """Snapshot of cumulative cache metrics for benchmarking."""
+        total = self.hits + self.misses
+        return {
+            "policy": type(self.policy).__name__,
+            "hits": self.hits,
+            "misses": self.misses,
+            "arrivals": total,
+            "hit_rate": (self.hits / total) if total else 0.0,
+            "forced_unpin_evictions": self.forced_unpin_evictions,
+            "num_pinned": sum(
+                1
+                for mm_hash in self.freeable
+                if self._unlock_tick.get(mm_hash, 0) > self.current_tick
+            ),
+            "num_freeable": len(self.freeable),
+            "num_free_slots": self.num_free_slots,
+        }
 
 
 def compute_mm_encoder_budget(
@@ -321,7 +468,14 @@ def compute_mm_encoder_budget(
 # utilize the cache and this class will fold into EncoderCacheManager, as
 # differences with MM models shrink.
 class EncoderDecoderCacheManager(EncoderCacheManager):
-    def __init__(self, cache_size: int):
+    def __init__(
+        self,
+        cache_size: int,
+        policy: Optional[EncoderCachePolicy] = None,
+    ):
+        # Intentionally do not call super().__init__: this class uses a
+        # different state shape.
+        del policy  # encoder-decoder path does not use the cross-request cache
         self.cache_size = cache_size
         self.num_free_slots = cache_size
         self.allocated: list[str] = []
@@ -379,3 +533,11 @@ class EncoderDecoderCacheManager(EncoderCacheManager):
     def free_encoder_input(self, request: Request, input_id: int) -> None:
         num_encoder_embeds = request.get_num_encoder_embeds(input_id)
         self.num_free_slots += num_encoder_embeds
+
+
+__all__ = [
+    "EncoderCacheManager",
+    "EncoderDecoderCacheManager",
+    "compute_mm_encoder_budget",
+    "build_policy_from_env",
+]
