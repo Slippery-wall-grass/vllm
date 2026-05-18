@@ -247,6 +247,7 @@ for POLICY in $POLICIES; do
       ( cd "$REPO_ROOT" && vllm bench serve \
           --backend openai-chat \
           --base-url "http://${HOST}:${PORT}" \
+          --endpoint /v1/chat/completions \
           --model "$MODEL" \
           --dataset-name mm-fixed-pool \
           --mm-pool-dir "$POOL_DIR" \
