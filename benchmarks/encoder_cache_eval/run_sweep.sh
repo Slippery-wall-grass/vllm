@@ -188,19 +188,31 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Auto-detect encoder cache capacity from server log if not provided.
+# Determine encoder cache capacity B for lambda* solving.
+#
+# vLLM does NOT print encoder_cache_size at startup, and by default it
+# equals --max-num-batched-tokens (see vllm/config/scheduler.py). The
+# precedence we use:
+#   1. $CACHE_CAPACITY explicitly set.
+#   2. $ENCODER_CACHE_SIZE explicitly set (also passed to the server).
+#   3. Fallback: $MAX_NUM_BATCHED_TOKENS (the vLLM default).
 # ---------------------------------------------------------------------------
 if [ -z "$CACHE_CAPACITY" ]; then
-  # vLLM prints something like 'encoder_cache_size=NNN' in logs.
+  # Try grep first in case a future vLLM version exposes it directly.
   CACHE_CAPACITY=$(grep -oE "encoder_cache_size[^0-9]*[0-9]+" \
                     "$RESULT_DIR/server_logs/measure.log" 2>/dev/null \
                   | grep -oE "[0-9]+" | tail -1 || true)
-  if [ -z "$CACHE_CAPACITY" ]; then
-    log "ERROR: could not auto-detect encoder cache capacity from the server log."
-    log "       Pass CACHE_CAPACITY=<int tokens> explicitly."
-    exit 1
-  fi
-  log "auto-detected encoder cache capacity = $CACHE_CAPACITY tokens"
+fi
+if [ -z "$CACHE_CAPACITY" ] && [ -n "$ENCODER_CACHE_SIZE" ]; then
+  CACHE_CAPACITY=$ENCODER_CACHE_SIZE
+  log "using explicit ENCODER_CACHE_SIZE=$CACHE_CAPACITY as cache capacity"
+fi
+if [ -z "$CACHE_CAPACITY" ]; then
+  CACHE_CAPACITY=$MAX_NUM_BATCHED_TOKENS
+  log "encoder cache capacity not provided; falling back to" \
+      "MAX_NUM_BATCHED_TOKENS=$CACHE_CAPACITY (vLLM default)"
+else
+  log "encoder cache capacity = $CACHE_CAPACITY tokens"
 fi
 
 # ---------------------------------------------------------------------------
