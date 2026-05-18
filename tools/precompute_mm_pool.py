@@ -418,6 +418,12 @@ def cmd_prewarm(args: argparse.Namespace) -> None:
     5-10 seconds vs ~30 seconds sequential. Order is shuffled so the
     FIFO eviction tail is randomized rather than always keeping the
     last-by-filename types.
+
+    By default the encoder cache is flushed via the server's
+    ``/reset_encoder_cache`` dev endpoint after prewarm so the
+    measurement phase starts from a clean cache state while still
+    benefiting from preserved CUDA graphs and lazy init. Disable with
+    ``--no-reset-after`` (kept for debugging).
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -475,6 +481,47 @@ def cmd_prewarm(args: argparse.Namespace) -> None:
         raise SystemExit(
             f"prewarm: {failed}/{len(payloads)} requests failed — aborting."
         )
+
+    if args.reset_after:
+        _reset_encoder_cache_endpoint(args.base_url, args.api_key, args.timeout)
+
+
+def _reset_encoder_cache_endpoint(
+    base_url: str,
+    api_key: str | None,
+    timeout: float,
+) -> None:
+    """POST /reset_encoder_cache. Requires VLLM_SERVER_DEV_MODE=1 on the
+    server, otherwise the route is not registered and returns 404."""
+    import urllib.request
+
+    url = base_url.rstrip("/") + "/reset_encoder_cache"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, data=b"", headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if 200 <= resp.status < 300:
+                print(
+                    "prewarm: encoder cache reset OK "
+                    "(CUDA graphs and lazy init preserved)"
+                )
+                return
+            raise RuntimeError(f"unexpected status {resp.status}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print(
+                "WARNING: /reset_encoder_cache returned 404. "
+                "Start the server with VLLM_SERVER_DEV_MODE=1 to enable "
+                "the dev routes, or pass --no-reset-after to skip.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARNING: encoder-cache reset failed: {exc}", file=sys.stderr)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +664,20 @@ def main() -> None:
     )
     pw.add_argument("--timeout", type=float, default=120.0)
     pw.add_argument("--seed", type=int, default=0)
+    pw.add_argument(
+        "--reset-after",
+        dest="reset_after",
+        action="store_true",
+        default=True,
+        help="POST /reset_encoder_cache after prewarm so the measurement "
+        "phase starts from a clean cache (default).",
+    )
+    pw.add_argument(
+        "--no-reset-after",
+        dest="reset_after",
+        action="store_false",
+        help="Skip the post-prewarm cache reset.",
+    )
     pw.set_defaults(func=cmd_prewarm)
 
     ps = sub.add_parser("solve", help="Solve lambda* and emit mm_pool.json.")

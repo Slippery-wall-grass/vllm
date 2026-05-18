@@ -120,6 +120,7 @@ start_server() {
     cd "$REPO_ROOT"
     env VLLM_ENCODER_CACHE_POLICY="$policy" \
         VLLM_ENCODER_CACHE_STATS_INTERVAL_SEC="$STATS_INTERVAL_SEC" \
+        VLLM_SERVER_DEV_MODE=1 \
         $env_extra \
         nohup vllm serve "$MODEL" \
           --host "$HOST" --port "$PORT" \
