@@ -403,6 +403,81 @@ def cmd_measure(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# prewarm
+# ---------------------------------------------------------------------------
+
+
+def cmd_prewarm(args: argparse.Namespace) -> None:
+    """Send one cheap request per pool image type to force-encode it
+    server-side. This populates the encoder cache and exercises every
+    CUDA graph / vision-tower code path before the measurement phase,
+    so the bench window is not contaminated by per-shape lazy init.
+
+    Submission is concurrent (ThreadPoolExecutor) to keep total wall
+    time short: K=100 images at concurrency=4 typically finishes in
+    5-10 seconds vs ~30 seconds sequential. Order is shuffled so the
+    FIFO eviction tail is randomized rather than always keeping the
+    last-by-filename types.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    spec_path = os.path.join(args.pool_dir, "pool_spec.json")
+    with open(spec_path, "r", encoding="utf-8") as f:
+        spec = json.load(f)
+    images_dir = os.path.join(args.pool_dir, spec.get("images_dir", "images"))
+
+    payloads: list[tuple[int, bytes]] = []
+    for t in spec["types"]:
+        with open(os.path.join(images_dir, t["filename"]), "rb") as f:
+            payloads.append((int(t["idx"]), f.read()))
+
+    rng = random.Random(args.seed)
+    rng.shuffle(payloads)
+
+    def worker(item: tuple[int, bytes]) -> tuple[int, float, str | None]:
+        idx, png = item
+        t0 = time.perf_counter()
+        try:
+            _send_chat_image(
+                args.base_url,
+                args.api_key,
+                args.model,
+                png,
+                output_tokens=1,
+                timeout=args.timeout,
+            )
+            return idx, time.perf_counter() - t0, None
+        except Exception as exc:  # noqa: BLE001
+            return idx, time.perf_counter() - t0, str(exc)
+
+    done = 0
+    failed = 0
+    t_start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        futures = [pool.submit(worker, item) for item in payloads]
+        for fut in as_completed(futures):
+            idx, lat, err = fut.result()
+            done += 1
+            if err is not None:
+                failed += 1
+                print(
+                    f"  prewarm type={idx:3d} FAILED ({lat:.2f}s): {err[:120]}",
+                    file=sys.stderr,
+                )
+    elapsed = time.perf_counter() - t_start
+    print(
+        f"prewarm: {done - failed}/{len(payloads)} succeeded in {elapsed:.1f}s "
+        f"(concurrency={args.concurrency})"
+    )
+    if failed > 0 and failed >= max(1, len(payloads) // 5):
+        # If more than 20% fail something is wrong; surface non-zero exit so
+        # run_sweep.sh aborts early instead of running a bad experiment.
+        raise SystemExit(
+            f"prewarm: {failed}/{len(payloads)} requests failed — aborting."
+        )
+
+
+# ---------------------------------------------------------------------------
 # solve
 # ---------------------------------------------------------------------------
 
@@ -523,6 +598,26 @@ def main() -> None:
         "When omitted, fall back to a pixel-count heuristic.",
     )
     pm.set_defaults(func=cmd_measure)
+
+    pw = sub.add_parser(
+        "prewarm",
+        help="Send one chat-completion request per pool image to force the "
+        "vision encoder through every type. Useful right before the bench "
+        "phase so CUDA graph capture and lazy module loading do not "
+        "contaminate the measurement window.",
+    )
+    pw.add_argument("--base-url", required=True)
+    pw.add_argument("--model", required=True)
+    pw.add_argument("--api-key", default=None)
+    pw.add_argument(
+        "--concurrency",
+        type=int,
+        default=4,
+        help="Parallel in-flight requests. 4 is a safe default for one A100.",
+    )
+    pw.add_argument("--timeout", type=float, default=120.0)
+    pw.add_argument("--seed", type=int, default=0)
+    pw.set_defaults(func=cmd_prewarm)
 
     ps = sub.add_parser("solve", help="Solve lambda* and emit mm_pool.json.")
     ps.add_argument(

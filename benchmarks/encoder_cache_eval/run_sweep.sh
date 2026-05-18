@@ -39,8 +39,15 @@ BUCKETS=${BUCKETS:-"360x640 720x1280 1080x1920 1440x2560"}
 INPUT_LEN=${INPUT_LEN:-1024}
 OUTPUT_LEN=${OUTPUT_LEN:-128}
 NUM_PROMPTS=${NUM_PROMPTS:-512}
-NUM_WARMUPS=${NUM_WARMUPS:-512}
+NUM_WARMUPS=${NUM_WARMUPS:-32}
 REPEATS=${REPEATS:-3}
+
+# Targeted prewarm: hit each of the K pool images exactly once before the
+# bench window so that CUDA-graph capture and vision-tower lazy init
+# happen outside the measurement. Disable with PREWARM=0 to fall back to
+# pure bench --num-warmups.
+PREWARM=${PREWARM:-1}
+PREWARM_CONCURRENCY=${PREWARM_CONCURRENCY:-4}
 RPS_LIST=${RPS_LIST:-"4 8 12 16 20 24 28 32"}
 NUM_MM_BASE=${NUM_MM_BASE:-1}   # base images per request
 NUM_MM_RANGE=${NUM_MM_RANGE:-0.0}
@@ -235,6 +242,18 @@ for POLICY in $POLICIES; do
   LOGFILE="$RESULT_DIR/server_logs/${POLICY}.log"
   PIDFILE="$RESULT_DIR/server_logs/${POLICY}.pid"
   start_server "$POLICY" "$LOGFILE" "$PIDFILE"
+
+  if [ "$PREWARM" = "1" ]; then
+    log "  prewarming encoder cache (K=$K targeted requests, concurrency=$PREWARM_CONCURRENCY)"
+    python "$REPO_ROOT/tools/precompute_mm_pool.py" --pool-dir "$POOL_DIR" prewarm \
+      --base-url "http://${HOST}:${PORT}" \
+      --model "$MODEL" \
+      --concurrency "$PREWARM_CONCURRENCY" \
+      --seed 0 2>&1 \
+      | tee -a "$RESULT_DIR/server_logs/${POLICY}.prewarm.txt"
+    # Tiny breather to let the cumulative stats log line emit before bench starts.
+    sleep "$STATS_INTERVAL_SEC"
+  fi
 
   for RPS in $RPS_LIST; do
     RPS_TAG=$(printf "%02d" "$RPS")
