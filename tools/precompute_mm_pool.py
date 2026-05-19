@@ -377,18 +377,45 @@ def _server_wakeup(args: argparse.Namespace, spec: dict) -> None:
     wakeup_timeout = max(args.timeout, args.wakeup_timeout)
     print(
         f"wakeup: sending one request to warm vision tower / CUDA graphs "
-        f"(image={smallest['filename']}, timeout={wakeup_timeout}s)"
+        f"(image={smallest['filename']}, timeout={wakeup_timeout}s)",
+        flush=True,
     )
     t0 = time.perf_counter()
-    _send_chat_image(
-        args.base_url,
-        args.api_key,
-        args.model,
-        png,
-        output_tokens=1,
-        timeout=wakeup_timeout,
-    )
-    print(f"wakeup: done in {time.perf_counter() - t0:.1f}s")
+    # Run the wake-up request on a worker thread so the main thread can
+    # emit periodic progress lines. Without this the script appears
+    # frozen for up to wakeup_timeout seconds, which makes it impossible
+    # to tell "still warming" from "actually stuck".
+    import threading
+
+    result_box: dict[str, object] = {}
+
+    def _do_request() -> None:
+        try:
+            _send_chat_image(
+                args.base_url,
+                args.api_key,
+                args.model,
+                png,
+                output_tokens=1,
+                timeout=wakeup_timeout,
+            )
+            result_box["ok"] = True
+        except Exception as exc:  # noqa: BLE001
+            result_box["err"] = exc
+
+    th = threading.Thread(target=_do_request, daemon=True)
+    th.start()
+    while th.is_alive():
+        th.join(timeout=15.0)
+        if th.is_alive():
+            print(
+                f"wakeup: still waiting ({time.perf_counter() - t0:.0f}s "
+                f"elapsed of {wakeup_timeout:.0f}s)…",
+                flush=True,
+            )
+    if "err" in result_box:
+        raise result_box["err"]  # type: ignore[misc]
+    print(f"wakeup: done in {time.perf_counter() - t0:.1f}s", flush=True)
 
 
 def cmd_measure(args: argparse.Namespace) -> None:

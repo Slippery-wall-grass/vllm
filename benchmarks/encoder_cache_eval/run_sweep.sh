@@ -57,6 +57,18 @@ MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-16384}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
 ENCODER_CACHE_SIZE=${ENCODER_CACHE_SIZE:-}   # leave empty to use vLLM default
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-600}
+
+# --- Server stability defaults ---
+# Qwen-VL's vision tower triggers per-shape CUDA-graph capture on its
+# first request, which routinely either takes >2 minutes or stalls
+# entirely. Disabling capture trades ~5-10% decode throughput for
+# *reliable* first-request latency, which is what we need for benchmark
+# reproducibility. Override with ENFORCE_EAGER=0 if you want graphs on.
+ENFORCE_EAGER=${ENFORCE_EAGER:-1}
+# Leave headroom for the vision encoder and activations on top of the
+# KV-cache pool. 0.85 = 68 GB KV on A100 80GB, 12 GB for everything
+# else.
+GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.85}
 SERVER_EXTRA_ARGS=${SERVER_EXTRA_ARGS:-}
 
 # Solver
@@ -110,6 +122,12 @@ start_server() {
     ec_size_arg="--encoder-cache-size $ENCODER_CACHE_SIZE"
   fi
 
+  local eager_arg=""
+  if [ "$ENFORCE_EAGER" = "1" ]; then
+    eager_arg="--enforce-eager"
+  fi
+  local gpu_mem_arg="--gpu-memory-utilization $GPU_MEM_UTIL"
+
   local env_extra=""
   if [ "$policy" = "offline" ]; then
     if [ ! -f "$POOL_DIR/mm_pool.json" ]; then
@@ -130,6 +148,8 @@ start_server() {
           --tensor-parallel-size "$TP" \
           --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
           --max-model-len "$MAX_MODEL_LEN" \
+          $gpu_mem_arg \
+          $eager_arg \
           $ec_size_arg \
           $SERVER_EXTRA_ARGS \
           > "$logfile" 2>&1 &
