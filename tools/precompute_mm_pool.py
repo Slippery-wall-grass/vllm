@@ -355,10 +355,48 @@ def _query_num_image_tokens(
     return int(prompt_tokens) - 4
 
 
+def _server_wakeup(args: argparse.Namespace, spec: dict) -> None:
+    """Force the vision tower / vLLM CUDA graphs to finish first-time
+    initialization before we start timing requests.
+
+    ``/health`` returns 200 as soon as the LLM core is alive, but the
+    vision tower is lazily loaded on the first multimodal request, which
+    can take well over the default 120s socket timeout. We send one
+    request using the smallest image in the pool with a very generous
+    timeout so the rest of the measurement loop can run with the normal
+    timeout.
+    """
+    images_dir = os.path.join(args.pool_dir, spec.get("images_dir", "images"))
+    # Pick the smallest image by m_tokens if available, else by area.
+    types = list(spec["types"])
+    def _size(t):
+        return (t.get("m_tokens") or (t["height"] * t["width"]))
+    smallest = min(types, key=_size)
+    with open(os.path.join(images_dir, smallest["filename"]), "rb") as f:
+        png = f.read()
+    wakeup_timeout = max(args.timeout, args.wakeup_timeout)
+    print(
+        f"wakeup: sending one request to warm vision tower / CUDA graphs "
+        f"(image={smallest['filename']}, timeout={wakeup_timeout}s)"
+    )
+    t0 = time.perf_counter()
+    _send_chat_image(
+        args.base_url,
+        args.api_key,
+        args.model,
+        png,
+        output_tokens=1,
+        timeout=wakeup_timeout,
+    )
+    print(f"wakeup: done in {time.perf_counter() - t0:.1f}s")
+
+
 def cmd_measure(args: argparse.Namespace) -> None:
     spec_path = os.path.join(args.pool_dir, "pool_spec.json")
     with open(spec_path, "r", encoding="utf-8") as f:
         spec = json.load(f)
+
+    _server_wakeup(args, spec)
 
     images_dir = os.path.join(args.pool_dir, spec.get("images_dir", "images"))
     # Warmup once per type before timing so we don't include compile/cuda
@@ -431,6 +469,8 @@ def cmd_prewarm(args: argparse.Namespace) -> None:
     with open(spec_path, "r", encoding="utf-8") as f:
         spec = json.load(f)
     images_dir = os.path.join(args.pool_dir, spec.get("images_dir", "images"))
+
+    _server_wakeup(args, spec)
 
     payloads: list[tuple[int, bytes]] = []
     for t in spec["types"]:
@@ -637,7 +677,20 @@ def main() -> None:
     pm.add_argument("--api-key", default=None)
     pm.add_argument("--warmup", type=int, default=2)
     pm.add_argument("--repeats", type=int, default=5)
-    pm.add_argument("--timeout", type=float, default=120.0)
+    pm.add_argument(
+        "--timeout",
+        type=float,
+        default=600.0,
+        help="Per-request HTTP timeout in seconds after the wake-up phase.",
+    )
+    pm.add_argument(
+        "--wakeup-timeout",
+        type=float,
+        default=1200.0,
+        help="HTTP timeout for the first vision-tower wake-up request. "
+        "First call after server startup includes CUDA graph capture and "
+        "lazy module loading, which routinely exceeds the normal timeout.",
+    )
     pm.add_argument(
         "--use-token-query",
         action="store_true",
@@ -662,7 +715,19 @@ def main() -> None:
         default=4,
         help="Parallel in-flight requests. 4 is a safe default for one A100.",
     )
-    pw.add_argument("--timeout", type=float, default=120.0)
+    pw.add_argument(
+        "--timeout",
+        type=float,
+        default=600.0,
+        help="Per-request HTTP timeout in seconds after the wake-up phase.",
+    )
+    pw.add_argument(
+        "--wakeup-timeout",
+        type=float,
+        default=1200.0,
+        help="HTTP timeout for the first wake-up request that primes the "
+        "vision tower / CUDA graphs.",
+    )
     pw.add_argument("--seed", type=int, default=0)
     pw.add_argument(
         "--reset-after",
