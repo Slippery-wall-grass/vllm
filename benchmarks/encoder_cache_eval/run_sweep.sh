@@ -76,6 +76,9 @@ mkdir -p "$RESULT_DIR/runs" "$RESULT_DIR/server_logs"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
+# Check for and clean up leftover processes from a previously aborted run.
+# Defined further down; called from main pipeline after server lifecycle helpers.
+
 # ---------------------------------------------------------------------------
 # Server lifecycle helpers
 # ---------------------------------------------------------------------------
@@ -137,19 +140,65 @@ start_server() {
 
 stop_server() {
   local pidfile=$1
-  if [ -f "$pidfile" ]; then
-    local pid
-    pid=$(cat "$pidfile")
-    log "stopping server pid=$pid"
-    kill -TERM "$pid" 2>/dev/null || true
-    for _ in $(seq 1 60); do
-      kill -0 "$pid" 2>/dev/null || break
-      sleep 1
-    done
-    kill -KILL "$pid" 2>/dev/null || true
-    rm -f "$pidfile"
+  if [ ! -f "$pidfile" ]; then
+    SERVER_PIDFILE=""
+    return 0
   fi
+  local pid
+  pid=$(cat "$pidfile")
+  log "stopping server pid=$pid"
+
+  # Step 1: gentle SIGTERM on the parent and on its direct children
+  #         (engine core, worker processes spawned by vLLM).
+  kill -TERM "$pid" 2>/dev/null || true
+  pkill -TERM -P "$pid" 2>/dev/null || true
+
+  # Step 2: wait up to 30s for clean exit.
+  for _ in $(seq 1 30); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+
+  # Step 3: if still alive, escalate to SIGKILL on the whole subtree.
+  if kill -0 "$pid" 2>/dev/null; then
+    log "  SIGTERM did not exit cleanly; sending SIGKILL"
+    kill -KILL "$pid" 2>/dev/null || true
+    pkill -KILL -P "$pid" 2>/dev/null || true
+    sleep 2
+  fi
+
+  # Step 4: belt-and-suspenders — kill any leftover vLLM workers / engine
+  # cores that may have detached from the parent's process group. These
+  # are the processes that most often hold GPU handles and block
+  # subsequent nvidia-smi calls.
+  pkill -KILL -f "vllm serve" 2>/dev/null || true
+  pkill -KILL -f "vllm.entrypoints" 2>/dev/null || true
+  pkill -KILL -f "EngineCore" 2>/dev/null || true
+  pkill -KILL -f "ray::" 2>/dev/null || true
+
+  rm -f "$pidfile"
   SERVER_PIDFILE=""
+
+  # Give the NVIDIA driver a few seconds to reclaim GPU device handles.
+  sleep 3
+}
+
+# Sanity check: warn if there are still vLLM-related processes from a
+# previous failed run. They will hold GPU memory and confuse health
+# checks for the new server.
+check_leftover_processes() {
+  local found
+  found=$(pgrep -fa "vllm serve|EngineCore" 2>/dev/null || true)
+  if [ -n "$found" ]; then
+    log "WARNING: leftover vLLM processes detected:"
+    echo "$found" | sed 's/^/  /'
+    log "  attempting to clean up before starting…"
+    pkill -KILL -f "vllm serve" 2>/dev/null || true
+    pkill -KILL -f "vllm.entrypoints" 2>/dev/null || true
+    pkill -KILL -f "EngineCore" 2>/dev/null || true
+    pkill -KILL -f "ray::" 2>/dev/null || true
+    sleep 5
+  fi
 }
 
 cleanup() {
@@ -159,6 +208,9 @@ cleanup() {
   fi
 }
 trap cleanup EXIT INT TERM
+
+# Pre-flight: clean up any leftover processes from a previously aborted run.
+check_leftover_processes
 
 # ---------------------------------------------------------------------------
 # Stage 1: pool generation
