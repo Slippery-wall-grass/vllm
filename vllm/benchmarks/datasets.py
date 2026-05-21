@@ -1284,18 +1284,30 @@ class MMFixedPoolDataset(BenchmarkDataset):
     / ``num_mm_items_range_ratio`` flags as :class:`RandomMultiModalDataset`.
     Each image within a request is sampled independently from the
     distribution given in ``pool_spec.json``.
+
+    Optional ``novelty_rate`` (in [0, 1]) injects one-shot novel images
+    into the stream: with probability ``novelty_rate`` each image slot
+    is replaced by freshly-generated random pixels (resolution drawn
+    uniformly from the resolutions present in the pool). These novel
+    images have unique mm_hashes and never repeat, simulating the
+    "long-tail" of one-off queries that surround the structured hot
+    set. They are the workload component on which the offline
+    Lagrangian policy is expected to shine, because it knows their
+    mm_hashes are not in the pool and therefore never pins them.
     """
 
     IS_MULTIMODAL = True
     DEFAULT_LIMIT_MM_PER_PROMPT = {"image": 255}
     DEFAULT_BASE_ITEMS_PER_REQUEST = 1
     DEFAULT_NUM_MM_ITEMS_RANGE_RATIO = 0.0
+    DEFAULT_NOVELTY_RATE = 0.0
 
     def __init__(
         self,
         pool_dir: str,
         random_seed: int = BenchmarkDataset.DEFAULT_SEED,
         disable_shuffle: bool = False,
+        novelty_rate: float = DEFAULT_NOVELTY_RATE,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -1304,9 +1316,20 @@ class MMFixedPoolDataset(BenchmarkDataset):
             disable_shuffle=disable_shuffle,
             **kwargs,
         )
+        if not (0.0 <= float(novelty_rate) <= 1.0):
+            raise ValueError(
+                f"novelty_rate must be in [0, 1], got {novelty_rate}"
+            )
+        self.novelty_rate = float(novelty_rate)
         self.pool_dir = pool_dir
         self._rng = np.random.default_rng(self.random_seed)
         self._load_pool()
+        # Resolutions to draw novel-image dimensions from. Defaulting to
+        # the set of resolutions present in the pool keeps the novelty
+        # stream comparable in encoder cost to the structured stream.
+        self._novel_shapes = sorted(
+            {(int(t["height"]), int(t["width"])) for t in self._spec["types"]}
+        )
 
     def _load_pool(self) -> None:
         import os
@@ -1362,6 +1385,18 @@ class MMFixedPoolDataset(BenchmarkDataset):
             raise ValueError(f"Invalid mm-item count range [{lo}, {hi}]")
         return int(self._rng.integers(lo, hi + 1))
 
+    def _generate_novel_image(self) -> Image.Image:
+        """Generate a one-shot random image with a unique mm_hash.
+
+        Resolution is drawn uniformly from the set of resolutions
+        present in the pool so the encoder cost distribution of the
+        novelty stream is comparable to the structured stream.
+        """
+        shape_idx = int(self._rng.integers(len(self._novel_shapes)))
+        h, w = self._novel_shapes[shape_idx]
+        pixels = self._rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+        return Image.fromarray(pixels, mode="RGB")
+
     def sample(
         self,
         tokenizer: TokenizerLike,
@@ -1413,7 +1448,16 @@ class MMFixedPoolDataset(BenchmarkDataset):
                     p=self._probs,
                     replace=True,
                 ).tolist()
-            mm_content = [_process_image_png(self._images[idx]) for idx in type_indices]
+            mm_content = []
+            for idx in type_indices:
+                if (
+                    self.novelty_rate > 0.0
+                    and float(self._rng.random()) < self.novelty_rate
+                ):
+                    img = self._generate_novel_image()
+                else:
+                    img = self._images[idx]
+                mm_content.append(_process_image_png(img))
             if enable_multimodal_chat:
                 prompt = self.apply_multimodal_chat_transformation(
                     base.prompt, mm_content
@@ -1922,6 +1966,20 @@ def add_random_multimodal_dataset_args(
     )
 
     parser_or_group.add_argument(
+        "--mm-novelty-rate",
+        type=float,
+        default=0.0,
+        help=(
+            "For --dataset-name=mm-fixed-pool: probability in [0, 1] that "
+            "each image slot is replaced by a freshly-generated one-shot "
+            "novel image (unique mm_hash, never repeats). Resolution is "
+            "sampled uniformly from the resolutions present in the pool. "
+            "Used to evaluate cache-policy robustness against long-tail "
+            "queries. Default 0.0 (pure pool sampling)."
+        ),
+    )
+
+    parser_or_group.add_argument(
         "--random-mm-bucket-config",
         type=_parse_mm_bucket_config,
         default=RandomMultiModalDataset.DEFAULT_MM_ITEM_BUCKET_CONFIG,
@@ -2207,6 +2265,7 @@ def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
                 pool_dir=args.mm_pool_dir,
                 random_seed=args.seed,
                 disable_shuffle=args.disable_shuffle,
+                novelty_rate=getattr(args, "mm_novelty_rate", 0.0),
             ).sample(
                 tokenizer=tokenizer,
                 num_requests=args.num_prompts,

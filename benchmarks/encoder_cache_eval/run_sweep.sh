@@ -52,6 +52,12 @@ RPS_LIST=${RPS_LIST:-"4 8 12 16 20 24 28 32"}
 NUM_MM_BASE=${NUM_MM_BASE:-1}   # base images per request
 NUM_MM_RANGE=${NUM_MM_RANGE:-0.0}
 
+# Mix of one-shot novel images into the pool sampling. 0.0 = pure pool
+# (default), 0.5 = half pool / half one-off random images that never
+# repeat. Tests how policies handle the realistic "structured hot set
+# + long tail" mix.
+NOVELTY_RATE=${NOVELTY_RATE:-0.0}
+
 # vLLM server flags
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-16384}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
@@ -345,6 +351,7 @@ for POLICY in $POLICIES; do
           --mm-pool-dir "$POOL_DIR" \
           --random-mm-base-items-per-request "$NUM_MM_BASE" \
           --random-mm-num-mm-items-range-ratio "$NUM_MM_RANGE" \
+          --mm-novelty-rate "$NOVELTY_RATE" \
           --random-input-len "$INPUT_LEN" \
           --random-output-len "$OUTPUT_LEN" \
           --random-range-ratio 0.0 \
