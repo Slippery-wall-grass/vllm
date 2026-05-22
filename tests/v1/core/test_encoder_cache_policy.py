@@ -123,13 +123,14 @@ def test_solve_lambda_star_no_pressure_returns_zero():
 
 
 class _AlwaysPinPolicy(EncoderCachePolicy):
-    """Test double: pin every arrival for ``horizon`` ticks."""
+    """Test double: pin every arrival for ``horizon`` ticks starting
+    from the moment the entry enters the freeable queue."""
 
     def __init__(self, horizon: int):
         self.horizon = horizon
 
     def on_arrival(self, mm_hash, num_embeds, current_tick):
-        return current_tick + self.horizon
+        return self.horizon  # ticks; applied at freeable transition
 
 
 class _NeverPinPolicy(EncoderCachePolicy):
@@ -240,9 +241,10 @@ def test_offline_policy_unknown_hash_falls_back_to_no_pin():
     assert pol.on_arrival("unknown_hash", 100, current_tick=10) == 0
     assert pol.unknown_hits == 1
     # Known hash may or may not be pinned depending on the sampled d;
-    # invariant we can check: result is either 0 or current_tick + horizon.
+    # invariant we can check: result is either 0 (no pin) or the
+    # configured horizon (applied at freeable transition).
     out = pol.on_arrival("known", 100, current_tick=10)
-    assert out in (0, 10 + 5)
+    assert out in (0, 5)
 
 
 def test_build_policy_from_env(monkeypatch):

@@ -64,9 +64,18 @@ class EncoderCachePolicy(abc.ABC):
     ) -> int:
         """Called for every arrival (hit or miss) of an mm_item.
 
-        Returns the absolute tick value before which the entry must
-        not be evicted. A value ``<= current_tick`` means the entry is
-        immediately evictable (not pinned).
+        Returns the desired *pin horizon* in ticks: the number of ticks
+        for which the entry should remain non-evictable once it
+        transitions to the freeable queue (i.e., once its reference
+        count drops to zero). A return value of ``0`` means no pin
+        ("evict me whenever").
+
+        Crucially the horizon is applied at the freeable transition,
+        not at the arrival itself. This matters when the request
+        lifetime (in tick units) is comparable to or larger than the
+        horizon: with the alternative "from arrival" semantics, the
+        pin would expire while the request is still in flight and the
+        entry would re-enter freeable already unpinned.
         """
 
     def reset(self) -> None:
@@ -196,7 +205,7 @@ class OfflineLagrangianEncoderCachePolicy(EncoderCachePolicy):
             d = int(math.floor(math.log(u) / math.log(1.0 - p)))
         # Pin iff predicted memory cost is below recomputation savings.
         if entry.m * self._lambda * d - entry.c < 0:
-            return current_tick + entry.unlock_horizon
+            return entry.unlock_horizon  # horizon (ticks), not absolute
         return 0
 
     def reset(self) -> None:
@@ -257,7 +266,7 @@ class OracleEncoderCachePolicy(EncoderCachePolicy):
             # Pin forever: novelty cannot evict a pool entry except via
             # forced_unpin, which only happens when no unpinned entry
             # is available (then the FIFO-front novelty is evicted).
-            return current_tick + self._PIN_FOREVER
+            return self._PIN_FOREVER  # horizon, applied at freeable transition
         return 0  # novelty: immediately evictable
 
 

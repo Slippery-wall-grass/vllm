@@ -97,8 +97,15 @@ class EncoderCacheManager:
 
         self.policy: EncoderCachePolicy = policy or FIFOEncoderCachePolicy()
         # Per-mm_hash absolute tick before which this entry is protected
-        # from eviction. Missing key == 0 == evictable now.
+        # from eviction. Missing key == 0 == evictable now. Populated
+        # at the moment an entry transitions to the freeable queue —
+        # not at arrival — so the pin actually covers the freeable
+        # window rather than expiring while the request is in flight.
         self._unlock_tick: dict[str, int] = {}
+        # Pin horizon (in ticks) most recently requested by the policy
+        # for each mm_hash. Stored at arrival, applied when the entry
+        # enters freeable.
+        self._pin_horizon: dict[str, int] = {}
 
         # Metrics: mm-item-level arrivals and forced-eviction events.
         self.current_tick: int = 0
@@ -125,6 +132,7 @@ class EncoderCacheManager:
         self.freeable.clear()
         self.freed.clear()
         self._unlock_tick.clear()
+        self._pin_horizon.clear()
         self.num_free_slots = self.cache_size
         self.num_freeable_slots = self.cache_size
         self.current_tick = 0
@@ -163,9 +171,15 @@ class EncoderCacheManager:
         self.hits += 1
         self.current_tick += 1
         num_embeds = request.get_num_encoder_embeds(input_id)
-        self._unlock_tick[mm_hash] = self.policy.on_arrival(
-            mm_hash, num_embeds, self.current_tick
-        )
+        # Policy returns a horizon (in ticks). We do not apply it now
+        # because the entry has just become referenced and is no
+        # longer in the freeable queue; the horizon will be applied
+        # to ``_unlock_tick`` when refs drop to 0 again.
+        horizon = self.policy.on_arrival(mm_hash, num_embeds, self.current_tick)
+        if horizon > 0:
+            self._pin_horizon[mm_hash] = horizon
+        else:
+            self._pin_horizon.pop(mm_hash, None)
         return True
 
     def can_allocate(
@@ -288,9 +302,16 @@ class EncoderCacheManager:
         # exactly once per unique mm_item -> drives policy's view of d_i.
         self.misses += 1
         self.current_tick += 1
-        self._unlock_tick[mm_hash] = self.policy.on_arrival(
+        # See note in check_and_update_cache: the policy returns a
+        # horizon (ticks) that we stash here and apply to
+        # ``_unlock_tick`` when refs eventually drop to 0.
+        horizon = self.policy.on_arrival(
             mm_hash, num_encoder_embeds, self.current_tick
         )
+        if horizon > 0:
+            self._pin_horizon[mm_hash] = horizon
+        else:
+            self._pin_horizon.pop(mm_hash, None)
 
     def get_cached_input_ids(self, request: Request) -> set[int]:
         """Get all cached multimodal input IDs for a request.
@@ -331,12 +352,21 @@ class EncoderCacheManager:
             # Ablation: drop immediately, no freeable buffer.
             del self.cached[mm_hash]
             self._unlock_tick.pop(mm_hash, None)
+            self._pin_horizon.pop(mm_hash, None)
             self.freed.append(mm_hash)
             self.num_free_slots += num_encoder_embeds
             # num_freeable_slots tracks num_free_slots in this mode since
             # the freeable queue is never populated.
             self.num_freeable_slots += num_encoder_embeds
         else:
+            # Entry transitions to freeable: NOW is when the pin
+            # actually starts counting. Materialize the previously
+            # requested horizon into an absolute unlock tick.
+            horizon = self._pin_horizon.pop(mm_hash, 0)
+            if horizon > 0:
+                self._unlock_tick[mm_hash] = self.current_tick + horizon
+            else:
+                self._unlock_tick.pop(mm_hash, None)
             self.freeable[mm_hash] = num_encoder_embeds
             self.num_freeable_slots += num_encoder_embeds
 
