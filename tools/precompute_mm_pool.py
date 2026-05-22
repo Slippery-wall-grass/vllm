@@ -85,17 +85,34 @@ def _generate_image(
     return buf.getvalue()
 
 
-def _hash_png_bytes(png_bytes: bytes) -> str:
-    """Hash the *decoded* image to match what vLLM hashes server-side.
+def _hash_png_bytes(
+    png_bytes: bytes,
+    model_id: str | None = None,
+    hf_processor_mm_kwargs: dict | None = None,
+) -> str:
+    """Hash the *decoded* image the way vLLM does server-side.
 
     vLLM's input pipeline decodes the data URL into a ``PIL.Image`` and
-    feeds that to :class:`MultiModalHasher`. Since PNG is lossless, the
-    decoded pixels are identical to what we encoded -> stable hash.
+    hashes via
+    :meth:`MultiModalHasher.hash_kwargs(model_id=..., image=...,
+    **hf_processor_mm_kwargs)`` (see
+    ``vllm/multimodal/processing/inputs.py``).
+
+    ``model_id`` MUST match the value vLLM uses (typically the
+    ``--model`` path/name passed to ``vllm serve``); otherwise the
+    offline-computed hash will not collide with the server-computed
+    one and ``Offline`` / ``Oracle`` policies will see every image as
+    unknown.
     """
     img = Image.open(io.BytesIO(png_bytes))
     img.load()
     img = convert_image_mode(img, "RGB")
-    return MultiModalHasher.hash_kwargs(image=img)
+    kwargs: dict[str, object] = {"image": img}
+    if model_id is not None:
+        kwargs["model_id"] = model_id
+    if hf_processor_mm_kwargs:
+        kwargs.update(hf_processor_mm_kwargs)
+    return MultiModalHasher.hash_kwargs(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +197,15 @@ def cmd_generate(args: argparse.Namespace) -> None:
     bucket_rng = random.Random(args.seed + 1)
     bucket_assignments = [buckets[bucket_rng.randrange(len(buckets))] for _ in range(args.k)]
 
+    if not args.model_id:
+        print(
+            "WARNING: --model-id not provided. The offline mm_hash will not "
+            "match the server-side hash, and Offline/Oracle policies will see "
+            "every pool image as 'unknown'. Pass --model-id with the same "
+            "value you use for `vllm serve <model>`.",
+            file=sys.stderr,
+        )
+
     types: list[dict[str, Any]] = []
     for i in range(args.k):
         h, w = bucket_assignments[i]
@@ -187,7 +213,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
         filename = f"{i:04d}.png"
         with open(os.path.join(pool_dir, "images", filename), "wb") as f:
             f.write(png_bytes)
-        mm_hash = _hash_png_bytes(png_bytes)
+        mm_hash = _hash_png_bytes(png_bytes, model_id=args.model_id)
         types.append(
             {
                 "idx": i,
@@ -205,6 +231,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
     spec = {
         "version": 1,
         "seed": args.seed,
+        "model_id": args.model_id,   # remembered for downstream re-hashing
         "distribution": {
             "kind": args.distribution,
             "param": args.distribution_param,
@@ -692,6 +719,16 @@ def main() -> None:
         default=None,
         help='Resolution buckets as "HxW" tokens, e.g. 360x640 720x1280. '
         "Default: 360x640 720x1280 1080x1920 1440x2560.",
+    )
+    pg.add_argument(
+        "--model-id",
+        type=str,
+        default=None,
+        help="Model identifier used by vLLM when hashing multimodal inputs "
+        "(see vllm/multimodal/processing/inputs.py). MUST match the value "
+        "passed to `vllm serve` (typically the model path or HF model name) "
+        "or the Offline / Oracle policies will see every pool image as "
+        "'unknown'.",
     )
     pg.set_defaults(func=cmd_generate)
 

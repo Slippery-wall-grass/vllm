@@ -244,11 +244,12 @@ check_leftover_processes
 # Stage 1: pool generation
 # ---------------------------------------------------------------------------
 if [ ! -f "$POOL_DIR/pool_spec.json" ]; then
-  log "generate pool K=$K dist=$DISTRIBUTION/$DISTRIBUTION_PARAM"
+  log "generate pool K=$K dist=$DISTRIBUTION/$DISTRIBUTION_PARAM model_id=$MODEL"
   python "$REPO_ROOT/tools/precompute_mm_pool.py" --pool-dir "$POOL_DIR" generate \
     --k "$K" --seed 0 \
     --distribution "$DISTRIBUTION" --distribution-param "$DISTRIBUTION_PARAM" \
-    --bucket-config $BUCKETS
+    --bucket-config $BUCKETS \
+    --model-id "$MODEL"
 else
   log "reusing existing pool: $POOL_DIR/pool_spec.json"
 fi

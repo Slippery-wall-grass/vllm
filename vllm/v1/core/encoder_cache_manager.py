@@ -410,9 +410,18 @@ class EncoderCacheManager:
             return
         self._last_stats_log_ts = now
         stats = self.get_stats()
+        # Surface known vs unknown mm_hash classification from policies
+        # that maintain a pool registry; useful for diagnosing hash
+        # mismatch between offline pool generation and server-side
+        # hashing (manifests as all arrivals being 'unknown').
+        known = getattr(self.policy, "known_hits", None)
+        unknown = getattr(self.policy, "unknown_hits", None)
+        pool_suffix = ""
+        if known is not None and unknown is not None:
+            pool_suffix = f" pool_known={known} pool_unknown={unknown}"
         logger.info(
             "encoder_cache policy=%s hits=%d misses=%d hit_rate=%.4f "
-            "forced_unpin=%d pinned=%d freeable=%d free_slots=%d",
+            "forced_unpin=%d pinned=%d freeable=%d free_slots=%d%s",
             stats["policy"],
             stats["hits"],
             stats["misses"],
@@ -421,6 +430,7 @@ class EncoderCacheManager:
             stats["num_pinned"],
             stats["num_freeable"],
             stats["num_free_slots"],
+            pool_suffix,
         )
 
     def get_stats(self) -> dict[str, int | float | str]:

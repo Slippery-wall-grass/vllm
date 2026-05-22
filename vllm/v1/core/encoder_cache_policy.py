@@ -64,18 +64,9 @@ class EncoderCachePolicy(abc.ABC):
     ) -> int:
         """Called for every arrival (hit or miss) of an mm_item.
 
-        Returns the desired *pin horizon* in ticks: the number of ticks
-        for which the entry should remain non-evictable once it
-        transitions to the freeable queue (i.e., once its reference
-        count drops to zero). A return value of ``0`` means no pin
-        ("evict me whenever").
-
-        Crucially the horizon is applied at the freeable transition,
-        not at the arrival itself. This matters when the request
-        lifetime (in tick units) is comparable to or larger than the
-        horizon: with the alternative "from arrival" semantics, the
-        pin would expire while the request is still in flight and the
-        entry would re-enter freeable already unpinned.
+        Returns the absolute tick value before which the entry must
+        not be evicted. A value ``<= current_tick`` means the entry is
+        immediately evictable (not pinned).
         """
 
     def reset(self) -> None:
@@ -149,6 +140,7 @@ class OfflineLagrangianEncoderCachePolicy(EncoderCachePolicy):
         self._lambda = float(lambda_star)
         self._rng = random.Random(seed)
         self._seed = seed
+        self._known_hits = 0
         self._unknown_hits = 0
         logger.info(
             "OfflineLagrangianEncoderCachePolicy: %d pool entries, lambda*=%.6g",
@@ -193,6 +185,7 @@ class OfflineLagrangianEncoderCachePolicy(EncoderCachePolicy):
         if entry is None:
             self._unknown_hits += 1
             return 0
+        self._known_hits += 1
         if entry.unlock_horizon == 0 or self._lambda <= 0.0:
             return 0
         # Inverse-CDF sample d ~ Geometric on {0,1,2,...}:
@@ -205,12 +198,17 @@ class OfflineLagrangianEncoderCachePolicy(EncoderCachePolicy):
             d = int(math.floor(math.log(u) / math.log(1.0 - p)))
         # Pin iff predicted memory cost is below recomputation savings.
         if entry.m * self._lambda * d - entry.c < 0:
-            return entry.unlock_horizon  # horizon (ticks), not absolute
+            return current_tick + entry.unlock_horizon
         return 0
 
     def reset(self) -> None:
         self._rng = random.Random(self._seed)
+        self._known_hits = 0
         self._unknown_hits = 0
+
+    @property
+    def known_hits(self) -> int:
+        return self._known_hits
 
     @property
     def unknown_hits(self) -> int:
@@ -236,6 +234,8 @@ class OracleEncoderCachePolicy(EncoderCachePolicy):
 
     def __init__(self, pool: dict[str, _PoolEntry]):
         self._pool = pool
+        self._known_hits = 0
+        self._unknown_hits = 0
         logger.info(
             "OracleEncoderCachePolicy: %d pool entries pinned forever",
             len(pool),
@@ -263,11 +263,25 @@ class OracleEncoderCachePolicy(EncoderCachePolicy):
         current_tick: int,
     ) -> int:
         if mm_hash in self._pool:
+            self._known_hits += 1
             # Pin forever: novelty cannot evict a pool entry except via
             # forced_unpin, which only happens when no unpinned entry
             # is available (then the FIFO-front novelty is evicted).
-            return self._PIN_FOREVER  # horizon, applied at freeable transition
+            return current_tick + self._PIN_FOREVER
+        self._unknown_hits += 1
         return 0  # novelty: immediately evictable
+
+    @property
+    def known_hits(self) -> int:
+        return self._known_hits
+
+    @property
+    def unknown_hits(self) -> int:
+        return self._unknown_hits
+
+    def reset(self) -> None:
+        self._known_hits = 0
+        self._unknown_hits = 0
 
 
 def build_policy_from_env() -> EncoderCachePolicy:
