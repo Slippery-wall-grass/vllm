@@ -178,6 +178,32 @@ def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
             writer.writerow(r)
 
 
+def _expected_c_seconds(pool_spec_path: Path | None) -> float | None:
+    """Compute E[c_i] = sum_i p_i * c_i from pool_spec.json.
+
+    This is the average encoder-forward cost saved by a single cache
+    hit (under the pool distribution; novelty hits contribute the same
+    amount on average since novelty resolutions are drawn from the same
+    bucket set as the pool).
+    """
+    if pool_spec_path is None or not pool_spec_path.exists():
+        return None
+    spec = json.load(open(pool_spec_path))
+    types = spec.get("types", [])
+    total = 0.0
+    pool_total = 0.0
+    for t in types:
+        p = t.get("p")
+        c = t.get("c_seconds")
+        if p is None or c is None:
+            continue
+        total += float(p) * float(c)
+        pool_total += float(p)
+    if pool_total <= 0:
+        return None
+    return total / pool_total
+
+
 def write_markdown(
     rows: list[dict[str, Any]],
     cache_deltas: dict[tuple[str, int], dict[str, Any]],
@@ -208,6 +234,8 @@ def write_markdown(
         ("delta_hit_rate", "Cache hit rate (per RPS step)"),
         ("delta_cache_forced_unpin_evictions", "Forced-unpin evictions (per step)"),
     ]
+
+    expected_c = _expected_c_seconds(pool_spec_path)
 
     lines: list[str] = []
     lines.append("# Encoder-cache policy sweep")
@@ -269,6 +297,93 @@ def write_markdown(
                 cells.append(fmt(cache_deltas.get((pol, rps), {}).get(key)))
             lines.append("| " + " | ".join(cells) + " |")
         lines.append("")
+
+    # Encoder compute time saved per RPS step (seconds and as % of
+    # pure no-cache baseline). Uses E[c_i] weighted by p_i.
+    if expected_c is not None:
+        lines.append(
+            f"## Encoder compute saved (s per RPS step) — E[c_i] = "
+            f"{expected_c * 1000:.1f} ms/hit"
+        )
+        lines.append("")
+        header = "| RPS | " + " | ".join(policies) + " |"
+        sep = "|" + "---|" * (len(policies) + 1)
+        lines.append(header)
+        lines.append(sep)
+        for rps in rps_levels:
+            cells = [str(rps)]
+            for pol in policies:
+                hits = cache_deltas.get((pol, rps), {}).get("delta_cache_hits")
+                if hits is None:
+                    cells.append("—")
+                else:
+                    saved_s = float(hits) * expected_c
+                    cells.append(f"{saved_s:.2f}")
+            lines.append("| " + " | ".join(cells) + " |")
+        lines.append("")
+
+        # Per-policy savings RELATIVE to nocache and to fifo.
+        lines.append("## Encoder compute saved vs nocache (s and %)")
+        lines.append("")
+        header = "| RPS | " + " | ".join(policies) + " |"
+        sep = "|" + "---|" * (len(policies) + 1)
+        lines.append(header)
+        lines.append(sep)
+        for rps in rps_levels:
+            cells = [str(rps)]
+            base_hits = cache_deltas.get(("nocache", rps), {}).get("delta_cache_hits")
+            for pol in policies:
+                hits = cache_deltas.get((pol, rps), {}).get("delta_cache_hits")
+                if hits is None or base_hits is None:
+                    cells.append("—")
+                else:
+                    extra = (float(hits) - float(base_hits)) * expected_c
+                    total_requests = sum(
+                        r.get("completed", 0)
+                        for r in grouped.get((pol, rps), [])
+                    )
+                    total_workload_compute = (
+                        float(total_requests) * expected_c
+                        if total_requests
+                        else None
+                    )
+                    if total_workload_compute and total_workload_compute > 0:
+                        pct = 100.0 * extra / total_workload_compute
+                        cells.append(f"{extra:.2f}s ({pct:+.1f}%)")
+                    else:
+                        cells.append(f"{extra:.2f}s")
+            lines.append("| " + " | ".join(cells) + " |")
+        lines.append("")
+
+        # Compare against oracle (if present) — how close did each
+        # policy get to the ideal upper bound?
+        if "oracle" in policies:
+            lines.append("## Headroom to oracle (how much more saving is possible)")
+            lines.append("")
+            header = "| RPS | " + " | ".join(p for p in policies if p != "oracle") + " |"
+            sep = "|" + "---|" * (len(policies))
+            lines.append(header)
+            lines.append(sep)
+            for rps in rps_levels:
+                cells = [str(rps)]
+                oracle_hits = cache_deltas.get(("oracle", rps), {}).get(
+                    "delta_cache_hits"
+                )
+                for pol in policies:
+                    if pol == "oracle":
+                        continue
+                    hits = cache_deltas.get((pol, rps), {}).get("delta_cache_hits")
+                    if hits is None or oracle_hits is None:
+                        cells.append("—")
+                    else:
+                        gap = (float(oracle_hits) - float(hits)) * expected_c
+                        if oracle_hits > 0:
+                            pct = 100.0 * float(hits) / float(oracle_hits)
+                            cells.append(f"{gap:.2f}s gap ({pct:.0f}% of oracle)")
+                        else:
+                            cells.append(f"{gap:.2f}s gap")
+                lines.append("| " + " | ".join(cells) + " |")
+            lines.append("")
 
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))

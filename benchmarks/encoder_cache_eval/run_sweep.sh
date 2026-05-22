@@ -80,8 +80,10 @@ SERVER_EXTRA_ARGS=${SERVER_EXTRA_ARGS:-}
 # Solver
 CACHE_CAPACITY=${CACHE_CAPACITY:-}   # auto-detected from server log if empty
 
-# Sweep
-POLICIES=${POLICIES:-"fifo nocache offline"}
+# Sweep. "oracle" is the ideal-upper-bound baseline that pins every
+# pool image forever and treats novelty like no-cache; not implementable
+# in production but bounds the achievable hit rate.
+POLICIES=${POLICIES:-"fifo nocache offline oracle"}
 STATS_INTERVAL_SEC=${STATS_INTERVAL_SEC:-5}
 
 # Aggregation
@@ -135,7 +137,7 @@ start_server() {
   local gpu_mem_arg="--gpu-memory-utilization $GPU_MEM_UTIL"
 
   local env_extra=""
-  if [ "$policy" = "offline" ]; then
+  if [ "$policy" = "offline" ] || [ "$policy" = "oracle" ]; then
     if [ ! -f "$POOL_DIR/mm_pool.json" ]; then
       log "ERROR: $POOL_DIR/mm_pool.json missing — run solve first"
       return 1
