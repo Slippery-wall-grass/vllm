@@ -212,6 +212,17 @@ def cmd_generate(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
 
+    hf_processor_mm_kwargs: dict = {}
+    if args.hf_processor_kwargs:
+        try:
+            hf_processor_mm_kwargs = json.loads(args.hf_processor_kwargs)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(
+                f"--hf-processor-kwargs must be JSON: {exc}"
+            ) from exc
+        if not isinstance(hf_processor_mm_kwargs, dict):
+            raise SystemExit("--hf-processor-kwargs must decode to an object")
+
     types: list[dict[str, Any]] = []
     for i in range(args.k):
         h, w = bucket_assignments[i]
@@ -219,7 +230,11 @@ def cmd_generate(args: argparse.Namespace) -> None:
         filename = f"{i:04d}.png"
         with open(os.path.join(pool_dir, "images", filename), "wb") as f:
             f.write(png_bytes)
-        mm_hash = _hash_png_bytes(png_bytes, model_id=args.model_id)
+        mm_hash = _hash_png_bytes(
+            png_bytes,
+            model_id=args.model_id,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs or None,
+        )
         types.append(
             {
                 "idx": i,
@@ -238,6 +253,7 @@ def cmd_generate(args: argparse.Namespace) -> None:
         "version": 1,
         "seed": args.seed,
         "model_id": args.model_id,   # remembered for downstream re-hashing
+        "hf_processor_mm_kwargs": hf_processor_mm_kwargs,
         "distribution": {
             "kind": args.distribution,
             "param": args.distribution_param,
@@ -735,6 +751,14 @@ def main() -> None:
         "passed to `vllm serve` (typically the model path or HF model name) "
         "or the Offline / Oracle policies will see every pool image as "
         "'unknown'.",
+    )
+    pg.add_argument(
+        "--hf-processor-kwargs",
+        type=str,
+        default=None,
+        help="JSON-encoded mapping that MUST match the value passed to "
+        "vllm serve via --mm-processor-kwargs. Default {} for stock "
+        "Qwen-VL deployments. Mismatch produces unknown mm_hashes.",
     )
     pg.set_defaults(func=cmd_generate)
 

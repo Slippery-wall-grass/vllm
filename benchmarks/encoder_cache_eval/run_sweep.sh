@@ -64,6 +64,11 @@ MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
 ENCODER_CACHE_SIZE=${ENCODER_CACHE_SIZE:-}   # leave empty to use vLLM default
 HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-600}
 
+# JSON-encoded processor mm kwargs. Must be identical between the offline
+# pool generation (used to compute mm_hash) and the vllm serve invocation
+# (used to compute mm_hash at runtime). Leave empty {} for stock Qwen-VL.
+HF_PROCESSOR_KWARGS=${HF_PROCESSOR_KWARGS:-"{}"}
+
 # --- Server stability defaults ---
 # Qwen-VL's vision tower triggers per-shape CUDA-graph capture on its
 # first request, which routinely either takes >2 minutes or stalls
@@ -136,6 +141,13 @@ start_server() {
   fi
   local gpu_mem_arg="--gpu-memory-utilization $GPU_MEM_UTIL"
 
+  # If the user customized processor kwargs, propagate them so that the
+  # server-side hash uses the same kwargs we hashed offline.
+  local mm_proc_arg=""
+  if [ -n "$HF_PROCESSOR_KWARGS" ] && [ "$HF_PROCESSOR_KWARGS" != "{}" ]; then
+    mm_proc_arg="--mm-processor-kwargs $HF_PROCESSOR_KWARGS"
+  fi
+
   local env_extra=""
   if [ "$policy" = "offline" ] || [ "$policy" = "oracle" ]; then
     if [ ! -f "$POOL_DIR/mm_pool.json" ]; then
@@ -159,6 +171,7 @@ start_server() {
           $gpu_mem_arg \
           $eager_arg \
           $ec_size_arg \
+          $mm_proc_arg \
           $SERVER_EXTRA_ARGS \
           > "$logfile" 2>&1 &
     echo $! > "$pidfile"
@@ -245,11 +258,13 @@ check_leftover_processes
 # ---------------------------------------------------------------------------
 if [ ! -f "$POOL_DIR/pool_spec.json" ]; then
   log "generate pool K=$K dist=$DISTRIBUTION/$DISTRIBUTION_PARAM model_id=$MODEL"
+  log "  hf_processor_kwargs=$HF_PROCESSOR_KWARGS"
   python "$REPO_ROOT/tools/precompute_mm_pool.py" --pool-dir "$POOL_DIR" generate \
     --k "$K" --seed 0 \
     --distribution "$DISTRIBUTION" --distribution-param "$DISTRIBUTION_PARAM" \
     --bucket-config $BUCKETS \
-    --model-id "$MODEL"
+    --model-id "$MODEL" \
+    --hf-processor-kwargs "$HF_PROCESSOR_KWARGS"
 else
   log "reusing existing pool: $POOL_DIR/pool_spec.json"
 fi
