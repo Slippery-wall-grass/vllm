@@ -48,6 +48,7 @@ if _REPO_ROOT not in sys.path:
 
 from vllm.multimodal.hasher import MultiModalHasher  # noqa: E402
 from vllm.multimodal.image import convert_image_mode  # noqa: E402
+from vllm.multimodal.media import MediaWithBytes  # noqa: E402
 from vllm.v1.core.encoder_cache_lambda import (  # noqa: E402
     TypeStats,
     dual_value,
@@ -90,24 +91,29 @@ def _hash_png_bytes(
     model_id: str | None = None,
     hf_processor_mm_kwargs: dict | None = None,
 ) -> str:
-    """Hash the *decoded* image the way vLLM does server-side.
+    """Hash an image the way vLLM does server-side.
 
-    vLLM's input pipeline decodes the data URL into a ``PIL.Image`` and
-    hashes via
-    :meth:`MultiModalHasher.hash_kwargs(model_id=..., image=...,
-    **hf_processor_mm_kwargs)`` (see
-    ``vllm/multimodal/processing/inputs.py``).
+    For base64/URL image inputs, vLLM's ImageMediaIO.load_base64 wraps
+    the decoded PIL image together with the original encoded bytes
+    into a ``MediaWithBytes(image, original_bytes)`` object. The
+    hasher's special-case for ``MediaWithBytes[Image.Image]`` then
+    hashes the *original encoded bytes* (PNG/JPEG bytes), NOT the PIL
+    pixel data (see ``vllm/multimodal/hasher.py:77``).
 
-    ``model_id`` MUST match the value vLLM uses (typically the
-    ``--model`` path/name passed to ``vllm serve``); otherwise the
-    offline-computed hash will not collide with the server-computed
-    one and ``Offline`` / ``Oracle`` policies will see every image as
-    unknown.
+    Therefore we must construct the same ``MediaWithBytes`` wrapper
+    offline and pass it as the ``image`` kwarg, otherwise the offline
+    hash uses the pixel-data serialization path and never collides
+    with the server's bytes-based path.
+
+    ``model_id`` and ``hf_processor_mm_kwargs`` must additionally
+    match what vLLM uses (see
+    ``vllm/multimodal/processing/inputs.py:50``).
     """
     img = Image.open(io.BytesIO(png_bytes))
     img.load()
     img = convert_image_mode(img, "RGB")
-    kwargs: dict[str, object] = {"image": img}
+    wrapped = MediaWithBytes(img, png_bytes)
+    kwargs: dict[str, object] = {"image": wrapped}
     if model_id is not None:
         kwargs["model_id"] = model_id
     if hf_processor_mm_kwargs:
