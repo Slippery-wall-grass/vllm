@@ -355,44 +355,45 @@ def write_markdown(
             lines.append("| " + " | ".join(cells) + " |")
         lines.append("")
 
-        # Compare against oracle (if present) — how close did each
-        # policy get to the ideal upper bound?
-        if "oracle" in policies:
-            lines.append("## Headroom to oracle (how much more saving is possible)")
-            lines.append("")
-            header = "| RPS | " + " | ".join(p for p in policies if p != "oracle") + " |"
-            sep = "|" + "---|" * (len(policies))
-            lines.append(header)
-            lines.append(sep)
-            for rps in rps_levels:
-                cells = [str(rps)]
-                oracle_hits = cache_deltas.get(("oracle", rps), {}).get(
-                    "delta_cache_hits"
-                )
-                for pol in policies:
-                    if pol == "oracle":
-                        continue
-                    hits = cache_deltas.get((pol, rps), {}).get("delta_cache_hits")
-                    if hits is None or oracle_hits is None:
-                        cells.append("—")
-                    else:
-                        gap = (float(oracle_hits) - float(hits)) * expected_c
-                        if oracle_hits > 0:
-                            pct = 100.0 * float(hits) / float(oracle_hits)
-                            cells.append(f"{gap:.2f}s gap ({pct:.0f}% of oracle)")
-                        else:
-                            cells.append(f"{gap:.2f}s gap")
-                lines.append("| " + " | ".join(cells) + " |")
-            lines.append("")
-
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+
+
+def _per_policy_saturation_rps(
+    grouped: dict[tuple[str, int], list[dict[str, Any]]],
+    policies: list[str],
+    rps_levels: list[int],
+    threshold: float = 0.85,
+) -> dict[str, int | None]:
+    """For each policy, return the lowest RPS at which the server fails
+    to sustain the requested rate (achieved_throughput < threshold *
+    requested_rps). RPS at or above this point are dropped from
+    latency plots because they sit on the queueing-explosion tail and
+    visually swamp the steady-state region.
+
+    Returns None for a policy if no saturation point is found.
+    """
+    sat: dict[str, int | None] = {}
+    for pol in policies:
+        sat[pol] = None
+        for rps in rps_levels:
+            achieved = median_safe(
+                [r.get("request_throughput") for r in grouped.get((pol, rps), [])]
+            )
+            if achieved is None:
+                continue
+            if achieved < threshold * float(rps):
+                sat[pol] = rps
+                break
+    return sat
 
 
 def maybe_plot(
     rows: list[dict[str, Any]],
     cache_deltas: dict[tuple[str, int], dict[str, Any]],
     plot_dir: Path,
+    expected_c_seconds: float | None = None,
+    saturation_threshold: float = 0.85,
 ) -> None:
     try:
         import matplotlib
@@ -409,18 +410,20 @@ def maybe_plot(
     for r in rows:
         grouped[(r["policy"], r["rps"])].append(r)
 
-    panels = [
+    sat = _per_policy_saturation_rps(grouped, policies, rps_levels, saturation_threshold)
+
+    # Throughput plots: show full range (the saturation IS the signal here).
+    throughput_panels = [
         ("request_throughput", "Request throughput (req/s)"),
         ("output_throughput", "Output throughput (tok/s)"),
-        ("mean_ttft_ms", "TTFT mean (ms)"),
-        ("p99_ttft_ms", "TTFT p99 (ms)"),
-        ("p99_e2el_ms", "E2EL p99 (ms)"),
     ]
-
-    for key, label in panels:
+    for key, label in throughput_panels:
         fig, ax = plt.subplots(figsize=(7, 4.5))
         for pol in policies:
-            ys = [median_safe([r.get(key) for r in grouped.get((pol, rps), [])]) for rps in rps_levels]
+            ys = [
+                median_safe([r.get(key) for r in grouped.get((pol, rps), [])])
+                for rps in rps_levels
+            ]
             xs_ys = [(x, y) for x, y in zip(rps_levels, ys) if y is not None]
             if not xs_ys:
                 continue
@@ -435,10 +438,55 @@ def maybe_plot(
         fig.savefig(plot_dir / f"{key}.png", dpi=120)
         plt.close(fig)
 
-    # Hit rate
+    # Latency plots: drop saturated RPS per policy so the steady-state
+    # comparison is visible.
+    latency_panels = [
+        ("mean_ttft_ms", "TTFT mean (ms)"),
+        ("p50_ttft_ms", "TTFT p50 (ms)"),
+        ("p99_ttft_ms", "TTFT p99 (ms)"),
+        ("mean_tpot_ms", "TPOT mean (ms)"),
+        ("p99_tpot_ms", "TPOT p99 (ms)"),
+        ("p99_e2el_ms", "E2EL p99 (ms)"),
+    ]
+    for key, label in latency_panels:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        any_plotted = False
+        for pol in policies:
+            cutoff = sat.get(pol)
+            visible_rps = [r for r in rps_levels if cutoff is None or r < cutoff]
+            ys = [
+                median_safe([r.get(key) for r in grouped.get((pol, rps), [])])
+                for rps in visible_rps
+            ]
+            xs_ys = [(x, y) for x, y in zip(visible_rps, ys) if y is not None]
+            if not xs_ys:
+                continue
+            xs, vals = zip(*xs_ys)
+            ax.plot(xs, vals, marker="o", label=pol)
+            any_plotted = True
+        ax.set_xlabel("Request rate (RPS)")
+        ax.set_ylabel(label)
+        title_suffix = ""
+        if any(c is not None for c in sat.values()):
+            dropped = ", ".join(
+                f"{p}≥{sat[p]}" for p in policies if sat[p] is not None
+            )
+            title_suffix = f"  (excluded saturated: {dropped})"
+        ax.set_title(label + title_suffix)
+        if any_plotted:
+            ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(plot_dir / f"{key}.png", dpi=120)
+        plt.close(fig)
+
+    # Hit rate (full range — independent of latency saturation).
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for pol in policies:
-        ys = [cache_deltas.get((pol, rps), {}).get("delta_hit_rate") for rps in rps_levels]
+        ys = [
+            cache_deltas.get((pol, rps), {}).get("delta_hit_rate")
+            for rps in rps_levels
+        ]
         xs_ys = [(x, y) for x, y in zip(rps_levels, ys) if y is not None]
         if not xs_ys:
             continue
@@ -453,6 +501,64 @@ def maybe_plot(
     fig.tight_layout()
     fig.savefig(plot_dir / "hit_rate.png", dpi=120)
     plt.close(fig)
+
+    # Encoder compute saved: per-step delta_cache_hits * E[c_i].
+    if expected_c_seconds is not None and expected_c_seconds > 0:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        for pol in policies:
+            ys = []
+            for rps in rps_levels:
+                hits = cache_deltas.get((pol, rps), {}).get("delta_cache_hits")
+                ys.append(
+                    float(hits) * expected_c_seconds if hits is not None else None
+                )
+            xs_ys = [(x, y) for x, y in zip(rps_levels, ys) if y is not None]
+            if not xs_ys:
+                continue
+            xs, vals = zip(*xs_ys)
+            ax.plot(xs, vals, marker="o", label=pol)
+        ax.set_xlabel("Request rate (RPS)")
+        ax.set_ylabel("Encoder compute saved (s)")
+        ax.set_title(
+            f"Encoder compute saved per RPS step  "
+            f"(E[c_i] = {expected_c_seconds * 1000:.1f} ms/hit)"
+        )
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(plot_dir / "encoder_time_saved.png", dpi=120)
+        plt.close(fig)
+
+        # Also normalize as "saved / requested total compute" to show
+        # the *fraction* of encoder work eliminated.
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        for pol in policies:
+            ys = []
+            for rps in rps_levels:
+                hits = cache_deltas.get((pol, rps), {}).get("delta_cache_hits")
+                completed = sum(
+                    int(r.get("completed", 0) or 0)
+                    for r in grouped.get((pol, rps), [])
+                )
+                if hits is None or completed <= 0:
+                    ys.append(None)
+                    continue
+                # fraction = hits / total_requests = encoder work avoided
+                ys.append(100.0 * float(hits) / float(completed))
+            xs_ys = [(x, y) for x, y in zip(rps_levels, ys) if y is not None]
+            if not xs_ys:
+                continue
+            xs, vals = zip(*xs_ys)
+            ax.plot(xs, vals, marker="o", label=pol)
+        ax.set_xlabel("Request rate (RPS)")
+        ax.set_ylabel("Encoder forwards avoided (% of arrivals)")
+        ax.set_title("Encoder compute saved (% of arrivals)")
+        ax.set_ylim(0, 100)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(plot_dir / "encoder_time_saved_pct.png", dpi=120)
+        plt.close(fig)
 
 
 def main() -> None:
@@ -473,7 +579,13 @@ def main() -> None:
     pool_path = Path(args.pool_spec) if args.pool_spec else None
     write_markdown(rows, deltas, pool_path, Path(args.output_md))
     if args.plot_dir:
-        maybe_plot(rows, deltas, Path(args.plot_dir))
+        expected_c = _expected_c_seconds(pool_path)
+        maybe_plot(
+            rows,
+            deltas,
+            Path(args.plot_dir),
+            expected_c_seconds=expected_c,
+        )
     print(f"Wrote {args.output_csv} and {args.output_md}")
     if args.plot_dir:
         print(f"Plots (if matplotlib available): {args.plot_dir}")

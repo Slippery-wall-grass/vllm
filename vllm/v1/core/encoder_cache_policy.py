@@ -215,75 +215,6 @@ class OfflineLagrangianEncoderCachePolicy(EncoderCachePolicy):
         return self._unknown_hits
 
 
-class OracleEncoderCachePolicy(EncoderCachePolicy):
-    """Theoretical upper bound: every pool image is encoded at most once.
-
-    Pool mm_hashes get an effectively infinite unlock_tick, so once
-    cached they are never evicted. Unknown (novelty) mm_hashes get
-    ``evict_on_unreference=True``-equivalent behavior via unlock_tick=0
-    plus the unpinned FIFO ordering, so they are the first to be
-    evicted under any cache pressure and the steady-state cache content
-    is exactly the pool.
-
-    Use this as the ``ideal'' baseline against which fifo/offline are
-    compared. It is not implementable in production (requires offline
-    knowledge of the pool), but it bounds the achievable hit rate.
-    """
-
-    _PIN_FOREVER = 10**12  # effectively infinity in tick units
-
-    def __init__(self, pool: dict[str, _PoolEntry]):
-        self._pool = pool
-        self._known_hits = 0
-        self._unknown_hits = 0
-        logger.info(
-            "OracleEncoderCachePolicy: %d pool entries pinned forever",
-            len(pool),
-        )
-
-    @classmethod
-    def from_json_file(cls, path: str) -> "OracleEncoderCachePolicy":
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        pool: dict[str, _PoolEntry] = {}
-        for mm_hash, entry in cfg["entries"].items():
-            pool[mm_hash] = _PoolEntry(
-                type_idx=int(entry.get("type_idx", -1)),
-                p=float(entry["p"]),
-                m=float(entry["m"]),
-                c=float(entry["c"]),
-                unlock_horizon=cls._PIN_FOREVER,
-            )
-        return cls(pool=pool)
-
-    def on_arrival(
-        self,
-        mm_hash: str,
-        num_embeds: int,
-        current_tick: int,
-    ) -> int:
-        if mm_hash in self._pool:
-            self._known_hits += 1
-            # Pin forever: novelty cannot evict a pool entry except via
-            # forced_unpin, which only happens when no unpinned entry
-            # is available (then the FIFO-front novelty is evicted).
-            return current_tick + self._PIN_FOREVER
-        self._unknown_hits += 1
-        return 0  # novelty: immediately evictable
-
-    @property
-    def known_hits(self) -> int:
-        return self._known_hits
-
-    @property
-    def unknown_hits(self) -> int:
-        return self._unknown_hits
-
-    def reset(self) -> None:
-        self._known_hits = 0
-        self._unknown_hits = 0
-
-
 def build_policy_from_env() -> EncoderCachePolicy:
     """Construct a policy from the process environment.
 
@@ -312,14 +243,7 @@ def build_policy_from_env() -> EncoderCachePolicy:
         return OfflineLagrangianEncoderCachePolicy.from_json_file(
             cfg_path, seed=seed
         )
-    if mode in ("oracle", "ideal"):
-        if not cfg_path:
-            raise ValueError(
-                "VLLM_ENCODER_CACHE_POLICY=oracle requires "
-                "VLLM_ENCODER_CACHE_POLICY_CONFIG to point at a JSON file."
-            )
-        return OracleEncoderCachePolicy.from_json_file(cfg_path)
     raise ValueError(
         f"Unknown VLLM_ENCODER_CACHE_POLICY: {mode!r}. "
-        "Expected one of: fifo, nocache, offline, oracle."
+        "Expected one of: fifo, nocache, offline."
     )
