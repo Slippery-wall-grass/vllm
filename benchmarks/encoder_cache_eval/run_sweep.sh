@@ -350,7 +350,10 @@ for POLICY in $POLICIES; do
   fi
 
   for RPS in $RPS_LIST; do
-    RPS_TAG=$(printf "%02d" "$RPS")
+    # Zero-padded fixed-width float so filenames sort correctly even when
+    # users mix integer (e.g. "2") and fractional (e.g. "1.5") rates.
+    # %07.2f gives "0001.50" / "0002.00" / "0012.00" — 7 chars, sortable.
+    RPS_TAG=$(printf "%07.2f" "$RPS")
     for REP in $(seq 0 $((REPEATS - 1))); do
       OUT="$RESULT_DIR/runs/${POLICY}_rps${RPS_TAG}_rep${REP}.json"
       BENCH_LOG="$RESULT_DIR/runs/${POLICY}_rps${RPS_TAG}_rep${REP}.bench.log"

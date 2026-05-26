@@ -25,7 +25,9 @@ from pathlib import Path
 from typing import Any
 
 
-_FILE_RX = re.compile(r"^(?P<policy>[a-zA-Z0-9_-]+)_rps(?P<rps>\d+)_rep(?P<rep>\d+)\.json$")
+_FILE_RX = re.compile(
+    r"^(?P<policy>[a-zA-Z0-9_-]+)_rps(?P<rps>\d+(?:\.\d+)?)_rep(?P<rep>\d+)\.json$"
+)
 
 
 # Cumulative cache stats line printed by EncoderCacheManager.maybe_log_stats():
@@ -101,18 +103,29 @@ def median_safe(xs):
     return statistics.median(xs) if xs else None
 
 
-def collect_rows(result_dir: Path) -> tuple[list[dict[str, Any]], dict[tuple[str, int], dict[str, Any]]]:
-    rows: list[dict[str, Any]] = []
-    cache_deltas: dict[tuple[str, int], dict[str, Any]] = defaultdict(dict)
+def _fmt_rps(rps: float) -> str:
+    """Display an RPS as int when it's integral (so '2' not '2.0'),
+    otherwise with enough decimals to be distinct from neighbors."""
+    if float(rps).is_integer():
+        return str(int(rps))
+    # Two decimals is enough for typical use (e.g. 1.5, 2.25); strip
+    # trailing zeros for readability.
+    s = f"{rps:.2f}".rstrip("0").rstrip(".")
+    return s if s else "0"
 
-    by_policy_rps: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+
+def collect_rows(result_dir: Path) -> tuple[list[dict[str, Any]], dict[tuple[str, float], dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    cache_deltas: dict[tuple[str, float], dict[str, Any]] = defaultdict(dict)
+
+    by_policy_rps: dict[tuple[str, float], list[dict[str, Any]]] = defaultdict(list)
 
     for f in sorted(result_dir.iterdir()):
         m = _FILE_RX.match(f.name)
         if not m:
             continue
         policy = m["policy"]
-        rps = int(m["rps"])
+        rps = float(m["rps"])
         rep = int(m["rep"])
         bench = load_bench_json(f)
         cache_path = f.with_suffix(".cache.txt")
@@ -277,7 +290,7 @@ def write_markdown(
         lines.append(header)
         lines.append(sep)
         for rps in rps_levels:
-            cells = [str(rps)]
+            cells = [_fmt_rps(rps)]
             for pol in policies:
                 vals = [r.get(key) for r in grouped[(pol, rps)]]
                 cells.append(fmt(median_safe(vals)))
@@ -292,7 +305,7 @@ def write_markdown(
         lines.append(header)
         lines.append(sep)
         for rps in rps_levels:
-            cells = [str(rps)]
+            cells = [_fmt_rps(rps)]
             for pol in policies:
                 cells.append(fmt(cache_deltas.get((pol, rps), {}).get(key)))
             lines.append("| " + " | ".join(cells) + " |")
@@ -311,7 +324,7 @@ def write_markdown(
         lines.append(header)
         lines.append(sep)
         for rps in rps_levels:
-            cells = [str(rps)]
+            cells = [_fmt_rps(rps)]
             for pol in policies:
                 hits = cache_deltas.get((pol, rps), {}).get("delta_cache_hits")
                 if hits is None:
@@ -330,7 +343,7 @@ def write_markdown(
         lines.append(header)
         lines.append(sep)
         for rps in rps_levels:
-            cells = [str(rps)]
+            cells = [_fmt_rps(rps)]
             base_hits = cache_deltas.get(("nocache", rps), {}).get("delta_cache_hits")
             for pol in policies:
                 hits = cache_deltas.get((pol, rps), {}).get("delta_cache_hits")
@@ -469,7 +482,7 @@ def maybe_plot(
         title_suffix = ""
         if any(c is not None for c in sat.values()):
             dropped = ", ".join(
-                f"{p}≥{sat[p]}" for p in policies if sat[p] is not None
+                f"{p}≥{_fmt_rps(sat[p])}" for p in policies if sat[p] is not None
             )
             title_suffix = f"  (excluded saturated: {dropped})"
         ax.set_title(label + title_suffix)
