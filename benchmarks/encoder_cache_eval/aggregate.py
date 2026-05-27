@@ -42,6 +42,30 @@ _CACHE_FIELDS = {
     "num_freeable": r"freeable=(\d+)",
 }
 
+# Cumulative encoder-forward log line emitted by the worker when
+# VLLM_TRACK_ENCODER_FORWARD_TIME=1 and the periodic logger is enabled:
+#   "encoder_forward cumulative_secs=12.345 cumulative_forwards=42"
+_ENC_FIELDS = {
+    "cumulative_encoder_secs": r"cumulative_secs=([\d.eE+\-]+)",
+    "cumulative_encoder_forwards": r"cumulative_forwards=(\d+)",
+}
+
+
+def parse_encoder_snapshot(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    txt = path.read_text(encoding="utf-8", errors="ignore").strip()
+    if not txt:
+        return {}
+    out: dict[str, Any] = {}
+    for key, pat in _ENC_FIELDS.items():
+        m = re.search(pat, txt)
+        if not m:
+            continue
+        raw = m.group(1)
+        out[key] = float(raw) if "." in raw or "e" in raw.lower() else int(raw)
+    return out
+
 
 def parse_cache_snapshot(path: Path) -> dict[str, Any]:
     if not path.exists():
@@ -129,41 +153,48 @@ def collect_rows(result_dir: Path) -> tuple[list[dict[str, Any]], dict[tuple[str
         rep = int(m["rep"])
         bench = load_bench_json(f)
         cache_path = f.with_suffix(".cache.txt")
-        if cache_path.name.endswith(".cache.txt"):
-            # `with_suffix(".cache.txt")` replaces only the final suffix,
-            # which is what we want.
-            pass
+        enc_path = f.with_suffix(".enc.txt")
         cache_snapshot = parse_cache_snapshot(cache_path)
+        enc_snapshot = parse_encoder_snapshot(enc_path)
         row = {
             "policy": policy,
             "rps": rps,
             "rep": rep,
             **bench,
             **{f"cache_{k}": v for k, v in cache_snapshot.items()},
+            **enc_snapshot,
         }
         rows.append(row)
         by_policy_rps[(policy, rps)].append(row)
 
-    # Cache counters in the log are cumulative. Compute per-(policy, RPS) deltas
-    # by subtracting the median of the *previous* RPS step's snapshot from
-    # this step's median. (For the smallest RPS we use the snapshot directly.)
+    # Cache + encoder counters in the log are cumulative. Compute per
+    # -(policy, RPS) deltas by subtracting the median of the *previous*
+    # RPS step's snapshot from this step's median. (For the smallest
+    # RPS we use the snapshot directly.)
     policies = sorted({p for p, _ in by_policy_rps})
     rps_levels = sorted({r for _, r in by_policy_rps})
+    cumulative_keys = [
+        "cache_hits",
+        "cache_misses",
+        "cache_forced_unpin_evictions",
+        "cumulative_encoder_secs",
+        "cumulative_encoder_forwards",
+    ]
     for policy in policies:
-        prev = {"cache_hits": 0, "cache_misses": 0, "cache_forced_unpin_evictions": 0}
+        prev = {k: 0 for k in cumulative_keys}
         for rps in rps_levels:
             bucket = by_policy_rps.get((policy, rps), [])
             if not bucket:
                 continue
-            cum = {}
-            for key in ["cache_hits", "cache_misses", "cache_forced_unpin_evictions"]:
+            cum: dict[str, float | None] = {}
+            for key in cumulative_keys:
                 cum[key] = median_safe([r.get(key) for r in bucket])
-            delta = {}
+            delta: dict[str, float] = {}
             for key, val in cum.items():
                 if val is None:
                     continue
-                delta[f"delta_{key}"] = max(0.0, val - prev.get(key, 0))
-                prev[key] = val
+                delta[f"delta_{key}"] = max(0.0, float(val) - float(prev.get(key, 0)))
+                prev[key] = float(val)
             # Derived hit rate for this RPS step.
             dh = delta.get("delta_cache_hits")
             dm = delta.get("delta_cache_misses")
@@ -308,6 +339,56 @@ def write_markdown(
             cells = [_fmt_rps(rps)]
             for pol in policies:
                 cells.append(fmt(cache_deltas.get((pol, rps), {}).get(key)))
+            lines.append("| " + " | ".join(cells) + " |")
+        lines.append("")
+
+    # Measured encoder-forward wall-clock per RPS step (from the
+    # worker-side cumulative counter). This is the ground-truth
+    # equivalent of the analytical estimate below.
+    has_measured = any(
+        cache_deltas.get((pol, rps), {}).get("delta_cumulative_encoder_secs") is not None
+        for pol in policies for rps in rps_levels
+    )
+    if has_measured:
+        lines.append("## Encoder forward time MEASURED (s per RPS step)")
+        lines.append("")
+        header = "| RPS | " + " | ".join(policies) + " |"
+        sep = "|" + "---|" * (len(policies) + 1)
+        lines.append(header)
+        lines.append(sep)
+        for rps in rps_levels:
+            cells = [_fmt_rps(rps)]
+            for pol in policies:
+                v = cache_deltas.get((pol, rps), {}).get("delta_cumulative_encoder_secs")
+                cells.append(f"{v:.2f}" if v is not None else "—")
+            lines.append("| " + " | ".join(cells) + " |")
+        lines.append("")
+
+        lines.append(
+            "## Encoder forward time MEASURED — saved vs nocache (s)"
+        )
+        lines.append("")
+        header = "| RPS | " + " | ".join(policies) + " |"
+        sep = "|" + "---|" * (len(policies) + 1)
+        lines.append(header)
+        lines.append(sep)
+        for rps in rps_levels:
+            cells = [_fmt_rps(rps)]
+            base = cache_deltas.get(("nocache", rps), {}).get(
+                "delta_cumulative_encoder_secs"
+            )
+            for pol in policies:
+                v = cache_deltas.get((pol, rps), {}).get(
+                    "delta_cumulative_encoder_secs"
+                )
+                if v is None or base is None:
+                    cells.append("—")
+                else:
+                    saved = float(base) - float(v)
+                    pct = (
+                        100.0 * saved / float(base) if base > 0 else 0.0
+                    )
+                    cells.append(f"{saved:.2f}s ({pct:+.1f}%)")
             lines.append("| " + " | ".join(cells) + " |")
         lines.append("")
 
@@ -514,6 +595,65 @@ def maybe_plot(
     fig.tight_layout()
     fig.savefig(plot_dir / "hit_rate.png", dpi=120)
     plt.close(fig)
+
+    # Measured encoder forward time per RPS step (ground truth from
+    # the worker's cumulative counter). Plotted only when the worker
+    # was started with VLLM_TRACK_ENCODER_FORWARD_TIME=1.
+    has_measured = any(
+        cache_deltas.get((pol, rps), {}).get("delta_cumulative_encoder_secs")
+        is not None
+        for pol in policies
+        for rps in rps_levels
+    )
+    if has_measured:
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        for pol in policies:
+            ys = [
+                cache_deltas.get((pol, rps), {}).get("delta_cumulative_encoder_secs")
+                for rps in rps_levels
+            ]
+            xs_ys = [(x, y) for x, y in zip(rps_levels, ys) if y is not None]
+            if not xs_ys:
+                continue
+            xs, vals = zip(*xs_ys)
+            ax.plot(xs, vals, marker="o", label=pol)
+        ax.set_xlabel("Request rate (RPS)")
+        ax.set_ylabel("Encoder forward time (s, measured)")
+        ax.set_title("Measured encoder forward time per RPS step")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(plot_dir / "encoder_time_measured.png", dpi=120)
+        plt.close(fig)
+
+        # Saved vs nocache (measured).
+        fig, ax = plt.subplots(figsize=(7, 4.5))
+        for pol in policies:
+            ys = []
+            for rps in rps_levels:
+                v = cache_deltas.get((pol, rps), {}).get(
+                    "delta_cumulative_encoder_secs"
+                )
+                base = cache_deltas.get(("nocache", rps), {}).get(
+                    "delta_cumulative_encoder_secs"
+                )
+                if v is None or base is None:
+                    ys.append(None)
+                else:
+                    ys.append(float(base) - float(v))
+            xs_ys = [(x, y) for x, y in zip(rps_levels, ys) if y is not None]
+            if not xs_ys:
+                continue
+            xs, vals = zip(*xs_ys)
+            ax.plot(xs, vals, marker="o", label=pol)
+        ax.set_xlabel("Request rate (RPS)")
+        ax.set_ylabel("Encoder time saved vs nocache (s)")
+        ax.set_title("Measured encoder time saved (vs nocache baseline)")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(plot_dir / "encoder_time_saved_measured.png", dpi=120)
+        plt.close(fig)
 
     # Encoder compute saved: per-step delta_cache_hits * E[c_i].
     if expected_c_seconds is not None and expected_c_seconds > 0:

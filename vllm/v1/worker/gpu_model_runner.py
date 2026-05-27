@@ -5,6 +5,7 @@ import functools
 import gc
 import itertools
 import threading
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
@@ -602,6 +603,29 @@ class GPUModelRunner(
         # Encoder timing registry for observability
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
         self._encoder_timing_lock = threading.Lock()
+
+        # Cumulative encoder-forward wall-clock (GPU-synchronized) counters.
+        # Enabled by setting VLLM_TRACK_ENCODER_FORWARD_TIME=1. The actual
+        # CUDA synchronizes inside timed_encoder_operation add latency to
+        # the encoder path, so this is off by default. When the periodic
+        # logger interval is set (VLLM_ENCODER_FORWARD_LOG_INTERVAL_SEC),
+        # the cumulative pair is emitted to the server log so external
+        # tooling can compute per-window deltas.
+        try:
+            self._track_encoder_forward_time = bool(
+                int(os.environ.get("VLLM_TRACK_ENCODER_FORWARD_TIME", "0"))
+            )
+        except ValueError:
+            self._track_encoder_forward_time = False
+        try:
+            self._encoder_forward_log_interval = float(
+                os.environ.get("VLLM_ENCODER_FORWARD_LOG_INTERVAL_SEC", "0")
+            )
+        except ValueError:
+            self._encoder_forward_log_interval = 0.0
+        self._cumulative_encoder_forward_secs: float = 0.0
+        self._cumulative_encoder_forwards: int = 0
+        self._last_encoder_forward_log_ts: float = time.monotonic()
 
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
@@ -6254,12 +6278,26 @@ class GPUModelRunner(
         Context manager to time encoder forward operations.
 
         Args:
-            should_time: Whether timing is enabled
+            should_time: Whether per-request timing is enabled (driven by
+                ``ObservabilityConfig.enable_mm_processor_stats``).
             group_lora_refs: Full list of (request_id, pos_info) tuples
             current_item_idx: Starting index for this group
             num_items: Number of items in this group
+
+        Side effects (additionally):
+
+        - When either ``should_time`` or the
+          ``VLLM_TRACK_ENCODER_FORWARD_TIME`` env var is set, the encoder
+          forward is timed with a CUDA synchronize and the cumulative
+          counter ``_cumulative_encoder_forward_secs`` is incremented.
+        - When ``VLLM_ENCODER_FORWARD_LOG_INTERVAL_SEC`` > 0, the
+          cumulative pair is logged at most every N seconds. External
+          tooling (e.g. ``benchmarks/encoder_cache_eval/aggregate.py``)
+          can grep that line to compute encoder-time savings per
+          benchmark window without an HTTP endpoint.
         """
-        if not should_time:
+        do_time = should_time or self._track_encoder_forward_time
+        if not do_time:
             yield
             return
 
@@ -6275,16 +6313,31 @@ class GPUModelRunner(
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - start_time
 
-            per_request_time = elapsed / max(len(group_request_ids), 1)
+            # Always update cumulative counters when we paid the sync
+            # cost — the data is essentially free at this point.
+            self._cumulative_encoder_forward_secs += elapsed
+            self._cumulative_encoder_forwards += num_items
 
-            with self._encoder_timing_lock:
-                for req_id in group_request_ids:
-                    if req_id not in self.encoder_timing_registry:
-                        self.encoder_timing_registry[req_id] = EncoderTimingStats()
+            if self._encoder_forward_log_interval > 0:
+                now = time.monotonic()
+                if now - self._last_encoder_forward_log_ts >= self._encoder_forward_log_interval:
+                    self._last_encoder_forward_log_ts = now
+                    logger.info(
+                        "encoder_forward cumulative_secs=%.4f "
+                        "cumulative_forwards=%d",
+                        self._cumulative_encoder_forward_secs,
+                        self._cumulative_encoder_forwards,
+                    )
 
-                    stats = self.encoder_timing_registry[req_id]
-                    stats.encoder_forward_secs += per_request_time
-                    stats.num_encoder_calls += 1
+            if should_time:
+                per_request_time = elapsed / max(len(group_request_ids), 1)
+                with self._encoder_timing_lock:
+                    for req_id in group_request_ids:
+                        if req_id not in self.encoder_timing_registry:
+                            self.encoder_timing_registry[req_id] = EncoderTimingStats()
+                        stats = self.encoder_timing_registry[req_id]
+                        stats.encoder_forward_secs += per_request_time
+                        stats.num_encoder_calls += 1
 
 
 @dataclass
