@@ -453,41 +453,11 @@ def write_markdown(
         f.write("\n".join(lines))
 
 
-def _per_policy_saturation_rps(
-    grouped: dict[tuple[str, int], list[dict[str, Any]]],
-    policies: list[str],
-    rps_levels: list[int],
-    threshold: float = 0.85,
-) -> dict[str, int | None]:
-    """For each policy, return the lowest RPS at which the server fails
-    to sustain the requested rate (achieved_throughput < threshold *
-    requested_rps). RPS at or above this point are dropped from
-    latency plots because they sit on the queueing-explosion tail and
-    visually swamp the steady-state region.
-
-    Returns None for a policy if no saturation point is found.
-    """
-    sat: dict[str, int | None] = {}
-    for pol in policies:
-        sat[pol] = None
-        for rps in rps_levels:
-            achieved = median_safe(
-                [r.get("request_throughput") for r in grouped.get((pol, rps), [])]
-            )
-            if achieved is None:
-                continue
-            if achieved < threshold * float(rps):
-                sat[pol] = rps
-                break
-    return sat
-
-
 def maybe_plot(
     rows: list[dict[str, Any]],
     cache_deltas: dict[tuple[str, int], dict[str, Any]],
     plot_dir: Path,
     expected_c_seconds: float | None = None,
-    saturation_threshold: float = 0.85,
 ) -> None:
     try:
         import matplotlib
@@ -500,19 +470,25 @@ def maybe_plot(
     plot_dir.mkdir(parents=True, exist_ok=True)
     policies = sorted({r["policy"] for r in rows})
     rps_levels = sorted({r["rps"] for r in rows})
-    grouped: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, float], list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
         grouped[(r["policy"], r["rps"])].append(r)
 
-    sat = _per_policy_saturation_rps(grouped, policies, rps_levels, saturation_threshold)
-
-    # Throughput plots: show full range (the saturation IS the signal here).
-    throughput_panels = [
+    # All panels (throughput AND latency) show the full RPS range so
+    # the user can observe what happens when the server saturates.
+    panels = [
         ("request_throughput", "Request throughput (req/s)"),
         ("output_throughput", "Output throughput (tok/s)"),
+        ("mean_ttft_ms", "TTFT mean (ms)"),
+        ("p50_ttft_ms", "TTFT p50 (ms)"),
+        ("p99_ttft_ms", "TTFT p99 (ms)"),
+        ("mean_tpot_ms", "TPOT mean (ms)"),
+        ("p99_tpot_ms", "TPOT p99 (ms)"),
+        ("p99_e2el_ms", "E2EL p99 (ms)"),
     ]
-    for key, label in throughput_panels:
+    for key, label in panels:
         fig, ax = plt.subplots(figsize=(7, 4.5))
+        any_plotted = False
         for pol in policies:
             ys = [
                 median_safe([r.get(key) for r in grouped.get((pol, rps), [])])
@@ -523,50 +499,10 @@ def maybe_plot(
                 continue
             xs, vals = zip(*xs_ys)
             ax.plot(xs, vals, marker="o", label=pol)
-        ax.set_xlabel("Request rate (RPS)")
-        ax.set_ylabel(label)
-        ax.set_title(label)
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        fig.savefig(plot_dir / f"{key}.png", dpi=120)
-        plt.close(fig)
-
-    # Latency plots: drop saturated RPS per policy so the steady-state
-    # comparison is visible.
-    latency_panels = [
-        ("mean_ttft_ms", "TTFT mean (ms)"),
-        ("p50_ttft_ms", "TTFT p50 (ms)"),
-        ("p99_ttft_ms", "TTFT p99 (ms)"),
-        ("mean_tpot_ms", "TPOT mean (ms)"),
-        ("p99_tpot_ms", "TPOT p99 (ms)"),
-        ("p99_e2el_ms", "E2EL p99 (ms)"),
-    ]
-    for key, label in latency_panels:
-        fig, ax = plt.subplots(figsize=(7, 4.5))
-        any_plotted = False
-        for pol in policies:
-            cutoff = sat.get(pol)
-            visible_rps = [r for r in rps_levels if cutoff is None or r < cutoff]
-            ys = [
-                median_safe([r.get(key) for r in grouped.get((pol, rps), [])])
-                for rps in visible_rps
-            ]
-            xs_ys = [(x, y) for x, y in zip(visible_rps, ys) if y is not None]
-            if not xs_ys:
-                continue
-            xs, vals = zip(*xs_ys)
-            ax.plot(xs, vals, marker="o", label=pol)
             any_plotted = True
         ax.set_xlabel("Request rate (RPS)")
         ax.set_ylabel(label)
-        title_suffix = ""
-        if any(c is not None for c in sat.values()):
-            dropped = ", ".join(
-                f"{p}≥{_fmt_rps(sat[p])}" for p in policies if sat[p] is not None
-            )
-            title_suffix = f"  (excluded saturated: {dropped})"
-        ax.set_title(label + title_suffix)
+        ax.set_title(label)
         if any_plotted:
             ax.legend()
         ax.grid(True, alpha=0.3)
