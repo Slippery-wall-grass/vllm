@@ -468,6 +468,26 @@ def _server_wakeup(args: argparse.Namespace, spec: dict) -> None:
 
 
 def cmd_measure(args: argparse.Namespace) -> None:
+    """Measure per-type encoder forward time using the difference method.
+
+    For each type:
+      1. Warmup the server with this image so the encoder output is
+         cached and the CUDA graph for its shape is captured.
+      2. Take ``--repeats`` samples of TTFT with the cache populated
+         ("hit baseline"). These do NOT execute the vision encoder
+         (cache hit), so they capture the fixed overhead: HTTP,
+         preprocess, hash, prefill of image+text tokens, first decode.
+      3. Take ``--repeats`` samples where we ``POST /reset_encoder_cache``
+         right before each send ("miss raw"). Each one therefore
+         executes the vision encoder.
+      4. ``c_seconds = median(miss_raw) - median(hit_baseline)`` is the
+         pure encoder-forward time, isolated from the fixed overhead.
+
+    Requires ``VLLM_SERVER_DEV_MODE=1`` so the
+    ``/reset_encoder_cache`` route is registered (see
+    ``vllm/entrypoints/serve/cache/api_router.py``). Both raw numbers
+    are also stored in ``pool_spec.json`` for sanity checking.
+    """
     spec_path = os.path.join(args.pool_dir, "pool_spec.json")
     with open(spec_path, "r", encoding="utf-8") as f:
         spec = json.load(f)
@@ -475,26 +495,51 @@ def cmd_measure(args: argparse.Namespace) -> None:
     _server_wakeup(args, spec)
 
     images_dir = os.path.join(args.pool_dir, spec.get("images_dir", "images"))
-    # Warmup once per type before timing so we don't include compile/cuda
-    # graph capture in the latency.
     for t in spec["types"]:
         with open(os.path.join(images_dir, t["filename"]), "rb") as f:
             png = f.read()
-        # Warmup
+
+        # Stage 1: warmup populates the cache for this image (and the
+        # CUDA graph for its shape, if not already captured by the
+        # global wakeup).
         for _ in range(max(1, args.warmup)):
             _send_chat_image(
                 args.base_url, args.api_key, args.model, png,
                 output_tokens=1, timeout=args.timeout,
             )
-        # Time
-        samples: list[float] = []
+
+        # Stage 2: hit baseline. Cache is populated; vision encoder is
+        # skipped each call. TTFT measures everything *except* encoder
+        # forward.
+        hit_samples: list[float] = []
         for _ in range(args.repeats):
-            lat = _send_chat_image(
+            hit_samples.append(_send_chat_image(
                 args.base_url, args.api_key, args.model, png,
                 output_tokens=1, timeout=args.timeout,
+            ))
+        c_hit = float(statistics.median(hit_samples))
+
+        # Stage 3: miss raw. Reset the cache before every send so each
+        # call exercises the vision encoder.
+        miss_samples: list[float] = []
+        for _ in range(args.repeats):
+            _reset_encoder_cache_endpoint(
+                args.base_url, args.api_key, args.timeout
             )
-            samples.append(lat)
-        t["c_seconds"] = float(statistics.median(samples))
+            miss_samples.append(_send_chat_image(
+                args.base_url, args.api_key, args.model, png,
+                output_tokens=1, timeout=args.timeout,
+            ))
+        c_miss = float(statistics.median(miss_samples))
+
+        # Pure encoder forward time. Clamp to a tiny positive value so
+        # downstream solvers (c == 0 implies infinite horizon) don't
+        # explode on measurement noise; record the raw numbers too.
+        c_encoder = max(1e-3, c_miss - c_hit)
+        t["c_seconds"] = c_encoder
+        t["c_hit_baseline"] = c_hit
+        t["c_miss_raw"] = c_miss
+
         # m_tokens
         if args.use_token_query:
             m = _query_num_image_tokens(
@@ -503,12 +548,13 @@ def cmd_measure(args: argparse.Namespace) -> None:
         else:
             m = None
         if m is None:
-            # Heuristic: ~588 tokens per megapixel for Qwen2-VL-like models.
             m = max(1, int(round(t["height"] * t["width"] / 1e6 * 588)))
         t["m_tokens"] = int(m)
         print(
             f"type {t['idx']:3d} {t['height']}x{t['width']}: "
-            f"c={t['c_seconds']:.4f}s  m={t['m_tokens']} tokens"
+            f"encoder={c_encoder*1000:.1f}ms "
+            f"(miss={c_miss*1000:.1f}ms - hit={c_hit*1000:.1f}ms)  "
+            f"m={t['m_tokens']} tokens"
         )
 
     with open(spec_path, "w", encoding="utf-8") as f:
