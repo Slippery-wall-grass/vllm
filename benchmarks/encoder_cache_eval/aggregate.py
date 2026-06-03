@@ -50,6 +50,24 @@ _ENC_FIELDS = {
     "cumulative_encoder_forwards": r"cumulative_forwards=(\d+)",
 }
 
+# Cumulative per-step stage timing line emitted by the worker when
+# VLLM_TRACK_STEP_TIME=1 and the periodic logger is enabled. Mirrors the
+# encoder_forward sidecar but adds prefill/decode cumulative seconds and
+# step/token counts:
+#   "stage_breakdown encoder_secs=X prefill_secs=Y decode_secs=Z
+#    encoder_forwards=A prefill_steps=B decode_steps=C
+#    prefill_tokens=D decode_tokens=E"
+_STAGE_FIELDS = {
+    "stage_encoder_secs": r"encoder_secs=([\d.eE+\-]+)",
+    "stage_prefill_secs": r"prefill_secs=([\d.eE+\-]+)",
+    "stage_decode_secs": r"decode_secs=([\d.eE+\-]+)",
+    "stage_encoder_forwards": r"encoder_forwards=(\d+)",
+    "stage_prefill_steps": r"prefill_steps=(\d+)",
+    "stage_decode_steps": r"decode_steps=(\d+)",
+    "stage_prefill_tokens": r"prefill_tokens=(\d+)",
+    "stage_decode_tokens": r"decode_tokens=(\d+)",
+}
+
 
 def parse_encoder_snapshot(path: Path) -> dict[str, Any]:
     if not path.exists():
@@ -59,6 +77,22 @@ def parse_encoder_snapshot(path: Path) -> dict[str, Any]:
         return {}
     out: dict[str, Any] = {}
     for key, pat in _ENC_FIELDS.items():
+        m = re.search(pat, txt)
+        if not m:
+            continue
+        raw = m.group(1)
+        out[key] = float(raw) if "." in raw or "e" in raw.lower() else int(raw)
+    return out
+
+
+def parse_stage_snapshot(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    txt = path.read_text(encoding="utf-8", errors="ignore").strip()
+    if not txt:
+        return {}
+    out: dict[str, Any] = {}
+    for key, pat in _STAGE_FIELDS.items():
         m = re.search(pat, txt)
         if not m:
             continue
@@ -154,8 +188,10 @@ def collect_rows(result_dir: Path) -> tuple[list[dict[str, Any]], dict[tuple[str
         bench = load_bench_json(f)
         cache_path = f.with_suffix(".cache.txt")
         enc_path = f.with_suffix(".enc.txt")
+        stage_path = f.with_suffix(".stage.txt")
         cache_snapshot = parse_cache_snapshot(cache_path)
         enc_snapshot = parse_encoder_snapshot(enc_path)
+        stage_snapshot = parse_stage_snapshot(stage_path)
         row = {
             "policy": policy,
             "rps": rps,
@@ -163,6 +199,7 @@ def collect_rows(result_dir: Path) -> tuple[list[dict[str, Any]], dict[tuple[str
             **bench,
             **{f"cache_{k}": v for k, v in cache_snapshot.items()},
             **enc_snapshot,
+            **stage_snapshot,
         }
         rows.append(row)
         by_policy_rps[(policy, rps)].append(row)
@@ -179,6 +216,14 @@ def collect_rows(result_dir: Path) -> tuple[list[dict[str, Any]], dict[tuple[str
         "cache_forced_unpin_evictions",
         "cumulative_encoder_secs",
         "cumulative_encoder_forwards",
+        "stage_encoder_secs",
+        "stage_prefill_secs",
+        "stage_decode_secs",
+        "stage_encoder_forwards",
+        "stage_prefill_steps",
+        "stage_decode_steps",
+        "stage_prefill_tokens",
+        "stage_decode_tokens",
     ]
     for policy in policies:
         prev = {k: 0 for k in cumulative_keys}
@@ -561,6 +606,110 @@ def maybe_plot(
         fig.tight_layout()
         fig.savefig(plot_dir / "encoder_time_measured.png", dpi=120)
         plt.close(fig)
+
+        # Stacked-bar stage breakdown per RPS, one figure per policy.
+        # Bars show absolute seconds spent in encoder / prefill / decode
+        # within each RPS window; percentages annotated on top so the
+        # ratio is visible at a glance.
+        for pol in policies:
+            xs: list[float] = []
+            enc_vals: list[float] = []
+            pre_vals: list[float] = []
+            dec_vals: list[float] = []
+            for rps in rps_levels:
+                d = cache_deltas.get((pol, rps), {})
+                e = d.get("delta_stage_encoder_secs")
+                p = d.get("delta_stage_prefill_secs")
+                de = d.get("delta_stage_decode_secs")
+                if e is None or p is None or de is None:
+                    continue
+                xs.append(float(rps))
+                enc_vals.append(float(e))
+                pre_vals.append(float(p))
+                dec_vals.append(float(de))
+            if not xs:
+                continue
+            fig, ax = plt.subplots(figsize=(8, 4.8))
+            x_pos = list(range(len(xs)))
+            bar_w = 0.6
+            ax.bar(x_pos, enc_vals, bar_w, label="encoder",
+                   color="#ff9f43")
+            ax.bar(x_pos, pre_vals, bar_w, bottom=enc_vals,
+                   label="prefill", color="#5f6caf")
+            decode_bottom = [a + b for a, b in zip(enc_vals, pre_vals)]
+            ax.bar(x_pos, dec_vals, bar_w, bottom=decode_bottom,
+                   label="decode", color="#3ec1d3")
+            # Annotate ratios on top of each stack.
+            for i, (e, p, de) in enumerate(zip(enc_vals, pre_vals, dec_vals)):
+                tot = e + p + de
+                if tot <= 0:
+                    continue
+                ax.text(
+                    i, tot,
+                    f"{100*e/tot:.0f}/{100*p/tot:.0f}/{100*de/tot:.0f}%",
+                    ha="center", va="bottom", fontsize=8,
+                )
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels([_fmt_rps(x) for x in xs])
+            ax.set_xlabel("Request rate (RPS)")
+            ax.set_ylabel("Cumulative time per RPS window (s)")
+            ax.set_title(
+                f"Stage time breakdown — {pol}\n"
+                "(enc/prefill/decode %)"
+            )
+            ax.legend(loc="upper left")
+            ax.grid(True, alpha=0.3, axis="y")
+            fig.tight_layout()
+            fig.savefig(plot_dir / f"stage_breakdown_{pol}.png", dpi=120)
+            plt.close(fig)
+
+        # Cross-policy ratio plot: stacked 100% bars showing stage share
+        # for each policy at each RPS. One panel per RPS so the user can
+        # compare fifo vs offline vs nocache stage mix at the same load.
+        for rps in rps_levels:
+            pol_xs: list[str] = []
+            enc_pcts: list[float] = []
+            pre_pcts: list[float] = []
+            dec_pcts: list[float] = []
+            for pol in policies:
+                d = cache_deltas.get((pol, rps), {})
+                e = d.get("delta_stage_encoder_secs")
+                p = d.get("delta_stage_prefill_secs")
+                de = d.get("delta_stage_decode_secs")
+                if e is None or p is None or de is None:
+                    continue
+                tot = float(e) + float(p) + float(de)
+                if tot <= 0:
+                    continue
+                pol_xs.append(pol)
+                enc_pcts.append(100 * float(e) / tot)
+                pre_pcts.append(100 * float(p) / tot)
+                dec_pcts.append(100 * float(de) / tot)
+            if not pol_xs:
+                continue
+            fig, ax = plt.subplots(figsize=(6, 4.2))
+            x_pos = list(range(len(pol_xs)))
+            ax.bar(x_pos, enc_pcts, 0.55, label="encoder",
+                   color="#ff9f43")
+            ax.bar(x_pos, pre_pcts, 0.55, bottom=enc_pcts,
+                   label="prefill", color="#5f6caf")
+            bot = [a + b for a, b in zip(enc_pcts, pre_pcts)]
+            ax.bar(x_pos, dec_pcts, 0.55, bottom=bot,
+                   label="decode", color="#3ec1d3")
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(pol_xs)
+            ax.set_ylabel("Share of stage time (%)")
+            ax.set_ylim(0, 105)
+            ax.set_title(
+                f"Stage share by policy @ RPS={_fmt_rps(rps)}"
+            )
+            ax.legend(loc="upper right", fontsize=8)
+            ax.grid(True, alpha=0.3, axis="y")
+            fig.tight_layout()
+            fig.savefig(
+                plot_dir / f"stage_share_rps{_fmt_rps(rps)}.png", dpi=120,
+            )
+            plt.close(fig)
 
         # Saved vs nocache (measured).
         fig, ax = plt.subplots(figsize=(7, 4.5))

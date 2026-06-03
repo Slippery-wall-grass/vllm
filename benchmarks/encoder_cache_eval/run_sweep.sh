@@ -160,6 +160,8 @@ start_server() {
         VLLM_ENCODER_CACHE_STATS_INTERVAL_SEC="$STATS_INTERVAL_SEC" \
         VLLM_TRACK_ENCODER_FORWARD_TIME=1 \
         VLLM_ENCODER_FORWARD_LOG_INTERVAL_SEC="$STATS_INTERVAL_SEC" \
+        VLLM_TRACK_STEP_TIME=1 \
+        VLLM_STEP_TIME_LOG_INTERVAL_SEC="$STATS_INTERVAL_SEC" \
         VLLM_SERVER_DEV_MODE=1 \
         $env_extra \
         nohup vllm serve "$MODEL" \
@@ -390,6 +392,11 @@ for POLICY in $POLICIES; do
       # so aggregate.py can compute per-RPS encoder time deltas.
       grep "encoder_forward " "$LOGFILE" | tail -1 \
         > "$RESULT_DIR/runs/${POLICY}_rps${RPS_TAG}_rep${REP}.enc.txt" || true
+      # Capture the most recent stage_breakdown line (encoder/prefill/decode
+      # cumulative seconds) so aggregate.py can build the per-stage ratio
+      # plot.
+      grep "stage_breakdown " "$LOGFILE" | tail -1 \
+        > "$RESULT_DIR/runs/${POLICY}_rps${RPS_TAG}_rep${REP}.stage.txt" || true
     done
   done
 
