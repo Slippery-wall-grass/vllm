@@ -627,6 +627,34 @@ class GPUModelRunner(
         self._cumulative_encoder_forwards: int = 0
         self._last_encoder_forward_log_ts: float = time.monotonic()
 
+        # Cumulative per-step model-forward wall-clock counters split into
+        # "prefill" (any step where new prompt/chunked-prefill tokens were
+        # scheduled) and "decode" (steps where every scheduled token comes
+        # from a running request advancing by 1). Enabled by setting
+        # VLLM_TRACK_STEP_TIME=1. Mixed steps (chunked prefill + decode in
+        # the same batch) count as "prefill" because the chunked-prefill
+        # tokens dominate the forward cost. See aggregate.py for the
+        # downstream stacked-bar visualisation.
+        try:
+            self._track_step_time = bool(
+                int(os.environ.get("VLLM_TRACK_STEP_TIME", "0"))
+            )
+        except ValueError:
+            self._track_step_time = False
+        try:
+            self._step_time_log_interval = float(
+                os.environ.get("VLLM_STEP_TIME_LOG_INTERVAL_SEC", "0")
+            )
+        except ValueError:
+            self._step_time_log_interval = 0.0
+        self._cumulative_prefill_step_secs: float = 0.0
+        self._cumulative_decode_step_secs: float = 0.0
+        self._cumulative_prefill_steps: int = 0
+        self._cumulative_decode_steps: int = 0
+        self._cumulative_prefill_tokens: int = 0
+        self._cumulative_decode_tokens: int = 0
+        self._last_step_time_log_ts: float = time.monotonic()
+
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         self.positions = self._make_buffer(self.max_num_tokens, dtype=torch.int64)
@@ -3640,6 +3668,14 @@ class GPUModelRunner(
                 scheduler_output, clear_metadata=clear_kv_metadata
             ) as kv_connector_output,
         ):
+            # Optional per-step stage timing for the offline encoder-cache
+            # eval. Only sync when enabled so we don't pay the cost on
+            # hot paths in production.
+            step_t0: float | None = None
+            if self._track_step_time:
+                torch.cuda.synchronize()
+                step_t0 = time.perf_counter()
+
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -3647,6 +3683,52 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+            if step_t0 is not None:
+                torch.cuda.synchronize()
+                step_elapsed = time.perf_counter() - step_t0
+                # Classify step. In V1, scheduled_new_reqs carries fresh
+                # prompts (full prefill) and scheduled_cached_reqs carries
+                # running requests. A step has "prefill activity" when:
+                #   - any new req is scheduled (fresh prompt prefill), OR
+                #   - chunked-prefill is in flight (total scheduled tokens
+                #     exceeds the number of cached requests advancing by 1).
+                num_new = len(scheduler_output.scheduled_new_reqs)
+                cached = scheduler_output.scheduled_cached_reqs
+                num_cached = len(cached.req_ids) if cached is not None else 0
+                total_tokens = scheduler_output.total_num_scheduled_tokens
+                has_prefill = num_new > 0 or total_tokens > num_cached
+                if has_prefill:
+                    self._cumulative_prefill_step_secs += step_elapsed
+                    self._cumulative_prefill_steps += 1
+                    self._cumulative_prefill_tokens += total_tokens
+                else:
+                    self._cumulative_decode_step_secs += step_elapsed
+                    self._cumulative_decode_steps += 1
+                    self._cumulative_decode_tokens += total_tokens
+
+                if self._step_time_log_interval > 0:
+                    now = time.monotonic()
+                    if (
+                        now - self._last_step_time_log_ts
+                        >= self._step_time_log_interval
+                    ):
+                        logger.info(
+                            "stage_breakdown "
+                            "encoder_secs=%.4f prefill_secs=%.4f "
+                            "decode_secs=%.4f encoder_forwards=%d "
+                            "prefill_steps=%d decode_steps=%d "
+                            "prefill_tokens=%d decode_tokens=%d",
+                            self._cumulative_encoder_forward_secs,
+                            self._cumulative_prefill_step_secs,
+                            self._cumulative_decode_step_secs,
+                            self._cumulative_encoder_forwards,
+                            self._cumulative_prefill_steps,
+                            self._cumulative_decode_steps,
+                            self._cumulative_prefill_tokens,
+                            self._cumulative_decode_tokens,
+                        )
+                        self._last_step_time_log_ts = now
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
