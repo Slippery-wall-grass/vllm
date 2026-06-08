@@ -628,13 +628,14 @@ class GPUModelRunner(
         self._last_encoder_forward_log_ts: float = time.monotonic()
 
         # Cumulative per-step model-forward wall-clock counters split into
-        # "prefill" (any step where new prompt/chunked-prefill tokens were
-        # scheduled) and "decode" (steps where every scheduled token comes
-        # from a running request advancing by 1). Enabled by setting
-        # VLLM_TRACK_STEP_TIME=1. Mixed steps (chunked prefill + decode in
-        # the same batch) count as "prefill" because the chunked-prefill
-        # tokens dominate the forward cost. See aggregate.py for the
-        # downstream stacked-bar visualisation.
+        # "prefill" and "decode". Enabled by setting VLLM_TRACK_STEP_TIME=1.
+        # Each step's wall-clock is attributed to the two buckets in
+        # proportion to the prefill vs decode token counts processed that step
+        # (see the per-step split in execute_model). Mixed steps (chunked
+        # prefill + decode in the same batch) therefore contribute to *both*
+        # buckets instead of being charged entirely to prefill, and
+        # `_cumulative_mixed_steps` records how many such steps occurred. See
+        # aggregate.py for the downstream stacked-bar visualisation.
         try:
             self._track_step_time = bool(
                 int(os.environ.get("VLLM_TRACK_STEP_TIME", "0"))
@@ -651,6 +652,7 @@ class GPUModelRunner(
         self._cumulative_decode_step_secs: float = 0.0
         self._cumulative_prefill_steps: int = 0
         self._cumulative_decode_steps: int = 0
+        self._cumulative_mixed_steps: int = 0
         self._cumulative_prefill_tokens: int = 0
         self._cumulative_decode_tokens: int = 0
         self._last_step_time_log_ts: float = time.monotonic()
@@ -3507,6 +3509,32 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            # Per-step prefill/decode token split for the offline encoder-cache
+            # eval (VLLM_TRACK_STEP_TIME=1). A scheduled token at absolute
+            # position `pos` for a request is a *prefill* token iff it is part
+            # of the prompt (pos < prompt_len); otherwise it is a *decode*
+            # (generated) token. This step advances each request over the
+            # positions [computed, computed + scheduled), so the number of
+            # prefill tokens for a request is
+            #     clip(prompt_len - computed, 0, scheduled).
+            # This is exact for chunked prefill (any chunk, including the one
+            # that straddles the prompt/first-generated-token boundary) and for
+            # speculative decode (a running request advances by 1 + num_spec
+            # tokens, all past the prompt -> all decode). It replaces the old
+            # all-or-nothing `has_prefill` heuristic that dumped an entire
+            # mixed step into the prefill bucket. Computed pre-forward; only
+            # when step timing is enabled to avoid overhead on the hot path.
+            step_prefill_tokens = 0
+            step_decode_tokens = 0
+            if self._track_step_time:
+                computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                prompt_len = self.input_batch.num_prompt_tokens[:num_reqs]
+                prefill_per_req = np.minimum(
+                    np.maximum(prompt_len - computed, 0), num_scheduled_tokens_np
+                )
+                step_prefill_tokens = int(prefill_per_req.sum())
+                step_decode_tokens = int(num_tokens_unpadded) - step_prefill_tokens
+
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
@@ -3687,25 +3715,37 @@ class GPUModelRunner(
             if step_t0 is not None:
                 torch.cuda.synchronize()
                 step_elapsed = time.perf_counter() - step_t0
-                # Classify step. In V1, scheduled_new_reqs carries fresh
-                # prompts (full prefill) and scheduled_cached_reqs carries
-                # running requests. A step has "prefill activity" when:
-                #   - any new req is scheduled (fresh prompt prefill), OR
-                #   - chunked-prefill is in flight (total scheduled tokens
-                #     exceeds the number of cached requests advancing by 1).
-                num_new = len(scheduler_output.scheduled_new_reqs)
-                cached = scheduler_output.scheduled_cached_reqs
-                num_cached = len(cached.req_ids) if cached is not None else 0
-                total_tokens = scheduler_output.total_num_scheduled_tokens
-                has_prefill = num_new > 0 or total_tokens > num_cached
-                if has_prefill:
-                    self._cumulative_prefill_step_secs += step_elapsed
-                    self._cumulative_prefill_steps += 1
-                    self._cumulative_prefill_tokens += total_tokens
-                else:
-                    self._cumulative_decode_step_secs += step_elapsed
-                    self._cumulative_decode_steps += 1
-                    self._cumulative_decode_tokens += total_tokens
+                # Attribute the step's wall-clock to prefill vs decode in
+                # proportion to the number of prefill/decode tokens actually
+                # processed this step (computed above). The forward is a single
+                # fused batch, so the two sub-times cannot be measured
+                # independently; token-proportional split is the standard
+                # approximation. It assumes equal per-token cost, so the
+                # prefill/decode discrimination of per-token cost comes from
+                # *pure* steps -- but unlike the old all-or-nothing scheme it no
+                # longer charges decode tokens' time to the prefill bucket on
+                # mixed (chunked-prefill + decode) steps, which are the common
+                # case under continuous batching at high RPS.
+                total_step_tokens = step_prefill_tokens + step_decode_tokens
+                if total_step_tokens > 0:
+                    prefill_frac = step_prefill_tokens / total_step_tokens
+                    self._cumulative_prefill_step_secs += step_elapsed * prefill_frac
+                    self._cumulative_decode_step_secs += step_elapsed * (
+                        1.0 - prefill_frac
+                    )
+                    self._cumulative_prefill_tokens += step_prefill_tokens
+                    self._cumulative_decode_tokens += step_decode_tokens
+                    # Step counts: a step is a "prefill step" if it carried any
+                    # prefill token (this preserves the prior meaning, with
+                    # prefill_steps + decode_steps == total steps); mixed steps
+                    # (both prefill and decode tokens present) are additionally
+                    # counted so the eval can see how prevalent token-mixing is.
+                    if step_prefill_tokens > 0:
+                        self._cumulative_prefill_steps += 1
+                        if step_decode_tokens > 0:
+                            self._cumulative_mixed_steps += 1
+                    else:
+                        self._cumulative_decode_steps += 1
 
                 if self._step_time_log_interval > 0:
                     now = time.monotonic()
@@ -3718,7 +3758,8 @@ class GPUModelRunner(
                             "encoder_secs=%.4f prefill_secs=%.4f "
                             "decode_secs=%.4f encoder_forwards=%d "
                             "prefill_steps=%d decode_steps=%d "
-                            "prefill_tokens=%d decode_tokens=%d",
+                            "prefill_tokens=%d decode_tokens=%d "
+                            "mixed_steps=%d",
                             self._cumulative_encoder_forward_secs,
                             self._cumulative_prefill_step_secs,
                             self._cumulative_decode_step_secs,
@@ -3727,6 +3768,7 @@ class GPUModelRunner(
                             self._cumulative_decode_steps,
                             self._cumulative_prefill_tokens,
                             self._cumulative_decode_tokens,
+                            self._cumulative_mixed_steps,
                         )
                         self._last_step_time_log_ts = now
 

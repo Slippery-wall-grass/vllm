@@ -56,7 +56,12 @@ _ENC_FIELDS = {
 # step/token counts:
 #   "stage_breakdown encoder_secs=X prefill_secs=Y decode_secs=Z
 #    encoder_forwards=A prefill_steps=B decode_steps=C
-#    prefill_tokens=D decode_tokens=E"
+#    prefill_tokens=D decode_tokens=E mixed_steps=F"
+# prefill_secs/decode_secs are split per step in proportion to the prefill vs
+# decode token counts processed that step (mixed chunked-prefill+decode steps
+# contribute to both buckets). `mixed_steps` counts steps that carried both
+# prefill and decode tokens (a subset of prefill_steps); it is absent in logs
+# produced before that field was added, in which case the parser omits it.
 _STAGE_FIELDS = {
     "stage_encoder_secs": r"encoder_secs=([\d.eE+\-]+)",
     "stage_prefill_secs": r"prefill_secs=([\d.eE+\-]+)",
@@ -66,6 +71,7 @@ _STAGE_FIELDS = {
     "stage_decode_steps": r"decode_steps=(\d+)",
     "stage_prefill_tokens": r"prefill_tokens=(\d+)",
     "stage_decode_tokens": r"decode_tokens=(\d+)",
+    "stage_mixed_steps": r"mixed_steps=(\d+)",
 }
 
 
@@ -222,6 +228,7 @@ def collect_rows(result_dir: Path) -> tuple[list[dict[str, Any]], dict[tuple[str
         "stage_encoder_forwards",
         "stage_prefill_steps",
         "stage_decode_steps",
+        "stage_mixed_steps",
         "stage_prefill_tokens",
         "stage_decode_tokens",
     ]
