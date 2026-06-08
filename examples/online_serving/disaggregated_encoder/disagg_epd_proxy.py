@@ -51,7 +51,7 @@ decode_session: aiohttp.ClientSession | None = None
 ###############################################################################
 
 
-MM_TYPES = {"image_url", "audio_url", "input_audio"}
+MM_TYPES = {"image_url", "audio_url", "input_audio", "video_url"}
 
 
 def extract_mm_items(request_data: dict) -> list[dict]:
@@ -391,19 +391,32 @@ async def chat_completions(request: Request):
         req_data = await request.json()
         req_id = request.headers.get("x-request-id", str(uuid.uuid4()))
 
+        # Debug: log the req_id that's being used for both the encoder
+        # fanout and the client response. Search this in the proxy log
+        # to verify a given client server_request_id matches what was
+        # forwarded to the encoder worker.
+        logger.info("[ChatCompletionsReqId] proxy_req_id=%s", req_id)
+
         e_urls = app.state.e_urls  # we want the full list for fan-out
         p_url = random.choice(app.state.p_urls) if app.state.p_urls else None
         d_url = random.choice(app.state.d_urls)
 
         is_streaming = req_data.get("stream", False)
 
+        # Echo the request id back to the client so benchmarks /
+        # tracing tools can correlate the client-side TTFT with E and P
+        # worker logs (which use this same id when
+        # --enable-request-id-headers is set).
+        response_headers = {"x-request-id": req_id}
+
         if is_streaming:
             return StreamingResponse(
                 forward_stream(req_data, req_id, e_urls, p_url, d_url),
                 media_type="text/event-stream",
+                headers=response_headers,
             )
         result = await forward_non_stream(req_data, req_id, e_urls, p_url, d_url)
-        return JSONResponse(content=result)
+        return JSONResponse(content=result, headers=response_headers)
 
     except HTTPException:
         raise
@@ -453,6 +466,21 @@ async def health_check():
         },
         status_code=status_code,
     )
+
+
+@app.post("/reset_encoder_cache")
+async def reset_encoder_cache():
+    """Reset encoder cache on all encode workers."""
+    for u in app.state.e_urls:
+        try:
+            async with encode_session.post(
+                f"{u}/reset_encoder_cache"
+            ) as resp:
+                resp.raise_for_status()
+        except Exception as e:
+            logger.error("Failed to reset encoder cache on %s: %s", u, e)
+            return JSONResponse({"error": str(e)}, status_code=502)
+    return JSONResponse({"status": "ok"})
 
 
 ###############################################################################

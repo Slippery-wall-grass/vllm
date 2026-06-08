@@ -27,3 +27,14 @@ async def health(raw_request: Request) -> Response:
         return Response(status_code=200)
     except EngineDeadError:
         return Response(status_code=503)
+
+
+@router.post("/reset_encoder_cache", response_class=Response)
+async def reset_encoder_cache(raw_request: Request) -> Response:
+    """Reset the encoder cache, evicting all cached encoder outputs."""
+    try:
+        await engine_client(raw_request).reset_encoder_cache()
+        return Response(status_code=200)
+    except Exception as e:
+        logger.error("Failed to reset encoder cache: %s", e)
+        return Response(status_code=500)

@@ -244,6 +244,11 @@ if TYPE_CHECKING:
     VLLM_CUDA_COMPATIBILITY_PATH: str | None = None
     VLLM_ELASTIC_EP_SCALE_UP_LAUNCH: bool = False
     VLLM_ELASTIC_EP_DRAIN_REQUESTS: bool = False
+    VLLM_ENCODER_CACHE_POLICY: str = "fifo"
+    VLLM_ENCODER_CACHE_CONFIG_PATH: str | None = None
+    VLLM_ENCODER_CACHE_TRACE: bool = False
+    VLLM_REQUEST_TIMING_TRACE: bool = False
+    VLLM_EC_DELETE_AFTER_LOAD: bool = False
 
 
 def get_default_cache_root():
@@ -1628,6 +1633,49 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ELASTIC_EP_DRAIN_REQUESTS": lambda: bool(
         int(os.getenv("VLLM_ELASTIC_EP_DRAIN_REQUESTS", "0"))
     ),
+    # Encoder cache replacement policy. One of:
+    #   "fifo"               - default LRU/FIFO eviction
+    #   "none"               - disable caching (entries freed immediately
+    #                          when no request references them)
+    #   "distribution_aware" - distribution-aware eviction; requires
+    #                          VLLM_ENCODER_CACHE_CONFIG_PATH
+    "VLLM_ENCODER_CACHE_POLICY": lambda: os.getenv(
+        "VLLM_ENCODER_CACHE_POLICY", "fifo"
+    ).lower(),
+    # Path to a JSON config file for the distribution-aware encoder cache.
+    "VLLM_ENCODER_CACHE_CONFIG_PATH": lambda: os.getenv(
+        "VLLM_ENCODER_CACHE_CONFIG_PATH", None
+    ),
+    # When set to "1"/"true", EncoderCacheManager.check_and_update_cache
+    # logs one INFO line per call ("EncoderCacheTrace ..."), enabling
+    # benchmarks to reconstruct per-request hit/miss curves. Off by
+    # default since it produces one log line per multimodal item.
+    "VLLM_ENCODER_CACHE_TRACE": lambda: os.getenv(
+        "VLLM_ENCODER_CACHE_TRACE", "0"
+    ).lower() in ("1", "true", "yes"),
+    # When set, emits per-request phase timing log lines on encoder
+    # ("EncoderForwardTrace req_id=... duration_ms=...") and prefill
+    # ("RequestPhases req_id=... arrival=... queued_ms=... "
+    # "prefill_ms=... first_token_latency_ms=...") sides so a benchmark
+    # can break TTFT into network / queue / encoder forward / prefill /
+    # decode components per request. One line per phase per request —
+    # not free at high QPS but cheap below ~100 req/s.
+    "VLLM_REQUEST_TIMING_TRACE": lambda: os.getenv(
+        "VLLM_REQUEST_TIMING_TRACE", "0"
+    ).lower() in ("1", "true", "yes"),
+    # When set, the EC connector consumer (prefill side in disagg E/P)
+    # deletes each encoder-cache file from shared storage immediately
+    # after loading it. This degrades the EC connector from a
+    # "persistent shared cache" to a one-shot transfer channel — so the
+    # encoder vLLM engine actually has to re-run encoder forward when
+    # its in-memory EncoderCacheManager misses, instead of being
+    # silently rescued by leftover files in /dev/shm. Useful for
+    # benchmarking different VLLM_ENCODER_CACHE_POLICY values, since
+    # otherwise the persistent file cache dominates and policies look
+    # identical.
+    "VLLM_EC_DELETE_AFTER_LOAD": lambda: os.getenv(
+        "VLLM_EC_DELETE_AFTER_LOAD", "0"
+    ).lower() in ("1", "true", "yes"),
 }
 
 

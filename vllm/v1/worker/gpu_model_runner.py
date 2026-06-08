@@ -6259,7 +6259,18 @@ class GPUModelRunner(
             current_item_idx: Starting index for this group
             num_items: Number of items in this group
         """
-        if not should_time:
+        # Two independent flags can request timing:
+        #   should_time              — set when enable_mm_processor_stats=True;
+        #                               populates the encoder_timing_registry
+        #                               for periodic stat aggregation.
+        #   VLLM_REQUEST_TIMING_TRACE — used by benchmarks to log per-call
+        #                               EncoderForwardTrace lines.
+        # Either one alone is enough to do timing. Without my fix the
+        # function early-returned when should_time was False and the
+        # benchmark's trace log never fired even with the env var set.
+        import vllm.envs as envs
+        timing_trace = envs.VLLM_REQUEST_TIMING_TRACE
+        if not should_time and not timing_trace:
             yield
             return
 
@@ -6277,14 +6288,31 @@ class GPUModelRunner(
 
             per_request_time = elapsed / max(len(group_request_ids), 1)
 
-            with self._encoder_timing_lock:
-                for req_id in group_request_ids:
-                    if req_id not in self.encoder_timing_registry:
-                        self.encoder_timing_registry[req_id] = EncoderTimingStats()
+            # Only update the registry when stats collection was actually
+            # requested; otherwise we'd accumulate per-request entries
+            # nobody ever drains.
+            if should_time:
+                with self._encoder_timing_lock:
+                    for req_id in group_request_ids:
+                        if req_id not in self.encoder_timing_registry:
+                            self.encoder_timing_registry[req_id] = (
+                                EncoderTimingStats()
+                            )
+                        stats = self.encoder_timing_registry[req_id]
+                        stats.encoder_forward_secs += per_request_time
+                        stats.num_encoder_calls += 1
 
-                    stats = self.encoder_timing_registry[req_id]
-                    stats.encoder_forward_secs += per_request_time
-                    stats.num_encoder_calls += 1
+            # Per-call benchmark log. Cache HITs don't call
+            # _execute_mm_encoder, so the absence of this line for a
+            # given req_id implies "encoder skipped — cache hit".
+            if timing_trace:
+                logger.info(
+                    "EncoderForwardTrace req_ids=%s num_items=%d "
+                    "duration_ms=%.3f per_request_ms=%.3f",
+                    ",".join(sorted(group_request_ids)),
+                    num_items, elapsed * 1000.0,
+                    per_request_time * 1000.0,
+                )
 
 
 @dataclass

@@ -73,6 +73,7 @@ class ECExampleConnector(ECConnectorBase):
                 data hashes (`mm_hash`) to encoder cache tensors.
             kwargs (dict): Additional keyword arguments for the connector.
         """
+        import vllm.envs as envs
         from vllm.platforms import current_platform
 
         # Get the metadata
@@ -85,6 +86,7 @@ class ECExampleConnector(ECConnectorBase):
             )
             return
         # Load the EC for each mm data
+        delete_after_load = envs.VLLM_EC_DELETE_AFTER_LOAD
         for mm_data in metadata.mm_datas:
             if mm_data.mm_hash in encoder_cache:
                 continue
@@ -94,6 +96,30 @@ class ECExampleConnector(ECConnectorBase):
             )["ec_cache"]
             encoder_cache[mm_data.mm_hash] = ec_cache
             logger.debug("Success load encoder cache for hash %s", mm_data.mm_hash)
+
+            # Optionally delete the file so subsequent encoder-side
+            # has_cache_item() lookups miss and the encoder actually
+            # re-runs forward (subject to its in-memory cache policy).
+            # Without this, EC connector files persist forever and
+            # silently rescue every miss — making different
+            # VLLM_ENCODER_CACHE_POLICY values indistinguishable in
+            # benchmarks.
+            if delete_after_load:
+                try:
+                    os.remove(filename)
+                    # Best-effort folder cleanup; ignore non-empty
+                    foldername = os.path.dirname(filename)
+                    try:
+                        os.rmdir(foldername)
+                    except OSError:
+                        pass
+                except FileNotFoundError:
+                    # Another worker may have already deleted it.
+                    pass
+                except OSError as e:
+                    logger.debug(
+                        "Could not delete EC file %s: %s", filename, e,
+                    )
 
     def save_caches(self, encoder_cache, mm_hash, **kwargs) -> None:
         """
