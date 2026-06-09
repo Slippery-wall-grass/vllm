@@ -72,6 +72,9 @@ _STAGE_FIELDS = {
     "stage_prefill_tokens": r"prefill_tokens=(\d+)",
     "stage_decode_tokens": r"decode_tokens=(\d+)",
     "stage_mixed_steps": r"mixed_steps=(\d+)",
+    # Cumulative request preemptions. >0 means prompts are being recomputed
+    # under KV-cache pressure (extra prefill work). Absent in older logs.
+    "stage_preempted_reqs": r"preempted_reqs=(\d+)",
 }
 
 
@@ -231,6 +234,7 @@ def collect_rows(result_dir: Path) -> tuple[list[dict[str, Any]], dict[tuple[str
         "stage_mixed_steps",
         "stage_prefill_tokens",
         "stage_decode_tokens",
+        "stage_preempted_reqs",
     ]
     for policy in policies:
         prev = {k: 0 for k in cumulative_keys}

@@ -655,6 +655,13 @@ class GPUModelRunner(
         self._cumulative_mixed_steps: int = 0
         self._cumulative_prefill_tokens: int = 0
         self._cumulative_decode_tokens: int = 0
+        # Number of request preemptions observed. V1 preempts under KV-cache
+        # pressure and later *recomputes* the preempted request's prompt, so a
+        # non-zero value here means prompts are being re-prefilled (extra work
+        # that lands in the prefill bucket, not decode). Lets the eval rule out
+        # the "decode is recomputing prefill" hypothesis: if this stays 0, the
+        # high decode share is step-count/efficiency, not recompute.
+        self._cumulative_preempted_reqs: int = 0
         self._last_step_time_log_ts: float = time.monotonic()
 
         # Persistent buffers for CUDA graphs.
@@ -3746,6 +3753,9 @@ class GPUModelRunner(
                             self._cumulative_mixed_steps += 1
                     else:
                         self._cumulative_decode_steps += 1
+                    preempted = scheduler_output.preempted_req_ids
+                    if preempted:
+                        self._cumulative_preempted_reqs += len(preempted)
 
                 if self._step_time_log_interval > 0:
                     now = time.monotonic()
@@ -3759,7 +3769,7 @@ class GPUModelRunner(
                             "decode_secs=%.4f encoder_forwards=%d "
                             "prefill_steps=%d decode_steps=%d "
                             "prefill_tokens=%d decode_tokens=%d "
-                            "mixed_steps=%d",
+                            "mixed_steps=%d preempted_reqs=%d",
                             self._cumulative_encoder_forward_secs,
                             self._cumulative_prefill_step_secs,
                             self._cumulative_decode_step_secs,
@@ -3769,6 +3779,7 @@ class GPUModelRunner(
                             self._cumulative_prefill_tokens,
                             self._cumulative_decode_tokens,
                             self._cumulative_mixed_steps,
+                            self._cumulative_preempted_reqs,
                         )
                         self._last_step_time_log_ts = now
 
