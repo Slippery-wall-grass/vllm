@@ -43,6 +43,10 @@ _FIELDS = {
     "evictable": r"evictable_tokens=(\d+)",
     "capacity": r"capacity=(\d+)",
 }
+# Encoder-cache reset (e.g. prewarm --reset-after via POST /reset_encoder_cache)
+# zeroes the cache instantly. Detected so the plot can show the true drop
+# instead of interpolating a misleading ramp across the idle gap that follows.
+_RESET_RX = re.compile(r"Resetting encoder cache")
 
 
 def _ts_seconds(m: re.Match) -> float:
@@ -56,30 +60,56 @@ def _ts_seconds(m: re.Match) -> float:
 
 
 def parse_log(path: Path) -> dict[str, list[float]]:
-    """Extract the occupancy trajectory from one server log."""
-    t: list[float] = []
-    ref: list[float] = []
-    pin: list[float] = []
-    evi: list[float] = []
-    cap: list[float] = []
-    t0: float | None = None
+    """Extract the occupancy trajectory (and reset events) from one log.
+
+    A synthetic all-zero sample is injected at each reset that falls within
+    the trajectory, so the stacked area shows the instantaneous drop to 0
+    rather than a straight line interpolated across the post-reset idle gap.
+    """
+    samples: list[tuple[float, float, float, float, float]] = []
+    reset_abs: list[float] = []
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
+            tm = _TS_RX.search(line)
+            if _RESET_RX.search(line):
+                if tm is not None:
+                    reset_abs.append(_ts_seconds(tm))
+                continue
             if "encoder_cache " not in line or "referenced_tokens=" not in line:
                 continue
-            tm = _TS_RX.search(line)
             vals = {k: re.search(p, line) for k, p in _FIELDS.items()}
             if tm is None or not all(vals.values()):
                 continue
-            secs = _ts_seconds(tm)
-            if t0 is None:
-                t0 = secs
-            t.append(secs - t0)
-            ref.append(float(vals["referenced"].group(1)))
-            pin.append(float(vals["pinned"].group(1)))
-            evi.append(float(vals["evictable"].group(1)))
-            cap.append(float(vals["capacity"].group(1)))
-    return {"t": t, "referenced": ref, "pinned": pin, "evictable": evi, "cap": cap}
+            samples.append(
+                (
+                    _ts_seconds(tm),
+                    float(vals["referenced"].group(1)),
+                    float(vals["pinned"].group(1)),
+                    float(vals["evictable"].group(1)),
+                    float(vals["capacity"].group(1)),
+                )
+            )
+    if not samples:
+        return {"t": [], "referenced": [], "pinned": [], "evictable": [],
+                "cap": [], "resets": []}
+
+    t0 = samples[0][0]
+    cap_val = samples[-1][4]
+    # Inject a zero-occupancy sample at each in-window reset so the stack
+    # truly drops to 0 there instead of being interpolated over.
+    for r in reset_abs:
+        if t0 <= r <= samples[-1][0]:
+            samples.append((r, 0.0, 0.0, 0.0, cap_val))
+    samples.sort(key=lambda s: s[0])
+
+    return {
+        "t": [s[0] - t0 for s in samples],
+        "referenced": [s[1] for s in samples],
+        "pinned": [s[2] for s in samples],
+        "evictable": [s[3] for s in samples],
+        "cap": [s[4] for s in samples],
+        "resets": [r - t0 for r in reset_abs if t0 <= r <= samples[-1][0]],
+    }
 
 
 def main() -> None:
@@ -123,6 +153,15 @@ def main() -> None:
         cap = s["cap"][-1] if s["cap"] else None
         if cap:
             ax.axhline(cap, ls="--", lw=1.2, color="black", label=f"capacity={int(cap)}")
+        for i, r in enumerate(s.get("resets", [])):
+            ax.axvline(
+                r,
+                ls=":",
+                lw=1.3,
+                color="red",
+                alpha=0.8,
+                label="cache reset" if i == 0 else None,
+            )
         ax.set_title(f"Encoder-cache token occupancy — {label}")
         ax.set_ylabel("encoder tokens")
         ax.legend(loc="upper left", fontsize=8, ncol=2)
