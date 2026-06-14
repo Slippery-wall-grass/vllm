@@ -69,6 +69,21 @@ class EncoderCachePolicy(abc.ABC):
         immediately evictable (not pinned).
         """
 
+    def eviction_value(self, mm_hash: str, num_embeds: int) -> float:
+        """Relative worth of KEEPING this freeable entry cached.
+
+        Consulted by the manager only on the *forced* eviction path — when
+        every freeable entry is pinned and space is still needed, so one
+        pinned entry must be given up. The manager force-evicts the entry
+        with the LOWEST value first (ties broken by FIFO insertion order).
+
+        The default returns 0.0 for every entry, which makes the manager
+        fall back to pure FIFO order (legacy behavior). Policies that know
+        per-type reuse/recompute statistics should override this so the
+        cheapest-to-lose entry is dropped instead of the oldest.
+        """
+        return 0.0
+
     def reset(self) -> None:
         """Override to clear policy-local state when the manager
         resets (e.g. after model weight reload)."""
@@ -200,6 +215,25 @@ class OfflineLagrangianEncoderCachePolicy(EncoderCachePolicy):
         if entry.m * self._lambda * d - entry.c < 0:
             return current_tick + entry.unlock_horizon
         return 0
+
+    def eviction_value(self, mm_hash: str, num_embeds: int) -> float:
+        """Worth of keeping a pinned entry, used on the forced-eviction
+        path. Defined as the expected encoder-recompute savings per unit of
+        cache memory:
+
+            value_i = p_i * c_i / m_i
+
+        i.e. (reuse probability) x (compute saved per reuse) normalized by
+        the embedding tokens it occupies. Force-evicting the lowest-value
+        entry frees the needed space at the least expected recompute cost,
+        instead of blindly dropping the FIFO-front entry (which may be a hot,
+        expensive-to-recompute image). Unknown / novel hashes are not in the
+        pool and are treated as worthless to keep (one-off, never reused).
+        """
+        entry = self._pool.get(mm_hash)
+        if entry is None or entry.m <= 0.0:
+            return 0.0
+        return entry.p * entry.c / entry.m
 
     def reset(self) -> None:
         self._rng = random.Random(self._seed)

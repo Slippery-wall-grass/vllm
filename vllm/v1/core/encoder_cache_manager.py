@@ -254,14 +254,34 @@ class EncoderCacheManager:
     def _select_eviction_candidate(self, forced: bool) -> Optional[str]:
         """Pick the next mm_hash to evict from the freeable queue.
 
-        With ``forced=False`` skips entries whose unlock tick is in the
-        future. With ``forced=True`` ignores pinning entirely, falling
-        back to FIFO order over the freeable queue.
+        With ``forced=False`` evicts the FIFO-front *unpinned* entry,
+        skipping entries whose unlock tick is still in the future. Returns
+        ``None`` when every freeable entry is pinned.
+
+        With ``forced=True`` every freeable entry is pinned and one must be
+        given up. Rather than blindly dropping the FIFO-front entry (which
+        may be a hot, expensive-to-recompute image), evict the entry the
+        policy values least — ``policy.eviction_value`` — so we free space
+        at the lowest expected recompute cost. Ties are broken by FIFO
+        insertion order (the earliest-inserted of the cheapest entries is
+        evicted first). For policies that do not override ``eviction_value``
+        (FIFO/no-cache) every value is 0.0, so this reduces to FIFO order
+        and the legacy behavior is preserved.
         """
-        for mm_hash in self.freeable:
-            if forced or self._unlock_tick.get(mm_hash, 0) <= self.current_tick:
-                return mm_hash
-        return None
+        if not forced:
+            for mm_hash in self.freeable:
+                if self._unlock_tick.get(mm_hash, 0) <= self.current_tick:
+                    return mm_hash
+            return None
+
+        best_hash: Optional[str] = None
+        best_value = float("inf")
+        for mm_hash, num_embeds in self.freeable.items():
+            value = self.policy.eviction_value(mm_hash, num_embeds)
+            if value < best_value:
+                best_value = value
+                best_hash = mm_hash
+        return best_hash
 
     def _evict(self, mm_hash: str) -> None:
         """Physically evict an entry from the cache bookkeeping."""

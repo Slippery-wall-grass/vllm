@@ -207,6 +207,40 @@ def test_forced_unpin_eviction_when_all_pinned():
     assert "C" in mgr.cached
 
 
+class _ValuedPinPolicy(EncoderCachePolicy):
+    """Test double: pins every arrival and exposes a per-hash keep-value so
+    the forced-eviction path drops the least valuable entry, not FIFO-front."""
+
+    def __init__(self, horizon: int, values: dict[str, float]):
+        self.horizon = horizon
+        self._values = values
+
+    def on_arrival(self, mm_hash, num_embeds, current_tick):
+        return self.horizon
+
+    def eviction_value(self, mm_hash, num_embeds):
+        return self._values.get(mm_hash, 0.0)
+
+
+def test_forced_eviction_drops_least_valuable_not_fifo_front():
+    # A is the FIFO-front but the most valuable to keep; B is cheapest.
+    # The forced path must drop B, not A (the legacy FIFO-front choice).
+    values = {"A": 1.0, "B": 0.1}
+    mgr = EncoderCacheManager(
+        cache_size=8, policy=_ValuedPinPolicy(horizon=10_000, values=values)
+    )
+    _alloc_and_release(mgr, "r1", "A", 4)
+    _alloc_and_release(mgr, "r2", "B", 4)
+    req = MockRequest("r3", ["C"], [4])
+    assert mgr.can_allocate(req, 0, int(1e9), 0)
+    mgr.allocate(req, 0)
+    assert mgr.forced_unpin_evictions == 1
+    # B (lowest value) is evicted even though A is the FIFO-front.
+    assert "A" in mgr.cached
+    assert "B" not in mgr.cached
+    assert "C" in mgr.cached
+
+
 # ---------------------------------------------------------------------------
 # No-cache policy
 # ---------------------------------------------------------------------------
