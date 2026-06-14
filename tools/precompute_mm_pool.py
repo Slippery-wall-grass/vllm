@@ -710,10 +710,22 @@ def cmd_solve(args: argparse.Namespace) -> None:
             "pool_spec.json has types without measured m_tokens/c_seconds. "
             "Run the 'measure' subcommand first."
         )
-    lam, dual_opt = solve_lambda_star(types, args.cache_capacity)
+    # The Lagrangian drives the *time-average* pinned memory up to the
+    # capacity it is solved against (the constraint is active when M > B).
+    # Solving against the full physical B therefore parks the average pin
+    # occupancy right at B, so instantaneous fluctuation routinely overshoots
+    # the hard cap and triggers forced-unpin evictions. Solving against an
+    # *effective* capacity B_eff = B * (1 - pin_margin) leaves a green
+    # evictable buffer of width ~pin_margin*B, so the average sits below B and
+    # the fluctuation no longer hits the ceiling. pin_margin=0 reproduces the
+    # original behavior.
+    margin = max(0.0, min(0.95, float(args.pin_margin)))
+    effective_capacity = args.cache_capacity * (1.0 - margin)
+    lam, dual_opt = solve_lambda_star(types, effective_capacity)
     print(
         f"solved lambda*={lam:.6g}, D(lambda*)={dual_opt:.6g} "
-        f"(capacity={args.cache_capacity}, K={len(types)})"
+        f"(capacity={args.cache_capacity}, pin_margin={margin:.3g}, "
+        f"effective_capacity={effective_capacity:.6g}, K={len(types)})"
     )
     if args.dump_dual_curve:
         # Helpful sanity-check dump: D(lambda) on a log grid.
@@ -722,7 +734,10 @@ def cmd_solve(args: argparse.Namespace) -> None:
         else:
             grid = [10.0 ** k for k in range(-10, 0)]
         for g in grid:
-            print(f"  lambda={g:.6g}  D={dual_value(types, args.cache_capacity, g):.6g}")
+            print(
+                f"  lambda={g:.6g}  "
+                f"D={dual_value(types, effective_capacity, g):.6g}"
+            )
 
     entries: dict[str, dict[str, Any]] = {}
     for t_raw, t in zip(types_raw, types):
@@ -739,6 +754,8 @@ def cmd_solve(args: argparse.Namespace) -> None:
                 "version": 1,
                 "lambda_star": lam,
                 "cache_capacity": args.cache_capacity,
+                "pin_margin": margin,
+                "effective_capacity": effective_capacity,
                 "entries": entries,
             },
             f,
@@ -891,6 +908,17 @@ def main() -> None:
         type=float,
         required=True,
         help="Encoder cache capacity in encoder embedding tokens (B).",
+    )
+    ps.add_argument(
+        "--pin-margin",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of capacity [0,0.95) held back as an evictable buffer. "
+            "lambda* is solved against B_eff = B*(1-margin) so the time-average "
+            "pinned occupancy sits below B, leaving headroom that drives "
+            "forced-unpin evictions toward 0. Default 0.0 (solve against full B)."
+        ),
     )
     ps.add_argument("--dump-dual-curve", action="store_true")
     ps.set_defaults(func=cmd_solve)

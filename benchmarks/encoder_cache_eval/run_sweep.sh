@@ -84,6 +84,12 @@ SERVER_EXTRA_ARGS=${SERVER_EXTRA_ARGS:-}
 
 # Solver
 CACHE_CAPACITY=${CACHE_CAPACITY:-}   # auto-detected from server log if empty
+# Fraction of capacity held back as an evictable buffer when solving lambda*.
+# The offline policy drives time-average pinned memory up to whatever capacity
+# lambda* was solved against; solving against B*(1-PIN_MARGIN) leaves headroom
+# so instantaneous fluctuation stops hitting the hard cap -> forced_unpin -> 0.
+# 0.0 = original behavior (solve against full B).
+PIN_MARGIN=${PIN_MARGIN:-0.0}
 
 POLICIES=${POLICIES:-"fifo nocache offline"}
 STATS_INTERVAL_SEC=${STATS_INTERVAL_SEC:-5}
@@ -324,9 +330,9 @@ fi
 # Stage 3: solve lambda*
 # ---------------------------------------------------------------------------
 if [ ! -f "$POOL_DIR/mm_pool.json" ]; then
-  log "solving lambda* with B=$CACHE_CAPACITY"
+  log "solving lambda* with B=$CACHE_CAPACITY pin_margin=$PIN_MARGIN"
   python "$REPO_ROOT/tools/precompute_mm_pool.py" --pool-dir "$POOL_DIR" solve \
-    --cache-capacity "$CACHE_CAPACITY" --dump-dual-curve \
+    --cache-capacity "$CACHE_CAPACITY" --pin-margin "$PIN_MARGIN" --dump-dual-curve \
     | tee "$RESULT_DIR/lambda_solve.log"
 else
   log "reusing existing lambda* in mm_pool.json"
