@@ -441,7 +441,9 @@ class EncoderCacheManager:
             pool_suffix = f" pool_known={known} pool_unknown={unknown}"
         logger.info(
             "encoder_cache policy=%s hits=%d misses=%d hit_rate=%.4f "
-            "forced_unpin=%d pinned=%d freeable=%d free_slots=%d%s",
+            "forced_unpin=%d pinned=%d freeable=%d free_slots=%d "
+            "referenced_tokens=%d pinned_tokens=%d evictable_tokens=%d "
+            "free_tokens=%d capacity=%d%s",
             stats["policy"],
             stats["hits"],
             stats["misses"],
@@ -450,12 +452,40 @@ class EncoderCacheManager:
             stats["num_pinned"],
             stats["num_freeable"],
             stats["num_free_slots"],
+            stats["referenced_tokens"],
+            stats["pinned_tokens"],
+            stats["evictable_tokens"],
+            stats["free_tokens"],
+            stats["capacity"],
             pool_suffix,
         )
 
     def get_stats(self) -> dict[str, int | float | str]:
-        """Snapshot of cumulative cache metrics for benchmarking."""
+        """Snapshot of cumulative cache metrics for benchmarking.
+
+        Also reports the instantaneous *token* occupancy split into three
+        mutually exclusive buckets that tile the capacity:
+
+        - ``referenced_tokens``: entries still referenced by an in-flight
+          request (refcount > 0); cannot be evicted.
+        - ``pinned_tokens``: unreferenced (freeable) entries the policy
+          still protects (``unlock_tick > current_tick``) — "kept because
+          the policy judges them valuable".
+        - ``evictable_tokens``: unreferenced freeable entries past their
+          unlock tick — droppable right now.
+
+        ``referenced + pinned + evictable + free_tokens == capacity``.
+        """
         total = self.hits + self.misses
+        num_pinned = 0
+        pinned_tokens = 0
+        for mm_hash, num_embeds in self.freeable.items():
+            if self._unlock_tick.get(mm_hash, 0) > self.current_tick:
+                num_pinned += 1
+                pinned_tokens += num_embeds
+        referenced_tokens = self.cache_size - self.num_freeable_slots
+        freeable_tokens = self.num_freeable_slots - self.num_free_slots
+        evictable_tokens = freeable_tokens - pinned_tokens
         return {
             "policy": type(self.policy).__name__,
             "hits": self.hits,
@@ -463,13 +493,14 @@ class EncoderCacheManager:
             "arrivals": total,
             "hit_rate": (self.hits / total) if total else 0.0,
             "forced_unpin_evictions": self.forced_unpin_evictions,
-            "num_pinned": sum(
-                1
-                for mm_hash in self.freeable
-                if self._unlock_tick.get(mm_hash, 0) > self.current_tick
-            ),
+            "num_pinned": num_pinned,
             "num_freeable": len(self.freeable),
             "num_free_slots": self.num_free_slots,
+            "referenced_tokens": referenced_tokens,
+            "pinned_tokens": pinned_tokens,
+            "evictable_tokens": evictable_tokens,
+            "free_tokens": self.num_free_slots,
+            "capacity": self.cache_size,
         }
 
 
