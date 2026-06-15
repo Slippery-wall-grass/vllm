@@ -133,9 +133,12 @@ start_server() {
   SERVER_PIDFILE=$pidfile
   log "starting server policy=$policy log=$logfile"
 
-  local ec_size_arg=""
+  # encoder_cache_size is not a vLLM CLI flag (it defaults to
+  # max_num_batched_tokens). Decouple B from the per-step token budget via
+  # the VLLM_ENCODER_CACHE_SIZE env var (read in SchedulerConfig.__post_init__).
+  local ec_size_env=""
   if [ -n "$ENCODER_CACHE_SIZE" ]; then
-    ec_size_arg="--encoder-cache-size $ENCODER_CACHE_SIZE"
+    ec_size_env="VLLM_ENCODER_CACHE_SIZE=$ENCODER_CACHE_SIZE"
   fi
 
   local eager_arg=""
@@ -169,6 +172,7 @@ start_server() {
         VLLM_TRACK_STEP_TIME=1 \
         VLLM_STEP_TIME_LOG_INTERVAL_SEC="$STATS_INTERVAL_SEC" \
         VLLM_SERVER_DEV_MODE=1 \
+        $ec_size_env \
         $env_extra \
         nohup vllm serve "$MODEL" \
           --host "$HOST" --port "$PORT" \
@@ -177,7 +181,6 @@ start_server() {
           --max-model-len "$MAX_MODEL_LEN" \
           $gpu_mem_arg \
           $eager_arg \
-          $ec_size_arg \
           $mm_proc_arg \
           $SERVER_EXTRA_ARGS \
           > "$logfile" 2>&1 &

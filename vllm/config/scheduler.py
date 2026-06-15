@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from dataclasses import InitVar
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
@@ -226,6 +227,27 @@ class SchedulerConfig:
 
         self.max_num_encoder_input_tokens = self.max_num_batched_tokens
         self.encoder_cache_size = self.max_num_batched_tokens
+        # The encoder cache size is not yet a first-class CLI/config field
+        # (see the field's TODO); it defaults to max_num_batched_tokens. Allow
+        # decoupling it via an env var so encoder-cache-policy studies can vary
+        # the cache capacity B without also changing the per-step token budget.
+        _ecs = os.environ.get("VLLM_ENCODER_CACHE_SIZE")
+        if _ecs:
+            try:
+                _ecs_val = int(_ecs)
+            except ValueError:
+                logger.warning(
+                    "Ignoring non-integer VLLM_ENCODER_CACHE_SIZE=%r", _ecs
+                )
+            else:
+                if _ecs_val > 0:
+                    self.encoder_cache_size = _ecs_val
+                    logger.info(
+                        "Overriding encoder_cache_size from "
+                        "VLLM_ENCODER_CACHE_SIZE=%d (max_num_batched_tokens=%d)",
+                        _ecs_val,
+                        self.max_num_batched_tokens,
+                    )
 
         if self.enable_chunked_prefill:
             logger.info(
