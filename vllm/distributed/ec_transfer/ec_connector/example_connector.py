@@ -132,6 +132,28 @@ class ECExampleConnector(ECConnectorBase):
         """
         return self._found_match_for_mm_data(identifier)
 
+    def delete_caches(self, mm_hashes: list[str]) -> None:
+        """Remove persisted embeddings for evicted mm_hashes (producer only).
+
+        Makes the shared store track the encoder-cache policy instead of
+        growing append-only; see ECConnectorBase.delete_caches.
+        """
+        if not self.is_producer:
+            return
+        for mm_hash in mm_hashes:
+            foldername = self._generate_foldername_debug(mm_hash, create_folder=False)
+            filename = os.path.join(foldername, "encoder_cache.safetensors")
+            try:
+                if os.path.exists(filename):
+                    os.remove(filename)
+                if os.path.isdir(foldername):
+                    os.rmdir(foldername)
+                logger.debug("Deleted shared-store cache for mm_hash %s", mm_hash)
+            except OSError as e:
+                logger.warning(
+                    "Failed to delete shared-store cache for %s: %s", mm_hash, e
+                )
+
     def update_state_after_alloc(
         self,
         request: "Request",

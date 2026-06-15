@@ -915,6 +915,16 @@ class Scheduler(SchedulerInterface):
                 scheduler_output
             )
             scheduler_output.ec_connector_metadata = ec_meta
+            # Propagate encoder-cache policy evictions to the external store so
+            # the policy actually governs encode load. Without this the store is
+            # append-only (has_cache_item stays True forever), the producer
+            # never re-encodes, and fifo/offline/nocache become identical. The
+            # evicted hashes are unreferenced and their transfer is complete, so
+            # deletion is safe (a later request re-encodes as a normal miss).
+            if scheduler_output.free_encoder_mm_hashes:
+                self.ec_connector.delete_caches(
+                    scheduler_output.free_encoder_mm_hashes
+                )
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)

@@ -213,6 +213,23 @@ class ECConnectorBase(ABC):
         """
         pass
 
+    def delete_caches(self, mm_hashes: list[str]) -> None:
+        """Delete persisted encoder caches for the given mm_hashes.
+
+        Called on the producer when the encoder-cache *policy* evicts entries
+        (the scheduler's ``get_freed_mm_hashes``). Without this, a store-backed
+        connector is append-only: ``has_cache_item`` stays True forever, so the
+        producer never re-encodes and every eviction policy behaves identically.
+        Propagating evictions to the store makes the policy actually govern
+        encode load. Entries surfaced by the policy are already unreferenced and
+        their in-flight transfer is complete (see ``request_finished`` /
+        ``get_finished``), so deletion is safe; a later request for a deleted
+        hash is simply a cache miss that re-encodes.
+
+        Default is a no-op for connectors with no external store.
+        """
+        return
+
     @abstractmethod
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
