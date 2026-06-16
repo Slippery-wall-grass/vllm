@@ -526,7 +526,7 @@ start_1e1p1d() {
         p_urls_csv=$(IFS=,; echo "${PREFILL_URLS[*]}")
     fi
     d_urls_csv=$(IFS=,; echo "${DECODE_URLS[*]}")
-    python "${GIT_ROOT}/examples/online_serving/disaggregated_encoder/disagg_epd_proxy.py" \
+    python "${GIT_ROOT}/examples/disaggregated/disaggregated_encoder/disagg_epd_proxy.py" \
         --host "0.0.0.0" \
         --port "$PROXY_PORT" \
         --encode-servers-urls "http://localhost:$ENCODE_PORT" \
