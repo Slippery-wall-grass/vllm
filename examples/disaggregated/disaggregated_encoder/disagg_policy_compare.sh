@@ -32,7 +32,13 @@ GIT_ROOT=$(git rev-parse --show-toplevel)
 # Config (override via env) -- request knobs mirror run_sweep.sh
 ###############################################################################
 MODEL="${MODEL:-Qwen/Qwen2.5-VL-3B-Instruct}"   # small LLM => encode-heavier
-HOST="${HOST:-127.0.0.1}"
+# Read SERVE_HOST, NOT HOST: conda compiler activation exports
+# HOST=x86_64-conda-linux-gnu, which is not a bindable address and makes
+# `vllm serve --host` fail with socket.gaierror. Decouple from it.
+HOST="${SERVE_HOST:-127.0.0.1}"
+# Dev routes (/reset_encoder_cache) are required by the c_i measurement and
+# the per-RPS cache reset between bench runs; enable by default.
+export VLLM_SERVER_DEV_MODE="${VLLM_SERVER_DEV_MODE:-1}"
 RESULT_DIR="${RESULT_DIR:-$(pwd)/disagg_policy_$(date +%Y%m%d_%H%M%S)}"
 POOL_DIR="${POOL_DIR:-$RESULT_DIR/pool}"
 
@@ -181,7 +187,8 @@ start_disagg() {
       vllm serve "$MODEL" \
         --host "$HOST" --port "$ENCODE_PORT" \
         --gpu-memory-utilization "$GPU_MEM_UTIL_E" \
-        --enforce-eager --enable-request-id-headers --no-enable-prefix-caching \
+        --enforce-eager --no-async-scheduling \
+        --enable-request-id-headers --no-enable-prefix-caching \
         --max-num-batched-tokens 114688 \
         --max-num-seqs "$ENCODE_MAX_NUM_SEQS" \
         --allowed-local-media-path "${GIT_ROOT}/tests/v1/ec_connector/integration" \
@@ -195,7 +202,7 @@ start_disagg() {
         --host "$HOST" --port "$PD_PORT" \
         --gpu-memory-utilization "$GPU_MEM_UTIL_PD" \
         --max-model-len "$MAX_MODEL_LEN" \
-        --enforce-eager --enable-request-id-headers \
+        --enforce-eager --no-async-scheduling --enable-request-id-headers \
         --max-num-seqs "$PD_MAX_NUM_SEQS" \
         --allowed-local-media-path "${GIT_ROOT}/tests/v1/ec_connector/integration" \
         "${PROC_ARG[@]}" \
@@ -258,4 +265,26 @@ for policy in $POLICIES; do
 done
 
 log "done. results in $RESULT_DIR"
-log "aggregate with: python $GIT_ROOT/benchmarks/encoder_cache_eval/aggregate.py $RESULT_DIR/runs"
+
+# ── Aggregate + plot (set SKIP_AGGREGATE=1 to skip) ─────────────────────────
+AGG="$GIT_ROOT/benchmarks/encoder_cache_eval/aggregate.py"
+if [ "${SKIP_AGGREGATE:-0}" = "1" ]; then
+  log "SKIP_AGGREGATE=1 — aggregate manually:"
+  log "  python $AGG --result-dir $RESULT_DIR/runs --pool-spec $POOL_DIR/pool_spec.json --output-csv $RESULT_DIR/summary.csv --output-md $RESULT_DIR/summary.md --plot-dir $RESULT_DIR/plots"
+else
+  log "aggregating -> summary.csv / summary.md / plots/  (matplotlib needed for PNGs; csv+md written regardless)"
+  python "$AGG" \
+    --result-dir "$RESULT_DIR/runs" \
+    --pool-spec  "$POOL_DIR/pool_spec.json" \
+    --output-csv "$RESULT_DIR/summary.csv" \
+    --output-md  "$RESULT_DIR/summary.md" \
+    --plot-dir   "$RESULT_DIR/plots" \
+    && {
+      if [ -f "$RESULT_DIR/summary.md" ]; then
+        echo "==================== summary.md ===================="
+        cat "$RESULT_DIR/summary.md"
+        echo "===================================================="
+      fi
+      log "summary: $RESULT_DIR/summary.md   csv: $RESULT_DIR/summary.csv   plots: $RESULT_DIR/plots/"
+    } || log "WARN: aggregate failed — run manually (args logged above with SKIP_AGGREGATE=1)"
+fi
