@@ -39,6 +39,9 @@ HOST="${SERVE_HOST:-127.0.0.1}"
 # Dev routes (/reset_encoder_cache) are required by the c_i measurement and
 # the per-RPS cache reset between bench runs; enable by default.
 export VLLM_SERVER_DEV_MODE="${VLLM_SERVER_DEV_MODE:-1}"
+# The JIT-built GDN kernel needs the conda libstdc++ (GLIBCXX_3.4.32); make
+# sure the active env's lib dir is on the loader path for child vllm serves.
+export LD_LIBRARY_PATH="${CONDA_PREFIX:+$CONDA_PREFIX/lib:}${LD_LIBRARY_PATH:-}"
 RESULT_DIR="${RESULT_DIR:-$(pwd)/disagg_policy_$(date +%Y%m%d_%H%M%S)}"
 POOL_DIR="${POOL_DIR:-$RESULT_DIR/pool}"
 
