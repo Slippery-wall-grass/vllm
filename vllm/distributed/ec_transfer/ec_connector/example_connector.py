@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -50,6 +51,22 @@ class ECExampleConnector(ECConnectorBase):
         super().__init__(vllm_config=vllm_config, role=role)
         # req_id -> index
         self._mm_datas_need_loads: dict[str, int] = {}
+        # Deferred deletion (producer side). In disagg E/PD the producer frees
+        # an mm_hash as soon as it is encoded (E has no decode phase), so an
+        # aggressive policy can evict+delete a shared-store file while the
+        # consumer (PD) for the SAME request is still about to read it ->
+        # FileNotFoundError and a dead engine. We split deletion in two:
+        #   * logical: a queued hash is reported absent by has_cache_item, so
+        #     the producer re-encodes immediately (policy effect, no bias);
+        #   * physical: the file is only unlinked after a grace window (>> the
+        #     PD read latency), so the in-flight transfer completes first.
+        # PD is a separate connector instance (never a producer) so its
+        # _pending_deletes stays empty and it still sees the physical file.
+        # Tune the window via VLLM_EC_DELETE_GRACE_SEC (seconds).
+        self._pending_deletes: dict[str, float] = {}
+        self._delete_grace_s: float = float(
+            os.environ.get("VLLM_EC_DELETE_GRACE_SEC", "10")
+        )
         transfer_config = vllm_config.ec_transfer_config
         if transfer_config is not None:
             self._storage_path = transfer_config.get_from_extra_config(
@@ -111,11 +128,16 @@ class ECExampleConnector(ECConnectorBase):
         # Return if it is PD Instance
         if not self.is_producer:
             return
+        # A re-encode of a hash that was queued for deletion cancels that
+        # pending delete — the file is being (re)written right now.
+        self._pending_deletes.pop(mm_hash, None)
         filename = self._generate_filename_debug(mm_hash)
         ec_cache = encoder_cache[mm_hash]
         tensors = {"ec_cache": ec_cache.detach().cpu()}
         safetensors.torch.save_file(tensors, filename)
         logger.debug("Save cache successful for mm_hash %s", mm_hash)
+        # Make deferred physical deletions progress even if evictions pause.
+        self._flush_pending_deletes()
 
     def has_cache_item(
         self,
@@ -137,10 +159,31 @@ class ECExampleConnector(ECConnectorBase):
 
         Makes the shared store track the encoder-cache policy instead of
         growing append-only; see ECConnectorBase.delete_caches.
+
+        Deletion is split logical/physical to avoid a load/delete race that
+        kills the engine in disagg E/PD (see __init__): the hash is queued
+        (logically gone immediately for has_cache_item) and the file is only
+        unlinked after a grace window so an in-flight consumer read finishes.
         """
         if not self.is_producer:
             return
+        now = time.monotonic()
         for mm_hash in mm_hashes:
+            self._pending_deletes.setdefault(mm_hash, now)
+        self._flush_pending_deletes()
+
+    def _flush_pending_deletes(self) -> None:
+        """Physically unlink queued files whose grace window has elapsed."""
+        if not self._pending_deletes:
+            return
+        now = time.monotonic()
+        due = [
+            h
+            for h, queued_at in self._pending_deletes.items()
+            if now - queued_at >= self._delete_grace_s
+        ]
+        for mm_hash in due:
+            self._pending_deletes.pop(mm_hash, None)
             foldername = self._generate_foldername_debug(mm_hash, create_folder=False)
             filename = os.path.join(foldername, "encoder_cache.safetensors")
             try:
@@ -192,7 +235,15 @@ class ECExampleConnector(ECConnectorBase):
     # ==============================
 
     def _found_match_for_mm_data(self, mm_hash) -> bool:
-        """Check if the cache is hit for the request."""
+        """Check if the cache is hit for the request.
+
+        A hash queued for deletion is reported absent so the producer
+        re-encodes it (the policy evicted it); the physical file may still
+        linger during its grace window purely so an in-flight consumer read
+        can complete. PD instances never queue deletes, so they still hit.
+        """
+        if mm_hash in self._pending_deletes:
+            return False
         filename = self._generate_filename_debug(mm_hash)
         return os.path.exists(filename)
 
