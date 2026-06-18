@@ -923,16 +923,16 @@ class Scheduler(SchedulerInterface):
                 scheduler_output
             )
             scheduler_output.ec_connector_metadata = ec_meta
-            # Propagate encoder-cache policy evictions to the external store so
-            # the policy actually governs encode load. Without this the store is
-            # append-only (has_cache_item stays True forever), the producer
-            # never re-encodes, and fifo/offline/nocache become identical. The
-            # evicted hashes are unreferenced and their transfer is complete, so
-            # deletion is safe (a later request re-encodes as a normal miss).
-            if scheduler_output.free_encoder_mm_hashes:
-                self.ec_connector.delete_caches(
-                    scheduler_output.free_encoder_mm_hashes
-                )
+            # NOTE: we intentionally do NOT delete evicted mm_hashes from the
+            # external store here. The producer no longer reads the store to
+            # skip encoding (the has_cache_item gate is consumer-only), so the
+            # encoder-cache policy fully governs the producer's encode load via
+            # its in-memory cache alone — the store can no longer "rescue" a
+            # miss and mask the policy. The store is thus a pure producer->
+            # consumer transfer buffer; coupling its deletion to policy
+            # evictions caused a producer-delete / consumer-load race
+            # (FileNotFoundError) under forced eviction. It stays bounded by the
+            # distinct mm items per run and is reset between policies.
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -1253,8 +1253,15 @@ class Scheduler(SchedulerInterface):
             if curr_embeds_end - curr_embeds_start == 0:
                 continue
 
-            if self.ec_connector is not None and self.ec_connector.has_cache_item(
-                item_identifier
+            # Only the CONSUMER loads encoder output from the external store.
+            # The producer must always (re)encode on an in-memory miss so that
+            # the encoder-cache policy alone governs its encode load; letting
+            # the producer read the store would let stale files "rescue" a
+            # policy-evicted item and make fifo/offline/nocache look identical.
+            if (
+                self.ec_connector is not None
+                and self.ec_connector.is_consumer
+                and self.ec_connector.has_cache_item(item_identifier)
             ):
                 mm_hashes_to_schedule.add(item_identifier)
                 external_load_encoder_input.append(i)
