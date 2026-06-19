@@ -84,15 +84,22 @@ GPU_PD="${GPU_PD:-1}"
 GPU_PD_LIST="${GPU_PD_LIST:-$GPU_PD}"
 read -r -a GPU_PD_ARR <<< "$GPU_PD_LIST"
 NUM_PD=${#GPU_PD_ARR[@]}
-# CUDA graphs for the E/PD serving engines. ENFORCE_EAGER=1 (default) keeps
-# startup fast and is robust for the GDN/Mamba model + EC connector. Set
-# ENFORCE_EAGER=0 to enable CUDA graphs: faster decode -> lower TPOT / higher
-# PD throughput (longer warmup). Applied to fifo and offline identically, so
-# the policy comparison is unchanged. The c_i measurement server stays eager
-# regardless (graphs don't touch the encoder forward).
+# CUDA graphs for the E/PD serving engines.
+#   ENFORCE_EAGER=1 (default): --enforce-eager. Fast startup, robust.
+#   ENFORCE_EAGER=0: enable PIECEWISE CUDA graphs. We force
+#     cudagraph_mode=PIECEWISE because the auto-default FULL_AND_PIECEWISE
+#     crashes qwen3_next's GDN linear attention during FULL decode-graph
+#     capture (KeyError ...linear_attn). PIECEWISE captures fine and still
+#     speeds decode (less than FULL). Longer warmup; helps decode/TPOT, not
+#     the prefill/encoder bottleneck. Same for fifo/offline -> comparison
+#     unchanged. The c_i measurement server stays eager regardless.
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
-EAGER_FLAG=""
-[ "$ENFORCE_EAGER" = "1" ] && EAGER_FLAG="--enforce-eager"
+declare -a CG_ARG=()
+if [ "$ENFORCE_EAGER" = "1" ]; then
+  CG_ARG=(--enforce-eager)
+else
+  CG_ARG=(--compilation-config '{"cudagraph_mode":"PIECEWISE"}')
+fi
 EC_STORE="${EC_STORE:-/tmp/ec_cache_policy}"
 ENCODE_MAX_NUM_SEQS="${ENCODE_MAX_NUM_SEQS:-16}"  # throttle encode -> bottleneck
 PD_MAX_NUM_SEQS="${PD_MAX_NUM_SEQS:-128}"
@@ -218,7 +225,7 @@ start_disagg() {
       vllm serve "$MODEL" \
         --host "$HOST" --port "$ENCODE_PORT" \
         --gpu-memory-utilization "$GPU_MEM_UTIL_E" \
-        $EAGER_FLAG --no-async-scheduling \
+        "${CG_ARG[@]}" --no-async-scheduling \
         --enable-request-id-headers --no-enable-prefix-caching \
         --max-num-batched-tokens 114688 \
         --max-num-seqs "$ENCODE_MAX_NUM_SEQS" \
@@ -240,7 +247,7 @@ start_disagg() {
           --host "$HOST" --port "$pd_port" \
           --gpu-memory-utilization "$GPU_MEM_UTIL_PD" \
           --max-model-len "$MAX_MODEL_LEN" \
-          $EAGER_FLAG --no-async-scheduling --enable-request-id-headers \
+          "${CG_ARG[@]}" --no-async-scheduling --enable-request-id-headers \
           --max-num-seqs "$PD_MAX_NUM_SEQS" \
           --allowed-local-media-path "${GIT_ROOT}/tests/v1/ec_connector/integration" \
           "${PROC_ARG[@]}" \
