@@ -133,6 +133,29 @@ scrape_phases() {
     curl -s "http://${HOST}:$((PD_PORT + i))/metrics" 2>/dev/null
   done | grep -E "^vllm:(time_to_first_token_seconds|request_queue_time_seconds|request_prefill_time_seconds|request_decode_time_seconds)_(sum|count)" >> "$f" 2>/dev/null || true
 }
+# Background sampler: every second, record each engine's instantaneous queue
+# depth (num_requests_waiting), running count, and KV-cache usage into $1 (CSV).
+# Run during a bench and kill afterwards; queue_summary.py then shows which
+# stage (E encoder vs PD workers) starts queuing first as load rises.
+sample_queues() {
+  local out=$1 s name port body w r kv now
+  local -a specs=("E:$ENCODE_PORT")
+  local j
+  for j in $(seq 0 $((NUM_PD - 1))); do specs+=("PD${j}:$((PD_PORT + j))"); done
+  echo "t,engine,waiting,running,kv" > "$out"
+  while true; do
+    now=$(date +%s)
+    for s in "${specs[@]}"; do
+      name="${s%%:*}"; port="${s##*:}"
+      body=$(curl -s "http://${HOST}:${port}/metrics" 2>/dev/null)
+      w=$(printf '%s\n' "$body" | awk '/^vllm:num_requests_waiting/{x+=$NF} END{print x+0}')
+      r=$(printf '%s\n' "$body" | awk '/^vllm:num_requests_running/{x+=$NF} END{print x+0}')
+      kv=$(printf '%s\n' "$body" | awk '/^vllm:kv_cache_usage_perc/{print $NF; exit}')
+      echo "${now},${name},${w:-0},${r:-0},${kv:-0}" >> "$out"
+    done
+    sleep 1
+  done
+}
 kill_pids() {
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
   sleep 2
@@ -283,6 +306,8 @@ run_policy() {
       local out="$RESULT_DIR/runs/${policy}_rps${rps_tag}_rep${REP}.json"
       log "  policy=$policy rps=$RPS rep=$REP"
       scrape_phases "${out%.json}.phase_before.txt"
+      sample_queues "${out%.json}.queues.csv" &
+      local sampler_pid=$!
       vllm bench serve \
         --backend openai-chat --base-url "http://${HOST}:${PROXY_PORT}" \
         --endpoint /v1/chat/completions --model "$MODEL" \
@@ -298,6 +323,7 @@ run_policy() {
         --save-result --result-filename "$out" \
         >"$RESULT_DIR/runs/${policy}_rps${rps_tag}_rep${REP}.bench.log" 2>&1 || \
         log "    WARN: bench nonzero (see ${policy}_rps${rps_tag}_rep${REP}.bench.log)"
+      kill "$sampler_pid" 2>/dev/null || true
       scrape_phases "${out%.json}.phase_after.txt"
       # Per-RPS cumulative producer-side snapshots.
       grep "encoder_cache "   "$enc_log" | tail -1 > "${out%.json}.cache.txt" || true
@@ -347,4 +373,15 @@ if [ -f "$PHASE" ]; then
          cat "$RESULT_DIR/phase_breakdown.md"; \
          echo "===================================================="; } \
     || log "WARN: phase_breakdown failed (non-fatal)"
+fi
+
+# ── Bottleneck: which stage (E vs PD) starts queuing first ───────────────────
+QSUM="$GIT_ROOT/benchmarks/encoder_cache_eval/queue_summary.py"
+if [ -f "$QSUM" ]; then
+  log "queue-depth bottleneck summary -> queue_summary.md"
+  python "$QSUM" "$RESULT_DIR/runs" --md "$RESULT_DIR/queue_summary.md" \
+    && { echo "================ queue_summary.md ================"; \
+         cat "$RESULT_DIR/queue_summary.md"; \
+         echo "===================================================="; } \
+    || log "WARN: queue_summary failed (non-fatal)"
 fi
