@@ -25,6 +25,7 @@ Usage:
 """
 import argparse
 import glob
+import json
 import os
 import re
 from collections import defaultdict
@@ -79,33 +80,53 @@ def main() -> None:
 
     rows = []
     for bf in sorted(glob.glob(os.path.join(args.run_dir, "*.phase_before.txt"))):
-        af = bf[: -len(".phase_before.txt")] + ".phase_after.txt"
-        base = os.path.basename(bf)[: -len(".phase_before.txt")]
+        stem = bf[: -len(".phase_before.txt")]
+        af = stem + ".phase_after.txt"
+        base = os.path.basename(stem)
         m = re.match(r"(?P<policy>.+)_rps(?P<rps>[0-9.]+)_rep(?P<rep>\d+)$", base)
         if not m:
             continue
         before, after = parse_snapshot(bf), parse_snapshot(af)
-        vals = {k: avg_ms(before, after, metric) for k, metric in METRICS.items()}
-        rows.append((m.group("policy"), float(m.group("rps")), vals))
+        v = {k: avg_ms(before, after, metric) for k, metric in METRICS.items()}
+        # Client-observed TTFT (from the bench result JSON) includes the encode
+        # + transfer that the PD-side metric cannot see.
+        client_ttft = float("nan")
+        jp = stem + ".json"
+        if os.path.exists(jp):
+            try:
+                client_ttft = float(json.load(open(jp)).get("mean_ttft_ms", "nan"))
+            except (ValueError, json.JSONDecodeError, OSError):
+                pass
+        # encode + transfer + proxy ≈ client TTFT − PD-side TTFT.
+        enc_net = (
+            client_ttft - v["ttft"]
+            if client_ttft == client_ttft and v["ttft"] == v["ttft"]
+            else float("nan")
+        )
+        rows.append((m.group("policy"), float(m.group("rps")), v, client_ttft, enc_net))
 
     rows.sort(key=lambda r: (r[0], r[1]))
 
+    def pct(x: float, whole: float) -> str:
+        return f"{x / whole * 100:.0f}%" if whole and whole == whole and x == x else "—"
+
     lines = [
-        "# TTFT phase composition (PD-side, ms avg/request)",
+        "# TTFT composition (ms avg/request)",
         "",
-        "queue+prefill ≈ server TTFT; add the encoder time (~c_i, separate) for "
-        "the full client TTFT.",
+        "client TTFT = encode+net + PD-queue + PD-prefill. `encode+net` is the "
+        "gap between the client-measured TTFT and the PD-side TTFT, i.e. the "
+        "encoder forward + E->PD transfer + proxy. Percentages are of client TTFT.",
         "",
-        "| policy | rps | queue | prefill | decode | TTFT(srv) | queue% | prefill% |",
-        "|---|---|---|---|---|---|---|---|",
+        "| policy | rps | client TTFT | encode+net | PD queue | PD prefill | "
+        "enc% | queue% | prefill% | (decode) |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
-    for pol, rps, v in rows:
-        srv = v["queue"] + v["prefill"]
-        qp = v["queue"] / srv * 100 if srv > 0 else float("nan")
-        pp = v["prefill"] / srv * 100 if srv > 0 else float("nan")
+    for pol, rps, v, client_ttft, enc_net in rows:
+        ct = client_ttft
         lines.append(
-            f"| {pol} | {rps:g} | {v['queue']:.1f} | {v['prefill']:.1f} | "
-            f"{v['decode']:.1f} | {v['ttft']:.1f} | {qp:.0f}% | {pp:.0f}% |"
+            f"| {pol} | {rps:g} | {ct:.0f} | {enc_net:.0f} | {v['queue']:.0f} | "
+            f"{v['prefill']:.0f} | {pct(enc_net, ct)} | {pct(v['queue'], ct)} | "
+            f"{pct(v['prefill'], ct)} | {v['decode']:.0f} |"
         )
 
     out = "\n".join(lines)
