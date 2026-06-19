@@ -97,6 +97,24 @@ async def fanout_encoder_primer(
     # Round-robin over encode servers to distribute load a bit
     url_cycle = (e_urls[i % len(e_urls)] for i in range(len(mm_items)))
 
+    async def _timed_encode_post(idx, target_url, encoder_req, headers):
+        # Per-child-request latency. Lets us tell whether E runs the fan-out
+        # concurrently (every child ~= the whole fan-out) or serializes it
+        # (children stagger; their latencies roughly sum to the fan-out), and
+        # how big the per-request floor is vs the encode compute.
+        import time as _t
+        _t0 = _t.perf_counter()
+        resp = await encode_session.post(
+            f"{target_url}/v1/chat/completions",
+            json=encoder_req,
+            headers=headers,
+        )
+        logger.info(
+            "[EncReqTiming] %s child=%d ms=%.1f status=%s",
+            req_id, idx, (_t.perf_counter() - _t0) * 1000.0, resp.status,
+        )
+        return resp
+
     for idx, (item, target_url) in enumerate(zip(mm_items, url_cycle)):
         # Derive a *child* request id:  <parent>:<index>:<random-short>
         child_req_id = f"{req_id}:{idx}:{uuid.uuid4().hex[:6]}"
@@ -112,13 +130,7 @@ async def fanout_encoder_primer(
             "max_tokens": 1,
             "stream": False,
         }
-        tasks.append(
-            encode_session.post(
-                f"{target_url}/v1/chat/completions",
-                json=encoder_req,
-                headers=headers,
-            )
-        )
+        tasks.append(_timed_encode_post(idx, target_url, encoder_req, headers))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
