@@ -77,6 +77,13 @@ PROXY_PORT="${PROXY_PORT:-10001}"
 MEASURE_PORT="${MEASURE_PORT:-19540}"
 GPU_E="${GPU_E:-0}"
 GPU_PD="${GPU_PD:-1}"
+# 1E + N PD: set GPU_PD_LIST="1 2 3" for 1E3PD. Each PD i serves on PD_PORT+i
+# and the proxy random-balances across them. Tripling PD capacity shifts the
+# bottleneck onto the single encoder, so the encoder-cache policy can finally
+# show up in throughput / TTFT. Defaults to the single GPU_PD (1E1PD).
+GPU_PD_LIST="${GPU_PD_LIST:-$GPU_PD}"
+read -r -a GPU_PD_ARR <<< "$GPU_PD_LIST"
+NUM_PD=${#GPU_PD_ARR[@]}
 EC_STORE="${EC_STORE:-/tmp/ec_cache_policy}"
 ENCODE_MAX_NUM_SEQS="${ENCODE_MAX_NUM_SEQS:-16}"  # throttle encode -> bottleneck
 PD_MAX_NUM_SEQS="${PD_MAX_NUM_SEQS:-128}"
@@ -101,12 +108,24 @@ wait_for_server() {
     until curl -s localhost:$port/v1/chat/completions >/dev/null 2>&1; do sleep 1; done" \
     && return 0 || { log "ERROR: server :$port not ready in ${TIMEOUT_SECONDS}s"; return 1; }
 }
+# Snapshot the queue/prefill/decode/ttft histogram _sum and _count across all
+# PD workers' /metrics into $1. Diffing two snapshots gives per-RPS averages.
+scrape_phases() {
+  local f=$1 i
+  : > "$f"
+  for i in $(seq 0 $((NUM_PD - 1))); do
+    curl -s "http://${HOST}:$((PD_PORT + i))/metrics" 2>/dev/null
+  done | grep -E "^vllm:(time_to_first_token_seconds|request_queue_time_seconds|request_prefill_time_seconds|request_decode_time_seconds)_(sum|count)" >> "$f" 2>/dev/null || true
+}
 kill_pids() {
   for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
   sleep 2
   for pid in "${PIDS[@]:-}"; do kill -9 "$pid" 2>/dev/null || true; done
   pkill -9 -f "vllm serve.*--port $ENCODE_PORT" 2>/dev/null || true
-  pkill -9 -f "vllm serve.*--port $PD_PORT" 2>/dev/null || true
+  local i
+  for i in $(seq 0 $((NUM_PD - 1))); do
+    pkill -9 -f "vllm serve.*--port $((PD_PORT + i))" 2>/dev/null || true
+  done
   pkill -9 -f "vllm serve.*--port $MEASURE_PORT" 2>/dev/null || true
   pkill -9 -f "disagg_epd_proxy.py.*--port $PROXY_PORT" 2>/dev/null || true
   PIDS=()
@@ -200,27 +219,36 @@ start_disagg() {
         >"$enc_log" 2>&1 &
   PIDS+=($!)
 
-  CUDA_VISIBLE_DEVICES="$GPU_PD" \
-      vllm serve "$MODEL" \
-        --host "$HOST" --port "$PD_PORT" \
-        --gpu-memory-utilization "$GPU_MEM_UTIL_PD" \
-        --max-model-len "$MAX_MODEL_LEN" \
-        --enforce-eager --no-async-scheduling --enable-request-id-headers \
-        --max-num-seqs "$PD_MAX_NUM_SEQS" \
-        --allowed-local-media-path "${GIT_ROOT}/tests/v1/ec_connector/integration" \
-        "${PROC_ARG[@]}" \
-        --ec-transfer-config "{\"ec_connector\":\"ECExampleConnector\",\"ec_role\":\"ec_consumer\",\"ec_connector_extra_config\":{\"shared_storage_path\":\"$EC_STORE\"}}" \
-        >"$pd_log" 2>&1 &
-  PIDS+=($!)
+  # Launch NUM_PD consumer (PD) workers, one per GPU in GPU_PD_LIST, each on
+  # PD_PORT+i. Collect their URLs for the proxy to balance across.
+  local d_urls="" i pd_gpu pd_port this_pd_log
+  for i in "${!GPU_PD_ARR[@]}"; do
+    pd_gpu="${GPU_PD_ARR[$i]}"
+    pd_port=$((PD_PORT + i))
+    this_pd_log="${pd_log%.log}.${i}.log"
+    CUDA_VISIBLE_DEVICES="$pd_gpu" \
+        vllm serve "$MODEL" \
+          --host "$HOST" --port "$pd_port" \
+          --gpu-memory-utilization "$GPU_MEM_UTIL_PD" \
+          --max-model-len "$MAX_MODEL_LEN" \
+          --enforce-eager --no-async-scheduling --enable-request-id-headers \
+          --max-num-seqs "$PD_MAX_NUM_SEQS" \
+          --allowed-local-media-path "${GIT_ROOT}/tests/v1/ec_connector/integration" \
+          "${PROC_ARG[@]}" \
+          --ec-transfer-config "{\"ec_connector\":\"ECExampleConnector\",\"ec_role\":\"ec_consumer\",\"ec_connector_extra_config\":{\"shared_storage_path\":\"$EC_STORE\"}}" \
+          >"$this_pd_log" 2>&1 &
+    PIDS+=($!)
+    d_urls="${d_urls:+$d_urls,}http://localhost:$pd_port"
+  done
 
   wait_for_server "$ENCODE_PORT"
-  wait_for_server "$PD_PORT"
+  for i in "${!GPU_PD_ARR[@]}"; do wait_for_server "$((PD_PORT + i))"; done
 
   ( cd "${GIT_ROOT}/examples/disaggregated/disaggregated_encoder" &&
     python disagg_epd_proxy.py --host 0.0.0.0 --port "$PROXY_PORT" \
       --encode-servers-urls "http://localhost:$ENCODE_PORT" \
       --prefill-servers-urls "disable" \
-      --decode-servers-urls "http://localhost:$PD_PORT" \
+      --decode-servers-urls "$d_urls" \
       >"$proxy_log" 2>&1 ) &
   PIDS+=($!)
   wait_for_server "$PROXY_PORT"
@@ -238,6 +266,7 @@ run_policy() {
     for REP in $(seq 0 $((REPEATS - 1))); do
       local out="$RESULT_DIR/runs/${policy}_rps${rps_tag}_rep${REP}.json"
       log "  policy=$policy rps=$RPS rep=$REP"
+      scrape_phases "${out%.json}.phase_before.txt"
       vllm bench serve \
         --backend openai-chat --base-url "http://${HOST}:${PROXY_PORT}" \
         --endpoint /v1/chat/completions --model "$MODEL" \
@@ -253,6 +282,7 @@ run_policy() {
         --save-result --result-filename "$out" \
         >"$RESULT_DIR/runs/${policy}_rps${rps_tag}_rep${REP}.bench.log" 2>&1 || \
         log "    WARN: bench nonzero (see ${policy}_rps${rps_tag}_rep${REP}.bench.log)"
+      scrape_phases "${out%.json}.phase_after.txt"
       # Per-RPS cumulative producer-side snapshots.
       grep "encoder_cache "   "$enc_log" | tail -1 > "${out%.json}.cache.txt" || true
       grep "encoder_forward "  "$enc_log" | tail -1 > "${out%.json}.enc.txt"   || true
@@ -290,4 +320,15 @@ else
       fi
       log "summary: $RESULT_DIR/summary.md   csv: $RESULT_DIR/summary.csv   plots: $RESULT_DIR/plots/"
     } || log "WARN: aggregate failed — run manually (args logged above with SKIP_AGGREGATE=1)"
+fi
+
+# ── TTFT phase composition (queue / prefill / decode from PD /metrics) ───────
+PHASE="$GIT_ROOT/benchmarks/encoder_cache_eval/phase_breakdown.py"
+if [ -f "$PHASE" ]; then
+  log "TTFT phase breakdown -> phase_breakdown.md"
+  python "$PHASE" "$RESULT_DIR/runs" --md "$RESULT_DIR/phase_breakdown.md" \
+    && { echo "================ phase_breakdown.md ================"; \
+         cat "$RESULT_DIR/phase_breakdown.md"; \
+         echo "===================================================="; } \
+    || log "WARN: phase_breakdown failed (non-fatal)"
 fi
