@@ -346,18 +346,27 @@ async def forward_non_stream(
 async def forward_stream(
     req_data: dict, req_id: str, e_urls: list[str], p_url: str, d_url: str
 ) -> AsyncIterator[str]:
+    import time
     try:
+        t0 = time.perf_counter()
         # Step 1: Process through Encoder instance (if has MM input)
         await fanout_encoder_primer(req_data, e_urls, req_id)
+        t_enc = time.perf_counter()
 
         # Step 2: Process through Prefill instance
         req_data = await maybe_prefill(req_data, p_url, req_id)
+        t_pf = time.perf_counter()
 
         # Step 3: Process through Decode instance
         logger.info("[%s] Starting streaming from decode: %s", req_id, d_url)
         headers = {"x-request-id": req_id}
 
-        # Streaming response
+        # Streaming response. On the first chunk, log how the proxy's wall-clock
+        # TTFT splits across stages so we can see where it actually goes:
+        #   encoder_ms      = E fan-out (awaited before PD is even contacted)
+        #   prefill_ms      = optional E->P stage (disabled in E+PD mode -> ~0)
+        #   pd_first_chunk  = PD POST -> first streamed token (PD queue+prefill)
+        first = True
         async with decode_session.post(
             f"{d_url}/v1/chat/completions",
             json=req_data,
@@ -366,6 +375,18 @@ async def forward_stream(
             resp.raise_for_status()
             async for chunk in resp.content.iter_chunked(1024):
                 if chunk:
+                    if first:
+                        t_first = time.perf_counter()
+                        logger.info(
+                            "[ProxyStageTiming] %s encoder_ms=%.1f prefill_ms=%.1f "
+                            "pd_first_chunk_ms=%.1f total_ms=%.1f",
+                            req_id,
+                            (t_enc - t0) * 1000.0,
+                            (t_pf - t_enc) * 1000.0,
+                            (t_first - t_pf) * 1000.0,
+                            (t_first - t0) * 1000.0,
+                        )
+                        first = False
                     yield chunk.decode("utf-8", errors="ignore")
 
         logger.info("[%s] Streaming completed", req_id)
