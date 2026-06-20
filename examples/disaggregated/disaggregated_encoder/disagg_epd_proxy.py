@@ -92,6 +92,46 @@ async def fanout_encoder_primer(
 
     logger.info("[%s] got %d multimodal items...", req_id, len(mm_items))
 
+    # Default: send ALL mm items in ONE request to a single encode server, so E
+    # pays the per-request overhead (HTTP + schedule + EC finished handshake)
+    # ONCE instead of once per image. Each item keeps its own uuid -> mm_hash,
+    # so the encoder-cache keying is unchanged. Set EC_MERGE_ENCODE=0 for the
+    # legacy one-request-per-image fan-out (for A/B).
+    if os.environ.get("EC_MERGE_ENCODE", "1") != "0":
+        import time as _t
+
+        target_url = random.choice(e_urls)
+        headers = {"x-request-id": f"{req_id}:enc"}
+        encoder_req = {
+            "model": orig_request.get("model"),
+            "messages": [{"role": "user", "content": list(mm_items)}],
+            "max_tokens": 1,
+            "stream": False,
+        }
+        _t0 = _t.perf_counter()
+        resp = await encode_session.post(
+            f"{target_url}/v1/chat/completions",
+            json=encoder_req,
+            headers=headers,
+        )
+        logger.info(
+            "[EncReqTiming] %s merged_items=%d ms=%.1f status=%s",
+            req_id,
+            len(mm_items),
+            (_t.perf_counter() - _t0) * 1000.0,
+            resp.status,
+        )
+        if resp.status != 200:
+            try:
+                detail = await resp.text()
+            except Exception:
+                detail = "<unable to read body>"
+            raise HTTPException(
+                status_code=resp.status,
+                detail=f"Encoder request failed: {detail}",
+            )
+        return
+
     tasks = []
 
     # Round-robin over encode servers to distribute load a bit
