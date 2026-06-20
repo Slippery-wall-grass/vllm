@@ -696,10 +696,34 @@ class BaseRenderer(ABC, Generic[_T]):
         )
         mm_timing_ctx = self._mm_timing_registry.get(mm_req_id)
 
+        # [MMPrep] always-on wall-clock around the HF processor. In disagg-E
+        # this `apply` IS the CPU image preprocessing (resize/normalize ->
+        # pixel_values); a mm_processor_cache hit makes it ~free. Logging it
+        # lets us split encoder_fanout into preprocess vs request-lifecycle
+        # without needing --enable-mm-processor-stats.
+        _mmprep_t0 = time.perf_counter()
         with set_default_torch_num_threads():
             mm_inputs = mm_processor.apply(mm_processor_inputs, mm_timing_ctx)
+        _mmprep_ms = (time.perf_counter() - _mmprep_t0) * 1000.0
 
         self.update_mm_cache_stats()
+
+        try:
+            _mmprep_n = sum(mm_data_items.get_all_counts().values())
+        except Exception:
+            _mmprep_n = -1
+        _mmprep_stages = ""
+        if mm_timing_ctx.enabled and mm_timing_ctx.stage_secs:
+            _mmprep_stages = " " + " ".join(
+                f"{_k}={_v * 1000.0:.1f}" for _k, _v in mm_timing_ctx.stage_secs.items()
+            )
+        logger.info(
+            "[MMPrep] req=%s apply_ms=%.1f n_items=%d%s",
+            mm_req_id,
+            _mmprep_ms,
+            _mmprep_n,
+            _mmprep_stages,
+        )
 
         return mm_inputs
 
