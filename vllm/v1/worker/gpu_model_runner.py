@@ -4062,7 +4062,20 @@ class GPUModelRunner(
                     scheduler_output,
                     encoder_cache=self.encoder_cache,
                 ) as ec_connector_output:
+                    # Time the producer's encode (+ save inside _execute_mm_encoder)
+                    # so the proxy's encoder_fanout can be decomposed: this path
+                    # returns an empty output, so NO engine metric (prefill/TTFT)
+                    # records it. Synchronize so the number is real GPU time.
+                    import time as _ec_t
+                    torch.cuda.synchronize()
+                    _ec_t0 = _ec_t.perf_counter()
                     self._execute_mm_encoder(scheduler_output)
+                    torch.cuda.synchronize()
+                    logger.info(
+                        "[ProducerEncode] reqs=%d encode_save_ms=%.1f",
+                        len(scheduler_output.num_scheduled_tokens),
+                        (_ec_t.perf_counter() - _ec_t0) * 1000.0,
+                    )
                     return make_empty_encoder_model_runner_output(scheduler_output)
 
             if not num_scheduled_tokens:

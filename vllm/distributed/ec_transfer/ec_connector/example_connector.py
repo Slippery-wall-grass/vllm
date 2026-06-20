@@ -101,7 +101,12 @@ class ECExampleConnector(ECConnectorBase):
                 "In connector.start_load_caches, but the connector metadata is None"
             )
             return
-        # Load the EC for each mm data
+        # Load the EC for each mm data. Time it so the proxy's pd_first_chunk
+        # can be decomposed: this embed load (file read + H2D) happens inside
+        # the PD execute step, before prefill, and is not covered by any metric.
+        import time as _ec_t
+        _ec_t0 = _ec_t.perf_counter()
+        _ec_loaded = 0
         for mm_data in metadata.mm_datas:
             if mm_data.mm_hash in encoder_cache:
                 continue
@@ -110,7 +115,15 @@ class ECExampleConnector(ECConnectorBase):
                 filename, device=current_platform.device_type
             )["ec_cache"]
             encoder_cache[mm_data.mm_hash] = ec_cache
+            _ec_loaded += 1
             logger.debug("Success load encoder cache for hash %s", mm_data.mm_hash)
+        if metadata.mm_datas:
+            logger.info(
+                "[ECLoad] loaded=%d of=%d ms=%.1f",
+                _ec_loaded,
+                len(metadata.mm_datas),
+                (_ec_t.perf_counter() - _ec_t0) * 1000.0,
+            )
 
     def save_caches(self, encoder_cache, mm_hash, **kwargs) -> None:
         """
