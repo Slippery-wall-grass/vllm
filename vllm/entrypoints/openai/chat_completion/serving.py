@@ -256,7 +256,14 @@ class OpenAIServingChat(OpenAIServing):
                 tokenizer,
                 chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
             )
+        # [EStage] split the E-side request lifecycle. `render` = image
+        # fetch/decode + MMPrep + tokenize (front half); the `engine` span
+        # below = enqueue IPC + scheduler wait + encode + output IPC + build
+        # response. For an encode-only (producer) request this brackets the
+        # ~500ms residual that neither cache touches.
+        _estage_t0 = time.perf_counter()
         result = await self.render_chat_request(request)
+        _estage_render_ms = (time.perf_counter() - _estage_t0) * 1000.0
         if isinstance(result, ErrorResponse):
             return result
 
@@ -381,7 +388,8 @@ class OpenAIServingChat(OpenAIServing):
                 chat_template_kwargs=chat_template_kwargs,
             )
 
-        return await self.chat_completion_full_generator(
+        _estage_t1 = time.perf_counter()
+        _estage_resp = await self.chat_completion_full_generator(
             request,
             result_generator,
             request_id,
@@ -391,6 +399,15 @@ class OpenAIServingChat(OpenAIServing):
             request_metadata,
             reasoning_parser,
         )
+        _estage_engine_ms = (time.perf_counter() - _estage_t1) * 1000.0
+        logger.info(
+            "[EStage] req=%s render_ms=%.1f engine_ms=%.1f total_ms=%.1f",
+            request_id,
+            _estage_render_ms,
+            _estage_engine_ms,
+            _estage_render_ms + _estage_engine_ms,
+        )
+        return _estage_resp
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
         if request.add_generation_prompt:
