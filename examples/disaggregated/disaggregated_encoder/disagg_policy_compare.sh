@@ -397,3 +397,14 @@ if [ -f "$QSUM" ]; then
          echo "===================================================="; } \
     || log "WARN: queue_summary failed (non-fatal)"
 fi
+
+# ── Fine TTFT breakdown: stacked components vs RPS + GPU-encode vs RPS ───────
+PLOT="$GIT_ROOT/benchmarks/encoder_cache_eval/plot_ttft_breakdown.py"
+if [ -f "$PLOT" ]; then
+  log "TTFT fine-breakdown plots -> plots/ttft_breakdown_*.png + producer_encode_vs_rps.png"
+  python "$PLOT" "$RESULT_DIR" --md "$RESULT_DIR/ttft_breakdown.md" \
+    && { echo "================ ttft_breakdown.md ================"; \
+         cat "$RESULT_DIR/ttft_breakdown.md"; \
+         echo "===================================================="; } \
+    || log "WARN: plot_ttft_breakdown failed (non-fatal)"
+fi
