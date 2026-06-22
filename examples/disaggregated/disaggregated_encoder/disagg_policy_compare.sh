@@ -116,6 +116,18 @@ declare -a PROC_ARG=()
 if [ "$HF_PROCESSOR_KWARGS" != "{}" ]; then
   PROC_ARG=(--mm-processor-kwargs "$HF_PROCESSOR_KWARGS")
 fi
+# mm_processor_cache type (applied to E/producer only). Default "" keeps vLLM's
+# default "lru": API-side sender cache (skips HF preprocess on repeats) but the
+# worker has NO receiver cache, so pixel_values are re-sent over API->worker IPC
+# every step. MM_CACHE_TYPE=shm puts processed pixel_values in a shared-memory
+# object store the worker reads directly -> repeated images skip the IPC
+# re-transfer, targeting the engine-orchestration (~134ms) bucket of
+# encoder_fanout. Only effective on a single-API-process engine (E qualifies).
+declare -a MM_CACHE_ARG=()
+if [ "${MM_CACHE_TYPE:-}" = "shm" ]; then
+  MM_CACHE_ARG=(--mm-processor-cache-type shm
+    --mm-shm-cache-max-object-size-mb "${MM_SHM_OBJ_MB:-256}")
+fi
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
 wait_for_server() {
@@ -253,7 +265,7 @@ start_disagg() {
         --max-num-batched-tokens 114688 \
         --max-num-seqs "$ENCODE_MAX_NUM_SEQS" \
         --allowed-local-media-path "${GIT_ROOT}/tests/v1/ec_connector/integration" \
-        "${PROC_ARG[@]}" \
+        "${PROC_ARG[@]}" "${MM_CACHE_ARG[@]}" \
         --ec-transfer-config "{\"ec_connector\":\"ECExampleConnector\",\"ec_role\":\"ec_producer\",\"ec_connector_extra_config\":{\"shared_storage_path\":\"$EC_STORE\"}}" \
         >"$enc_log" 2>&1 &
   PIDS+=($!)
