@@ -123,14 +123,15 @@ def test_solve_lambda_star_no_pressure_returns_zero():
 
 
 class _AlwaysPinPolicy(EncoderCachePolicy):
-    """Test double: pin every arrival for ``horizon`` ticks starting
-    from the moment the entry enters the freeable queue."""
+    """Test double: pin every arrival until the ABSOLUTE tick
+    ``current_tick + horizon`` (anchored at arrival), mirroring the real
+    policy contract that ``on_arrival`` returns an absolute unlock tick."""
 
     def __init__(self, horizon: int):
         self.horizon = horizon
 
     def on_arrival(self, mm_hash, num_embeds, current_tick):
-        return self.horizon  # ticks; applied at freeable transition
+        return current_tick + self.horizon  # absolute unlock tick
 
 
 class _NeverPinPolicy(EncoderCachePolicy):
@@ -192,6 +193,26 @@ def test_pin_expires_after_unlock_horizon():
     assert "A" not in mgr.cached
 
 
+def test_unlock_tick_is_absolute_not_double_counted():
+    # Regression for the offline-pin double-count bug. on_arrival() returns an
+    # ABSOLUTE unlock tick (current_tick_at_arrival + horizon). When the entry
+    # becomes freeable the manager must store that value verbatim, NOT add
+    # current_tick a second time (which pinned entries ~2x too long and drove
+    # the spurious forced-unpin storm).
+    class _AbsArrivalPlus5(EncoderCachePolicy):
+        def on_arrival(self, mm_hash, num_embeds, current_tick):
+            return current_tick + 5  # absolute unlock tick
+
+    mgr = EncoderCacheManager(cache_size=8, policy=_AbsArrivalPlus5())
+    req = MockRequest("r1", ["A"], [4])
+    assert mgr.can_allocate(req, 0, int(1e9), 0)
+    mgr.allocate(req, 0)  # arrival: current_tick -> 1, on_arrival -> 6
+    assert mgr.current_tick == 1
+    mgr.free_encoder_input(req, 0)  # release materializes the pin
+    # Must equal the policy's absolute tick (1 + 5 = 6), never 1 + 6 = 7.
+    assert mgr._unlock_tick["A"] == 6
+
+
 def test_forced_unpin_eviction_when_all_pinned():
     mgr = EncoderCacheManager(cache_size=8, policy=_AlwaysPinPolicy(horizon=10_000))
     _alloc_and_release(mgr, "r1", "A", 4)
@@ -216,7 +237,7 @@ class _ValuedPinPolicy(EncoderCachePolicy):
         self._values = values
 
     def on_arrival(self, mm_hash, num_embeds, current_tick):
-        return self.horizon
+        return current_tick + self.horizon  # absolute unlock tick
 
     def eviction_value(self, mm_hash, num_embeds):
         return self._values.get(mm_hash, 0.0)
