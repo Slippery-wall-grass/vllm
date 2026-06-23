@@ -67,6 +67,19 @@ class ECExampleConnector(ECConnectorBase):
         self._delete_grace_s: float = float(
             os.environ.get("VLLM_EC_DELETE_GRACE_SEC", "10")
         )
+        # Consume-on-load: make the shared store a single-use E->PD transfer
+        # buffer. The consumer (PD) unlinks each file right after it has loaded
+        # the embed into its in-GPU encoder_cache, so the store never grows
+        # append-only (root cause of the /dev/shm host-RAM OOM that kills PD).
+        # This does NOT change the research metrics: the producer (E) never
+        # reads the store (has_cache_item is consumer-only), so E's policy
+        # cache alone governs hit-rate / encode load; deleting the transfer
+        # file only means a *different* PD that later needs the same hash
+        # re-encodes locally (no effect on E-side encoder_forward / hit stats).
+        # Set EC_STORE_CONSUME_ON_LOAD=0 to restore the append-only store.
+        self._consume_on_load: bool = (
+            os.environ.get("EC_STORE_CONSUME_ON_LOAD", "1") != "0"
+        )
         transfer_config = vllm_config.ec_transfer_config
         if transfer_config is not None:
             self._storage_path = transfer_config.get_from_extra_config(
@@ -117,6 +130,17 @@ class ECExampleConnector(ECConnectorBase):
             encoder_cache[mm_data.mm_hash] = ec_cache
             _ec_loaded += 1
             logger.debug("Success load encoder cache for hash %s", mm_data.mm_hash)
+            # Single-use transfer buffer: the embed now lives in PD's in-GPU
+            # encoder_cache, so the on-disk copy is free to go. Unlink it (and
+            # its folder) directly — do NOT go through _generate_filename_debug,
+            # which would re-create the directory it is trying to remove.
+            if self._consume_on_load:
+                folder = os.path.join(self._storage_path, mm_data.mm_hash)
+                try:
+                    os.remove(os.path.join(folder, "encoder_cache.safetensors"))
+                    os.rmdir(folder)
+                except OSError:
+                    pass
         if metadata.mm_datas:
             logger.info(
                 "[ECLoad] loaded=%d of=%d ms=%.1f",
