@@ -108,6 +108,10 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 GPU_MEM_UTIL_E="${GPU_MEM_UTIL_E:-0.30}"
 GPU_MEM_UTIL_PD="${GPU_MEM_UTIL_PD:-0.70}"
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-1200}"
+# Queue sampler interval (seconds, fractional ok). Finer => catches shorter
+# transient queues that a 1s tick misses. Note num_requests_waiting itself is
+# only refreshed per scheduler step (~tens of ms), so below ~0.05 is pointless.
+QUEUE_SAMPLE_SEC="${QUEUE_SAMPLE_SEC:-0.25}"
 
 mkdir -p "$RESULT_DIR/runs"
 declare -a PIDS=()
@@ -145,10 +149,13 @@ scrape_phases() {
     curl -s "http://${HOST}:$((PD_PORT + i))/metrics" 2>/dev/null
   done | grep -E "^vllm:(time_to_first_token_seconds|request_queue_time_seconds|request_prefill_time_seconds|request_decode_time_seconds)_(sum|count)" >> "$f" 2>/dev/null || true
 }
-# Background sampler: every second, record each engine's instantaneous queue
-# depth (num_requests_waiting), running count, and KV-cache usage into $1 (CSV).
-# Run during a bench and kill afterwards; queue_summary.py then shows which
-# stage (E encoder vs PD workers) starts queuing first as load rises.
+# Background sampler: every QUEUE_SAMPLE_SEC seconds, record each engine's
+# instantaneous queue depth (num_requests_waiting), running count, and KV-cache
+# usage into $1 (CSV). Run during a bench and kill afterwards; queue_summary.py
+# then shows which stage (E encoder vs PD workers) starts queuing first as load
+# rises. `t` is a high-resolution (sub-second) timestamp so each sampling round
+# is unique — queue_summary.py groups PD engines by `t`, which would mis-sum if
+# multiple sub-second rounds shared the same integer second.
 sample_queues() {
   local out=$1 s name port body w r kv now
   local -a specs=("E:$ENCODE_PORT")
@@ -156,7 +163,7 @@ sample_queues() {
   for j in $(seq 0 $((NUM_PD - 1))); do specs+=("PD${j}:$((PD_PORT + j))"); done
   echo "t,engine,waiting,running,kv" > "$out"
   while true; do
-    now=$(date +%s)
+    now=$(date +%s.%N)
     for s in "${specs[@]}"; do
       name="${s%%:*}"; port="${s##*:}"
       body=$(curl -s "http://${HOST}:${port}/metrics" 2>/dev/null)
@@ -165,7 +172,7 @@ sample_queues() {
       kv=$(printf '%s\n' "$body" | awk '/^vllm:kv_cache_usage_perc/{print $NF; exit}')
       echo "${now},${name},${w:-0},${r:-0},${kv:-0}" >> "$out"
     done
-    sleep 1
+    sleep "$QUEUE_SAMPLE_SEC"
   done
 }
 kill_pids() {

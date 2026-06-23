@@ -4,8 +4,8 @@
 """Show which stage (the single encoder E vs the PD workers) starts queuing
 first as offered load rises — the core "where is the bottleneck" question.
 
-disagg_policy_compare.sh's background sampler writes, once per second during
-each RPS bench, one row per engine into
+disagg_policy_compare.sh's background sampler writes, every QUEUE_SAMPLE_SEC
+seconds (default 0.25) during each RPS bench, one row per engine into
 ``<run_dir>/<policy>_rps<rps>_rep<rep>.queues.csv`` with columns
 ``t,engine,waiting,running,kv`` (waiting = vllm:num_requests_waiting,
 kv = vllm:kv_cache_usage_perc). ``engine`` is ``E`` for the encoder and
