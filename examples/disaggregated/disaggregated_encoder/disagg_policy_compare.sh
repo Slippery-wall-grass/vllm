@@ -132,6 +132,30 @@ if [ "${MM_CACHE_TYPE:-}" = "shm" ]; then
   MM_CACHE_ARG=(--mm-processor-cache-type shm
     --mm-shm-cache-max-object-size-mb "${MM_SHM_OBJ_MB:-256}")
 fi
+# Torch-profiler trace pass (PROFILE=1). Captures a BOUNDED steady-state trace
+# at the REAL operating point (same RPS / policy / warmed cache) rather than the
+# clean RPS sweep. The profiled run's latency is overhead-inflated, so its bench
+# numbers are DISCARDED — only the trace (Chrome/Perfetto, viewable at
+# https://ui.perfetto.dev) is kept. When PROFILE=1, run_policy does one trace
+# pass per policy and skips the measurement sweep + aggregation entirely, so
+# clean numbers and traces never come from the same run. Profile E by default;
+# PROFILE_PD=1 also traces a PD worker. The torch schedule keeps overhead off
+# the wait window and records only PROFILE_ACTIVE steady steps.
+PROFILE="${PROFILE:-0}"
+PROFILE_PD="${PROFILE_PD:-0}"
+PROFILE_RPS="${PROFILE_RPS:-}"                  # default = last value of RPS_LIST
+PROFILE_PROMPTS="${PROFILE_PROMPTS:-64}"
+PROFILE_WAIT="${PROFILE_WAIT:-20}"              # steps skipped before recording (zero overhead)
+PROFILE_WARMUP="${PROFILE_WARMUP:-2}"           # discarded steps (JIT noise)
+PROFILE_ACTIVE="${PROFILE_ACTIVE:-15}"          # recorded steady steps
+PROFILE_DIR="$RESULT_DIR/traces"
+declare -a PROFILE_ARG=()
+if [ "$PROFILE" = "1" ]; then
+  mkdir -p "$PROFILE_DIR"
+  PROFILE_ARG=(--profiler-config \
+    "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"$PROFILE_DIR\",\"torch_profiler_with_stack\":true,\"wait_iterations\":$PROFILE_WAIT,\"warmup_iterations\":$PROFILE_WARMUP,\"active_iterations\":$PROFILE_ACTIVE}")
+  [ -z "$PROFILE_RPS" ] && PROFILE_RPS="${RPS_LIST##* }"  # last token of RPS_LIST
+fi
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
 wait_for_server() {
@@ -272,7 +296,7 @@ start_disagg() {
         --max-num-batched-tokens 114688 \
         --max-num-seqs "$ENCODE_MAX_NUM_SEQS" \
         --allowed-local-media-path "${GIT_ROOT}/tests/v1/ec_connector/integration" \
-        "${PROC_ARG[@]}" "${MM_CACHE_ARG[@]}" \
+        "${PROC_ARG[@]}" "${MM_CACHE_ARG[@]}" "${PROFILE_ARG[@]}" \
         --ec-transfer-config "{\"ec_connector\":\"ECExampleConnector\",\"ec_role\":\"ec_producer\",\"ec_connector_extra_config\":{\"shared_storage_path\":\"$EC_STORE\"}}" \
         >"$enc_log" 2>&1 &
   PIDS+=($!)
@@ -292,7 +316,7 @@ start_disagg() {
           "${CG_ARG[@]}" --no-async-scheduling --enable-request-id-headers \
           --max-num-seqs "$PD_MAX_NUM_SEQS" \
           --allowed-local-media-path "${GIT_ROOT}/tests/v1/ec_connector/integration" \
-          "${PROC_ARG[@]}" \
+          "${PROC_ARG[@]}" "${PROFILE_ARG[@]}" \
           --ec-transfer-config "{\"ec_connector\":\"ECExampleConnector\",\"ec_role\":\"ec_consumer\",\"ec_connector_extra_config\":{\"shared_storage_path\":\"$EC_STORE\"}}" \
           >"$this_pd_log" 2>&1 &
     PIDS+=($!)
@@ -312,12 +336,65 @@ start_disagg() {
   wait_for_server "$PROXY_PORT"
 }
 
+# Drive a short load through the proxy at $1 RPS (numbers discarded; used to
+# warm the cache and to fill the profiler's recording window). Output -> $2.
+_profile_bench() {
+  vllm bench serve \
+    --backend openai-chat --base-url "http://${HOST}:${PROXY_PORT}" \
+    --endpoint /v1/chat/completions --model "$MODEL" \
+    --dataset-name mm-fixed-pool --mm-pool-dir "$POOL_DIR" \
+    --random-mm-base-items-per-request "$NUM_MM_BASE" \
+    --random-mm-num-mm-items-range-ratio "$NUM_MM_RANGE" \
+    --mm-novelty-rate "$NOVELTY_RATE" \
+    --random-input-len "$INPUT_LEN" --random-output-len "$OUTPUT_LEN" \
+    --random-range-ratio 0.0 \
+    --num-prompts "$PROFILE_PROMPTS" --num-warmups 0 \
+    --request-rate "$1" --ignore-eos \
+    >"$2" 2>&1 || log "    WARN: profile bench nonzero (see $2)"
+}
+
+# One bounded trace pass at the real operating point: warm the cache, then
+# record a steady-state window on E (and optionally a PD). Latencies here are
+# profiler-inflated, so the bench numbers are discarded — only the torch trace
+# (under $PROFILE_DIR) is kept.
+profile_pass() {
+  local policy=$1
+  local pdir="$PROFILE_DIR/$policy"
+  mkdir -p "$pdir"
+  local -a turls=("http://${HOST}:${ENCODE_PORT}")
+  [ "$PROFILE_PD" = "1" ] && turls+=("http://${HOST}:${PD_PORT}")
+  log "  PROFILE policy=$policy rps=$PROFILE_RPS engines=[${turls[*]}] (numbers discarded)"
+  log "    warming cache..."
+  _profile_bench "$PROFILE_RPS" "$pdir/warmup.bench.log"
+  local u
+  for u in "${turls[@]}"; do
+    curl -s -X POST "$u/start_profile" >/dev/null && log "    started profile @ $u" \
+      || log "    WARN: start_profile $u failed (is --profiler-config set?)"
+  done
+  log "    recording steady window..."
+  _profile_bench "$PROFILE_RPS" "$pdir/trace.bench.log"
+  for u in "${turls[@]}"; do
+    curl -s -X POST "$u/stop_profile" >/dev/null && log "    stopped profile @ $u" \
+      || log "    WARN: stop_profile $u failed"
+  done
+  log "  PROFILE done -> $PROFILE_DIR/  (*.json.gz; open in https://ui.perfetto.dev)"
+}
+
 run_policy() {
   local policy=$1
   local enc_log="$RESULT_DIR/${policy}.encoder.log"
   log "=== policy=$policy ==="
   start_disagg "$policy" "$enc_log" \
     "$RESULT_DIR/${policy}.pd.log" "$RESULT_DIR/${policy}.proxy.log"
+
+  # PROFILE mode: one bounded trace pass at the real operating point, then
+  # tear down. No measurement sweep / aggregation (kept on the clean PROFILE=0
+  # run), so profiler overhead never contaminates the reported numbers.
+  if [ "$PROFILE" = "1" ]; then
+    profile_pass "$policy"
+    kill_pids
+    return
+  fi
 
   for RPS in $RPS_LIST; do
     local rps_tag; rps_tag=$(printf "%07.2f" "$RPS")
@@ -359,6 +436,15 @@ for policy in $POLICIES; do
 done
 
 log "done. results in $RESULT_DIR"
+
+# PROFILE run produces traces, not measurement JSONs — skip aggregation/plots.
+if [ "$PROFILE" = "1" ]; then
+  log "PROFILE run: torch traces under $PROFILE_DIR/<policy>/ (*.json.gz)."
+  log "  view: download + open in https://ui.perfetto.dev (or chrome://tracing)."
+  log "  NOTE: latencies in these traces carry profiler overhead — read structure,"
+  log "        not absolute ms. Run with PROFILE=0 for clean measurement numbers."
+  cleanup 0
+fi
 
 # ── Aggregate + plot (set SKIP_AGGREGATE=1 to skip) ─────────────────────────
 AGG="$GIT_ROOT/benchmarks/encoder_cache_eval/aggregate.py"
