@@ -448,7 +448,7 @@ run_policy() {
 }
 
 log "model=$MODEL policies=[$POLICIES] B=${ENCODER_CACHE_SIZE:-default} pin_margin=$PIN_MARGIN"
-log "workload: K=$K img/req=$NUM_MM_BASE novelty=$NOVELTY_RATE in=$INPUT_LEN out=$OUTPUT_LEN n=$NUM_PROMPTS rps=[$RPS_LIST]"
+log "workload: K=$K img/req=$NUM_MM_BASE novelty=$NOVELTY_RATE in=$INPUT_LEN out=$OUTPUT_LEN n=$NUM_PROMPTS $([ -n "$CONCURRENCY_LIST" ] && echo "concurrency=[$CONCURRENCY_LIST] (closed loop, request-rate inf)" || echo "rps=[$RPS_LIST]")"
 for policy in $POLICIES; do
   run_policy "$policy"
 done
