@@ -59,6 +59,15 @@ NUM_PROMPTS="${NUM_PROMPTS:-256}"
 NUM_WARMUPS="${NUM_WARMUPS:-0}"
 REPEATS="${REPEATS:-1}"
 RPS_LIST="${RPS_LIST:-4 8 12}"
+# Saturation measurement: set CONCURRENCY_LIST to sweep --max-concurrency in
+# CLOSED loop (--request-rate inf) instead of the open-loop RPS sweep. Closed
+# loop keeps exactly N requests in flight, so the server is never overwhelmed
+# past saturation -> no aborts/timeouts -> clean TTFT even at the knee (open
+# loop corrupts metrics there: unbounded queue -> truncated outputs -> median
+# TTFT collapses to 0). Throughput rises with N then plateaus = saturation; the
+# plateau is the max sustainable throughput. The swept value still lands in the
+# `_rps<tag>` slot, so summary/plots read it as the x-axis (= concurrency here).
+CONCURRENCY_LIST="${CONCURRENCY_LIST:-}"
 NUM_MM_BASE="${NUM_MM_BASE:-1}"
 NUM_MM_RANGE="${NUM_MM_RANGE:-0.0}"
 NOVELTY_RATE="${NOVELTY_RATE:-0.0}"
@@ -396,11 +405,20 @@ run_policy() {
     return
   fi
 
-  for RPS in $RPS_LIST; do
-    local rps_tag; rps_tag=$(printf "%07.2f" "$RPS")
+  local sweep_list="${CONCURRENCY_LIST:-$RPS_LIST}" closed=0
+  [ -n "$CONCURRENCY_LIST" ] && closed=1
+  for VAL in $sweep_list; do
+    local rps_tag; rps_tag=$(printf "%07.2f" "$VAL")
+    local -a rate_args
+    if [ "$closed" = "1" ]; then
+      # Closed loop: cap in-flight at VAL, send as fast as they complete.
+      rate_args=(--max-concurrency "$VAL" --request-rate inf)
+    else
+      rate_args=(--request-rate "$VAL")
+    fi
     for REP in $(seq 0 $((REPEATS - 1))); do
       local out="$RESULT_DIR/runs/${policy}_rps${rps_tag}_rep${REP}.json"
-      log "  policy=$policy rps=$RPS rep=$REP"
+      log "  policy=$policy $([ "$closed" = 1 ] && echo conc || echo rps)=$VAL rep=$REP"
       scrape_phases "${out%.json}.phase_before.txt"
       sample_queues "${out%.json}.queues.csv" &
       local sampler_pid=$!
@@ -414,7 +432,7 @@ run_policy() {
         --random-input-len "$INPUT_LEN" --random-output-len "$OUTPUT_LEN" \
         --random-range-ratio 0.0 \
         --num-prompts "$NUM_PROMPTS" --num-warmups "$NUM_WARMUPS" \
-        --request-rate "$RPS" --ignore-eos \
+        "${rate_args[@]}" --ignore-eos \
         --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,95,99 \
         --save-result --result-filename "$out" \
         >"$RESULT_DIR/runs/${policy}_rps${rps_tag}_rep${REP}.bench.log" 2>&1 || \
