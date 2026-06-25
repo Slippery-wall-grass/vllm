@@ -131,14 +131,21 @@ class ECExampleConnector(ECConnectorBase):
             _ec_loaded += 1
             logger.debug("Success load encoder cache for hash %s", mm_data.mm_hash)
             # Single-use transfer buffer: the embed now lives in PD's in-GPU
-            # encoder_cache, so the on-disk copy is free to go. Unlink it (and
-            # its folder) directly — do NOT go through _generate_filename_debug,
-            # which would re-create the directory it is trying to remove.
+            # encoder_cache, so the on-disk copy is free to go. Unlink ONLY the
+            # file — do NOT rmdir the folder. The producer (a separate process
+            # sharing this dir) may be concurrently re-encoding the same hash:
+            # if we rmdir the folder right after its makedirs() but before its
+            # save_file() writes the temp file, the save fails with ENOENT and
+            # kills the engine. Leaving the (now-empty) dir is harmless.
             if self._consume_on_load:
-                folder = os.path.join(self._storage_path, mm_data.mm_hash)
                 try:
-                    os.remove(os.path.join(folder, "encoder_cache.safetensors"))
-                    os.rmdir(folder)
+                    os.remove(
+                        os.path.join(
+                            self._storage_path,
+                            mm_data.mm_hash,
+                            "encoder_cache.safetensors",
+                        )
+                    )
                 except OSError:
                     pass
         if metadata.mm_datas:
@@ -168,11 +175,27 @@ class ECExampleConnector(ECConnectorBase):
         # A re-encode of a hash that was queued for deletion cancels that
         # pending delete — the file is being (re)written right now.
         self._pending_deletes.pop(mm_hash, None)
-        filename = self._generate_filename_debug(mm_hash)
         ec_cache = encoder_cache[mm_hash]
         tensors = {"ec_cache": ec_cache.detach().cpu()}
-        safetensors.torch.save_file(tensors, filename)
-        logger.debug("Save cache successful for mm_hash %s", mm_hash)
+        # A consumer doing consume-on-load can unlink this entry concurrently,
+        # racing our directory (re)creation. Retry once after re-ensuring the
+        # dir, and NEVER let a transient store I/O error propagate — it would
+        # kill the EngineCore. A dropped save just means the consumer re-encodes
+        # this hash (correct, only slightly more compute).
+        for _attempt in (0, 1):
+            try:
+                filename = self._generate_filename_debug(mm_hash)  # re-makedirs
+                safetensors.torch.save_file(tensors, filename)
+                logger.debug("Save cache successful for mm_hash %s", mm_hash)
+                break
+            except Exception as e:  # noqa: BLE001 - save is best-effort
+                if _attempt == 1:
+                    logger.warning(
+                        "EC save failed for mm_hash %s, skipping (consumer will "
+                        "re-encode): %s",
+                        mm_hash,
+                        e,
+                    )
         # Make deferred physical deletions progress even if evictions pause.
         self._flush_pending_deletes()
 
