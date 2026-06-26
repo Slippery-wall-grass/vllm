@@ -67,18 +67,19 @@ class ECExampleConnector(ECConnectorBase):
         self._delete_grace_s: float = float(
             os.environ.get("VLLM_EC_DELETE_GRACE_SEC", "10")
         )
-        # Consume-on-load: make the shared store a single-use E->PD transfer
-        # buffer. The consumer (PD) unlinks each file right after it has loaded
-        # the embed into its in-GPU encoder_cache, so the store never grows
-        # append-only (root cause of the /dev/shm host-RAM OOM that kills PD).
-        # This does NOT change the research metrics: the producer (E) never
-        # reads the store (has_cache_item is consumer-only), so E's policy
-        # cache alone governs hit-rate / encode load; deleting the transfer
-        # file only means a *different* PD that later needs the same hash
-        # re-encodes locally (no effect on E-side encoder_forward / hit stats).
-        # Set EC_STORE_CONSUME_ON_LOAD=0 to restore the append-only store.
+        # Consume-on-load: the consumer (PD) unlinks each file right after it
+        # loads the embed into its in-GPU encoder_cache, to keep the store from
+        # growing append-only. DEFAULT OFF: it is UNSAFE with multiple PD
+        # workers sharing one store -- PD0 deleting a hash's file makes a
+        # concurrent PD1/PD2 load of the SAME hash hit FileNotFoundError in
+        # start_load_caches, which kills that EngineCore (seen at high
+        # concurrency). It is also unnecessary here: a fixed K-image pool keeps
+        # the store tiny (K files) on a real disk. Only enable
+        # (EC_STORE_CONSUME_ON_LOAD=1) for a single-PD run with a genuinely
+        # unbounded working set. The load path below is also hardened so a
+        # missing file degrades to a re-encode instead of crashing the engine.
         self._consume_on_load: bool = (
-            os.environ.get("EC_STORE_CONSUME_ON_LOAD", "1") != "0"
+            os.environ.get("EC_STORE_CONSUME_ON_LOAD", "0") != "0"
         )
         transfer_config = vllm_config.ec_transfer_config
         if transfer_config is not None:
@@ -124,9 +125,21 @@ class ECExampleConnector(ECConnectorBase):
             if mm_data.mm_hash in encoder_cache:
                 continue
             filename = self._generate_filename_debug(mm_data.mm_hash)
-            ec_cache = safetensors.torch.load_file(
-                filename, device=current_platform.device_type
-            )["ec_cache"]
+            try:
+                ec_cache = safetensors.torch.load_file(
+                    filename, device=current_platform.device_type
+                )["ec_cache"]
+            except Exception as e:  # noqa: BLE001 - load is best-effort
+                # The file may have been unlinked by another consumer's
+                # consume-on-load (or any store hiccup) between has_cache_item
+                # and now. Do NOT crash the EngineCore: leave the hash uncached
+                # so the worker encodes it locally as a normal miss.
+                logger.warning(
+                    "EC load miss for mm_hash %s (%s); re-encoding locally",
+                    mm_data.mm_hash,
+                    e,
+                )
+                continue
             encoder_cache[mm_data.mm_hash] = ec_cache
             _ec_loaded += 1
             logger.debug("Success load encoder cache for hash %s", mm_data.mm_hash)
