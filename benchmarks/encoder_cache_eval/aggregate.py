@@ -24,6 +24,13 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+# Display label for the swept axis. The filename slot stays `_rps<tag>` for
+# back-compat, but in a closed-loop run the value is max-concurrency, not RPS;
+# disagg_policy_compare.sh sets SWEEP_XLABEL=concurrency so tables/plots read
+# correctly. Defaults to RPS for the open-loop sweep.
+XLABEL = os.environ.get("SWEEP_XLABEL", "RPS")
+XAXIS = "Request rate (RPS)" if XLABEL == "RPS" else "Max concurrency (in flight)"
+
 
 _FILE_RX = re.compile(
     r"^(?P<policy>[a-zA-Z0-9_-]+)_rps(?P<rps>\d+(?:\.\d+)?)_rep(?P<rep>\d+)\.json$"
@@ -372,7 +379,7 @@ def write_markdown(
     for key, label in metrics:
         lines.append(f"## {label}")
         lines.append("")
-        header = "| RPS | " + " | ".join(policies) + " |"
+        header = f"| {XLABEL} | " + " | ".join(policies) + " |"
         sep = "|" + "---|" * (len(policies) + 1)
         lines.append(header)
         lines.append(sep)
@@ -387,7 +394,7 @@ def write_markdown(
     for key, label in derived:
         lines.append(f"## {label}")
         lines.append("")
-        header = "| RPS | " + " | ".join(policies) + " |"
+        header = f"| {XLABEL} | " + " | ".join(policies) + " |"
         sep = "|" + "---|" * (len(policies) + 1)
         lines.append(header)
         lines.append(sep)
@@ -408,7 +415,7 @@ def write_markdown(
     if has_measured:
         lines.append("## Encoder forward time MEASURED (s per RPS step)")
         lines.append("")
-        header = "| RPS | " + " | ".join(policies) + " |"
+        header = f"| {XLABEL} | " + " | ".join(policies) + " |"
         sep = "|" + "---|" * (len(policies) + 1)
         lines.append(header)
         lines.append(sep)
@@ -424,7 +431,7 @@ def write_markdown(
             "## Encoder forward time MEASURED — saved vs nocache (s)"
         )
         lines.append("")
-        header = "| RPS | " + " | ".join(policies) + " |"
+        header = f"| {XLABEL} | " + " | ".join(policies) + " |"
         sep = "|" + "---|" * (len(policies) + 1)
         lines.append(header)
         lines.append(sep)
@@ -456,7 +463,7 @@ def write_markdown(
             f"{expected_c * 1000:.1f} ms/hit"
         )
         lines.append("")
-        header = "| RPS | " + " | ".join(policies) + " |"
+        header = f"| {XLABEL} | " + " | ".join(policies) + " |"
         sep = "|" + "---|" * (len(policies) + 1)
         lines.append(header)
         lines.append(sep)
@@ -475,7 +482,7 @@ def write_markdown(
         # Per-policy savings RELATIVE to nocache and to fifo.
         lines.append("## Encoder compute saved vs nocache (s and %)")
         lines.append("")
-        header = "| RPS | " + " | ".join(policies) + " |"
+        header = f"| {XLABEL} | " + " | ".join(policies) + " |"
         sep = "|" + "---|" * (len(policies) + 1)
         lines.append(header)
         lines.append(sep)
@@ -556,7 +563,7 @@ def maybe_plot(
             xs, vals = zip(*xs_ys)
             ax.plot(xs, vals, marker="o", label=pol)
             any_plotted = True
-        ax.set_xlabel("Request rate (RPS)")
+        ax.set_xlabel(XAXIS)
         ax.set_ylabel(label)
         ax.set_title(label)
         if any_plotted:
@@ -578,7 +585,7 @@ def maybe_plot(
             continue
         xs, vals = zip(*xs_ys)
         ax.plot(xs, vals, marker="o", label=pol)
-    ax.set_xlabel("Request rate (RPS)")
+    ax.set_xlabel(XAXIS)
     ax.set_ylabel("Hit rate (per-step delta)")
     ax.set_title("Encoder cache hit rate")
     ax.set_ylim(0, 1)
@@ -609,7 +616,7 @@ def maybe_plot(
                 continue
             xs, vals = zip(*xs_ys)
             ax.plot(xs, vals, marker="o", label=pol)
-        ax.set_xlabel("Request rate (RPS)")
+        ax.set_xlabel(XAXIS)
         ax.set_ylabel("Encoder forward time (s, measured)")
         ax.set_title("Measured encoder forward time per RPS step")
         ax.legend()
@@ -662,7 +669,7 @@ def maybe_plot(
                 )
             ax.set_xticks(x_pos)
             ax.set_xticklabels([_fmt_rps(x) for x in xs])
-            ax.set_xlabel("Request rate (RPS)")
+            ax.set_xlabel(XAXIS)
             ax.set_ylabel("Cumulative time per RPS window (s)")
             ax.set_title(
                 f"Stage time breakdown — {pol}\n"
@@ -742,7 +749,7 @@ def maybe_plot(
                 continue
             xs, vals = zip(*xs_ys)
             ax.plot(xs, vals, marker="o", label=pol)
-        ax.set_xlabel("Request rate (RPS)")
+        ax.set_xlabel(XAXIS)
         ax.set_ylabel("Encoder time saved vs nocache (s)")
         ax.set_title("Measured encoder time saved (vs nocache baseline)")
         ax.legend()
@@ -766,7 +773,7 @@ def maybe_plot(
                 continue
             xs, vals = zip(*xs_ys)
             ax.plot(xs, vals, marker="o", label=pol)
-        ax.set_xlabel("Request rate (RPS)")
+        ax.set_xlabel(XAXIS)
         ax.set_ylabel("Encoder compute saved (s)")
         ax.set_title(
             f"Encoder compute saved per RPS step  "
@@ -799,7 +806,7 @@ def maybe_plot(
                 continue
             xs, vals = zip(*xs_ys)
             ax.plot(xs, vals, marker="o", label=pol)
-        ax.set_xlabel("Request rate (RPS)")
+        ax.set_xlabel(XAXIS)
         ax.set_ylabel("Encoder forwards avoided (% of arrivals)")
         ax.set_title("Encoder compute saved (% of arrivals)")
         ax.set_ylim(0, 100)

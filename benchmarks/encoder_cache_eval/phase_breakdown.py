@@ -30,6 +30,9 @@ import os
 import re
 from collections import defaultdict
 
+# Swept-axis display label (set SWEEP_XLABEL=concurrency for closed-loop runs).
+XLABEL = os.environ.get("SWEEP_XLABEL", "rps")
+
 METRICS = {
     "queue": "vllm:request_queue_time_seconds",
     "prefill": "vllm:request_prefill_time_seconds",
@@ -117,7 +120,7 @@ def main() -> None:
         "gap between the client-measured TTFT and the PD-side TTFT, i.e. the "
         "encoder forward + E->PD transfer + proxy. Percentages are of client TTFT.",
         "",
-        "| policy | rps | client TTFT | encode+net | PD queue | PD prefill | "
+        f"| policy | {XLABEL} | client TTFT | encode+net | PD queue | PD prefill | "
         "enc% | queue% | prefill% | (decode) |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]

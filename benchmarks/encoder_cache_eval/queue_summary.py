@@ -27,6 +27,9 @@ import os
 import re
 from collections import defaultdict
 
+# Swept-axis display label (set SWEEP_XLABEL=concurrency for closed-loop runs).
+XLABEL = os.environ.get("SWEEP_XLABEL", "rps")
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -80,7 +83,7 @@ def main() -> None:
         "the LOWER rps is the first to queue = the bottleneck. For this study "
         "you want **E (encode)** to queue first.",
         "",
-        "| policy | rps | E wait | PD wait | E kv% | PD kv% | queuing |",
+        f"| policy | {XLABEL} | E wait | PD wait | E kv% | PD kv% | queuing |",
         "|---|---|---|---|---|---|---|",
     ]
     first: dict = defaultdict(lambda: {"E": None, "PD": None})

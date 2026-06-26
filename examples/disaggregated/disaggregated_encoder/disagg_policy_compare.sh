@@ -68,6 +68,8 @@ RPS_LIST="${RPS_LIST:-4 8 12}"
 # plateau is the max sustainable throughput. The swept value still lands in the
 # `_rps<tag>` slot, so summary/plots read it as the x-axis (= concurrency here).
 CONCURRENCY_LIST="${CONCURRENCY_LIST:-}"
+# Relabel the swept axis in all aggregation tables/plots when closed-loop.
+[ -n "$CONCURRENCY_LIST" ] && export SWEEP_XLABEL=concurrency
 NUM_MM_BASE="${NUM_MM_BASE:-1}"
 NUM_MM_RANGE="${NUM_MM_RANGE:-0.0}"
 NOVELTY_RATE="${NOVELTY_RATE:-0.0}"

@@ -41,6 +41,9 @@ import json
 import os
 import re
 from collections import defaultdict
+
+# Swept-axis display label (set SWEEP_XLABEL=concurrency for closed-loop runs).
+XLABEL = os.environ.get("SWEEP_XLABEL", "rps")
 from datetime import datetime
 
 # ── timestamp parsing ───────────────────────────────────────────────────────
@@ -269,7 +272,7 @@ def main() -> None:
 
     # ── text table ──────────────────────────────────────────────────────────
     lines = ["# TTFT fine breakdown vs RPS (ms avg/request)", ""]
-    hdr = "| policy | rps | " + " | ".join(c for c, _ in COMPONENTS) + " | TTFT(sum) |"
+    hdr = f"| policy | {XLABEL} | " + " | ".join(c for c, _ in COMPONENTS) + " | TTFT(sum) |"
     lines += [hdr, "|" + "---|" * (len(COMPONENTS) + 3)]
     for policy in policies:
         for rps, comp, raw in data[policy]:
@@ -313,7 +316,7 @@ def main() -> None:
             bottoms = [b + v for b, v in zip(bottoms, vals)]
         ax.set_xticks(list(x))
         ax.set_xticklabels(xs)
-        ax.set_xlabel("request rate (RPS)")
+        ax.set_xlabel("request rate (RPS)" if XLABEL == "rps" else "max concurrency (in flight)")
         ax.set_ylabel("% of TTFT" if normalize else "ms")
         ax.set_title(title)
         ax.legend(fontsize=8, ncol=2, loc="upper center",
@@ -342,7 +345,7 @@ def main() -> None:
             ax.plot([p[0] for p in pts], [p[1] for p in pts],
                     marker="o", label=policy)
     if any_pt:
-        ax.set_xlabel("request rate (RPS)")
+        ax.set_xlabel("request rate (RPS)" if XLABEL == "rps" else "max concurrency (in flight)")
         ax.set_ylabel("ProducerEncode (GPU encode+save) ms/step")
         ax.set_title("GPU encode time vs RPS")
         ax.grid(True, alpha=0.3)
