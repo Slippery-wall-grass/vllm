@@ -73,6 +73,19 @@ def extract_mm_items(request_data: dict) -> list[dict]:
     return items
 
 
+# [research] skip-E: 记录 proxy 已见过的图 key(按 image_url 字符串哈希).
+# 命中(之前已编码过, embedding 在 store)的图不再发给 E, PD 从 store 直取.
+# 需配合大 ENCODER_CACHE_SIZE(不淘汰)保证正确; PD 作为 consumer 兜底.
+_SKIP_E_SEEN: set = set()
+
+
+def _skip_e_item_key(item: dict) -> str:
+    import hashlib as _hl
+
+    u = (item.get("image_url") or item.get("video_url") or {}).get("url", "")
+    return _hl.sha1(u.encode("utf-8")).hexdigest()
+
+
 async def fanout_encoder_primer(
     orig_request: dict,
     e_urls: list[str],
@@ -91,6 +104,25 @@ async def fanout_encoder_primer(
         return  # nothing to do
 
     logger.info("[%s] got %d multimodal items...", req_id, len(mm_items))
+
+    # [research] SKIP_E=1: 剔除已见过(命中)的图, 只把新图(miss)发给 E; 全命中则完全跳过 E.
+    if os.environ.get("SKIP_E", "0") != "0":
+        _unseen = []
+        _n_hit = 0
+        for _it in mm_items:
+            _k = _skip_e_item_key(_it)
+            if _k in _SKIP_E_SEEN:
+                _n_hit += 1
+            else:
+                _SKIP_E_SEEN.add(_k)
+                _unseen.append(_it)
+        logger.info(
+            "[SkipE] %s items=%d hit(skip)=%d encode=%d",
+            req_id, len(mm_items), _n_hit, len(_unseen),
+        )
+        mm_items = _unseen
+        if not mm_items:
+            return  # 全部命中 -> 完全跳过 E(不发编码请求)
 
     # Default: send ALL mm items in ONE request to a single encode server, so E
     # pays the per-request overhead (HTTP + schedule + EC finished handshake)
