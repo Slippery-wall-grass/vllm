@@ -45,13 +45,32 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 
-# Benchmark args
-DATASET_NAME="${DATASET_NAME:-hf}"
-DATASET_PATH="${DATASET_PATH:-lmarena-ai/VisionArena-Chat}"
+# Benchmark args.
+#   mm-fixed-pool (default): the fixed K-image pool used by the encoder-cache
+#     study, so EPD-ratio results are directly comparable with those runs. The
+#     pool is generated ONCE into POOL_DIR and reused by every ratio, so all
+#     ratios see byte-identical images.
+#   hf: upstream's VisionArena-Chat (needs HuggingFace access).
+DATASET_NAME="${DATASET_NAME:-mm-fixed-pool}"
+DATASET_PATH="${DATASET_PATH:-lmarena-ai/VisionArena-Chat}"   # only for DATASET_NAME=hf
 NUM_PROMPTS="${NUM_PROMPTS:-512}"
+NUM_WARMUPS="${NUM_WARMUPS:-64}"
 REQUEST_RATE="${REQUEST_RATE:-inf}"          # open loop; or use MAX_CONCURRENCY
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-}"       # set for closed loop (recommended)
 SEED="${SEED:-0}"
+
+# Fixed-pool workload (matches the encoder-cache experiments' defaults).
+POOL_DIR="${POOL_DIR:-$(pwd)/epd_ratio_pool}"   # shared across ALL ratios
+K="${K:-20}"
+DISTRIBUTION="${DISTRIBUTION:-zipf}"
+DISTRIBUTION_PARAM="${DISTRIBUTION_PARAM:-0.5}"
+BUCKETS="${BUCKETS:-360x640 720x1280 1080x1920 1440x2560}"
+HF_PROCESSOR_KWARGS="${HF_PROCESSOR_KWARGS:-{}}"
+NUM_MM_BASE="${NUM_MM_BASE:-4}"
+NUM_MM_RANGE="${NUM_MM_RANGE:-0.0}"
+NOVELTY_RATE="${NOVELTY_RATE:-0.3}"
+INPUT_LEN="${INPUT_LEN:-256}"
+OUTPUT_LEN="${OUTPUT_LEN:-128}"
 
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-1800}"
 GIT_ROOT=$(git rev-parse --show-toplevel)
@@ -102,6 +121,24 @@ rm -rf "$EC_STORE"; mkdir -p "$EC_STORE"
 
 log "=== ratio ${NUM_E}E / ${NUM_PD}PD  (TOTAL_GPUS=$TOTAL_GPUS) ==="
 log "model=$MODEL  store=$EC_STORE  results=$RESULT_DIR"
+
+###############################################################################
+# Fixed image pool -- generated ONCE and reused by every ratio, so all ratios
+# are driven by byte-identical images (same K, same zipf draw, same buckets).
+###############################################################################
+if [ "$DATASET_NAME" = "mm-fixed-pool" ]; then
+  if [ ! -f "$POOL_DIR/pool_spec.json" ]; then
+    log "generating image pool K=$K dist=$DISTRIBUTION/$DISTRIBUTION_PARAM -> $POOL_DIR"
+    python "$GIT_ROOT/tools/precompute_mm_pool.py" --pool-dir "$POOL_DIR" generate \
+      --k "$K" --seed 0 \
+      --distribution "$DISTRIBUTION" --distribution-param "$DISTRIBUTION_PARAM" \
+      --bucket-config $BUCKETS \
+      --model-id "$MODEL" \
+      --hf-processor-kwargs "$HF_PROCESSOR_KWARGS"
+  else
+    log "reusing existing pool: $POOL_DIR/pool_spec.json"
+  fi
+fi
 
 ###############################################################################
 # Encoder workers: GPUs [0, NUM_E)
@@ -175,14 +212,28 @@ else
   log "load: open loop, request-rate=$REQUEST_RATE"
 fi
 
-log "running benchmark (n=$NUM_PROMPTS)..."
+declare -a DATA_ARG=()
+if [ "$DATASET_NAME" = "mm-fixed-pool" ]; then
+  DATA_ARG=(
+    --dataset-name mm-fixed-pool --mm-pool-dir "$POOL_DIR"
+    --random-mm-base-items-per-request "$NUM_MM_BASE"
+    --random-mm-num-mm-items-range-ratio "$NUM_MM_RANGE"
+    --mm-novelty-rate "$NOVELTY_RATE"
+    --random-input-len "$INPUT_LEN" --random-output-len "$OUTPUT_LEN"
+    --random-range-ratio 0.0 --ignore-eos
+    --num-warmups "$NUM_WARMUPS"
+  )
+else
+  DATA_ARG=(--dataset-name "$DATASET_NAME" --dataset-path "$DATASET_PATH")
+fi
+
+log "running benchmark (n=$NUM_PROMPTS, dataset=$DATASET_NAME)..."
 vllm bench serve \
   --model "$MODEL" \
   --backend openai-chat \
   --endpoint /v1/chat/completions \
   --base-url "http://${HOST}:${PROXY_PORT}" \
-  --dataset-name "$DATASET_NAME" \
-  --dataset-path "$DATASET_PATH" \
+  "${DATA_ARG[@]}" \
   --seed "$SEED" \
   --num-prompts "$NUM_PROMPTS" \
   "${LOAD_ARG[@]}" \
@@ -199,8 +250,13 @@ cat >"$RESULT_DIR/meta.json" <<EOF
   "gpu_mem_util_e": $GPU_MEM_UTIL_E, "gpu_mem_util_pd": $GPU_MEM_UTIL_PD,
   "max_num_seqs": $MAX_NUM_SEQS, "max_model_len": $MAX_MODEL_LEN,
   "dataset_name": "$DATASET_NAME", "dataset_path": "$DATASET_PATH",
-  "num_prompts": $NUM_PROMPTS,
+  "num_prompts": $NUM_PROMPTS, "num_warmups": $NUM_WARMUPS,
   "request_rate": "$REQUEST_RATE", "max_concurrency": "${MAX_CONCURRENCY:-}",
+  "pool_dir": "$POOL_DIR", "k": $K,
+  "distribution": "$DISTRIBUTION", "distribution_param": $DISTRIBUTION_PARAM,
+  "buckets": "$BUCKETS",
+  "num_mm_base": $NUM_MM_BASE, "novelty_rate": $NOVELTY_RATE,
+  "input_len": $INPUT_LEN, "output_len": $OUTPUT_LEN,
   "ec_store": "$EC_STORE"
 }
 EOF
