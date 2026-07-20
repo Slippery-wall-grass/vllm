@@ -33,7 +33,9 @@ if [ "$NUM_E" -lt 1 ] || [ "$NUM_PD" -lt 1 ]; then
   exit 1
 fi
 
-HOST="${HOST:-127.0.0.1}"
+# NOTE: do NOT use $HOST -- conda exports HOST=x86_64-conda-linux-gnu, which
+# would be passed to --host and fail to resolve (socket.gaierror).
+SERVE_HOST="${SERVE_HOST:-127.0.0.1}"
 ENCODE_PORT_BASE="${ENCODE_PORT_BASE:-19534}"
 PD_PORT_BASE="${PD_PORT_BASE:-19600}"
 PROXY_PORT="${PROXY_PORT:-10001}"
@@ -147,7 +149,7 @@ e_urls=""
 for i in $(seq 0 $((NUM_E - 1))); do
   port=$((ENCODE_PORT_BASE + i))
   CUDA_VISIBLE_DEVICES="$i" vllm serve "$MODEL" \
-    --host "$HOST" --port "$port" \
+    --host "$SERVE_HOST" --port "$port" \
     --gpu-memory-utilization "$GPU_MEM_UTIL_E" \
     "${EAGER_ARG[@]}" \
     --enable-request-id-headers \
@@ -170,7 +172,7 @@ for j in $(seq 0 $((NUM_PD - 1))); do
   gpu=$((NUM_E + j))
   port=$((PD_PORT_BASE + j))
   CUDA_VISIBLE_DEVICES="$gpu" vllm serve "$MODEL" \
-    --host "$HOST" --port "$port" \
+    --host "$SERVE_HOST" --port "$port" \
     --gpu-memory-utilization "$GPU_MEM_UTIL_PD" \
     "${EAGER_ARG[@]}" \
     --enable-request-id-headers \
@@ -232,7 +234,7 @@ vllm bench serve \
   --model "$MODEL" \
   --backend openai-chat \
   --endpoint /v1/chat/completions \
-  --base-url "http://${HOST}:${PROXY_PORT}" \
+  --base-url "http://${SERVE_HOST}:${PROXY_PORT}" \
   "${DATA_ARG[@]}" \
   --seed "$SEED" \
   --num-prompts "$NUM_PROMPTS" \
