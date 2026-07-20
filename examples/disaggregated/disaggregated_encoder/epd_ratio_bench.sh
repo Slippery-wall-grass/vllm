@@ -20,6 +20,15 @@
 # prompt across all PD workers (both are comma-separated URL lists).
 set -euo pipefail
 
+# FlashInfer JIT-compiles its kernels with the conda gcc-13 toolchain, so the
+# cached .so files need GLIBCXX_3.4.32. Without this, dlopen resolves against
+# the older system /lib/x86_64-linux-gnu/libstdc++.so.6 and EngineCore dies at
+# startup ("version `GLIBCXX_3.4.32' not found"). Interactive shells usually
+# have this exported already; batch jobs (sbatch) do not -- so set it here.
+if [ -n "${CONDA_PREFIX:-}" ]; then
+  export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
+fi
+
 ###############################################################################
 # Configuration -- override via env
 ###############################################################################
