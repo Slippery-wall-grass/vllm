@@ -83,6 +83,7 @@ NOVELTY_RATE="${NOVELTY_RATE:-0.3}"
 INPUT_LEN="${INPUT_LEN:-256}"
 OUTPUT_LEN="${OUTPUT_LEN:-128}"
 
+METRIC_INTERVAL="${METRIC_INTERVAL:-0.5}"   # /metrics polling period
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-1800}"
 GIT_ROOT=$(git rev-parse --show-toplevel)
 RESULT_DIR="${RESULT_DIR:-$(pwd)/epd_ratio_${NUM_E}E${NUM_PD}PD_$(date +%Y%m%d_%H%M%S)}"
@@ -155,6 +156,7 @@ fi
 # Encoder workers: GPUs [0, NUM_E)
 ###############################################################################
 e_urls=""
+metric_spec=""
 for i in $(seq 0 $((NUM_E - 1))); do
   port=$((ENCODE_PORT_BASE + i))
   CUDA_VISIBLE_DEVICES="$i" vllm serve "$MODEL" \
@@ -170,6 +172,7 @@ for i in $(seq 0 $((NUM_E - 1))); do
     >"$RESULT_DIR/encoder.$i.log" 2>&1 &
   PIDS+=($!)
   e_urls="${e_urls:+$e_urls,}http://localhost:$port"
+  metric_spec="${metric_spec:+$metric_spec,}E$i=http://localhost:$port"
   log "  encoder[$i] gpu=$i port=$port"
 done
 
@@ -192,6 +195,7 @@ for j in $(seq 0 $((NUM_PD - 1))); do
     >"$RESULT_DIR/pd.$j.log" 2>&1 &
   PIDS+=($!)
   d_urls="${d_urls:+$d_urls,}http://localhost:$port"
+  metric_spec="${metric_spec:+$metric_spec,}PD$j=http://localhost:$port"
   log "  pd[$j] gpu=$gpu port=$port"
 done
 
@@ -238,6 +242,16 @@ else
   DATA_ARG=(--dataset-name "$DATASET_NAME" --dataset-path "$DATASET_PATH")
 fi
 
+# Per-worker service rate: poll every engine's Prometheus endpoint for the
+# duration of the benchmark, then derive mu = completions / busy-time.
+SR_PY="$GIT_ROOT/benchmarks/encoder_cache_eval/worker_service_rate.py"
+sampler_pid=""
+if [ -f "$SR_PY" ]; then
+  python "$SR_PY" sample --engines "$metric_spec"     --out "$RESULT_DIR/metrics.csv" --interval "$METRIC_INTERVAL" &
+  sampler_pid=$!
+  log "metrics sampler started (pid=$sampler_pid, interval=${METRIC_INTERVAL}s)"
+fi
+
 log "running benchmark (n=$NUM_PROMPTS, dataset=$DATASET_NAME)..."
 vllm bench serve \
   --model "$MODEL" \
@@ -251,6 +265,12 @@ vllm bench serve \
   --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,95,99 \
   --save-result --result-filename "$RESULT_DIR/bench.json" \
   2>&1 | tee "$RESULT_DIR/bench.log"
+
+if [ -n "$sampler_pid" ]; then
+  kill "$sampler_pid" 2>/dev/null || true
+  wait "$sampler_pid" 2>/dev/null || true
+  python "$SR_PY" report "$RESULT_DIR/metrics.csv"     --md "$RESULT_DIR/service_rate.md" || log "WARN: service-rate report failed"
+fi
 
 # Record the exact configuration next to the results for reproducibility.
 cat >"$RESULT_DIR/meta.json" <<EOF
