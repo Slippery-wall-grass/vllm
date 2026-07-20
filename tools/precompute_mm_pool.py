@@ -49,11 +49,10 @@ if _REPO_ROOT not in sys.path:
 from vllm.multimodal.hasher import MultiModalHasher  # noqa: E402
 from vllm.multimodal.image import convert_image_mode  # noqa: E402
 from vllm.multimodal.media import MediaWithBytes  # noqa: E402
-from vllm.v1.core.encoder_cache_lambda import (  # noqa: E402
-    TypeStats,
-    dual_value,
-    solve_lambda_star,
-)
+# NOTE: vllm.v1.core.encoder_cache_lambda is imported lazily inside cmd_solve.
+# It only exists on the encoder-cache research branches, and only the `solve`
+# subcommand needs it -- keeping it out of module scope lets `generate` /
+# `measure` / `prewarm` run against a stock upstream vLLM checkout.
 
 
 # 4 buckets per user specification (resolution-independent of distribution).
@@ -692,6 +691,13 @@ def _reset_encoder_cache_endpoint(
 
 
 def cmd_solve(args: argparse.Namespace) -> None:
+    # Lazy import: only the Lagrangian solve path needs the research module.
+    from vllm.v1.core.encoder_cache_lambda import (
+        TypeStats,
+        dual_value,
+        solve_lambda_star,
+    )
+
     spec_path = os.path.join(args.pool_dir, "pool_spec.json")
     with open(spec_path, "r", encoding="utf-8") as f:
         spec = json.load(f)
