@@ -1305,6 +1305,268 @@ class RandomMultiModalDataset(RandomDataset):
 
 
 # -----------------------------------------------------------------------------
+# Fixed-pool Multi-Modal Dataset (for encoder-cache policy evaluation)
+# -----------------------------------------------------------------------------
+
+
+def _process_image_png(image: Image.Image) -> dict[str, Any]:
+    """Encode ``image`` as base64 PNG (lossless) for OpenAI-format payloads.
+
+    Required by :class:`MMFixedPoolDataset` so that round-tripping the
+    image through the network does not change pixel values (JPEG would).
+    Pixel stability is what makes :class:`MultiModalHasher` produce a
+    stable mm_hash that the precompute tool can reproduce offline.
+    """
+    image = convert_image_mode(image, "RGB")
+    with io.BytesIO() as buf:
+        image.save(buf, format="PNG", optimize=False)
+        encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{encoded}"},
+    }
+
+
+class MMFixedPoolDataset(BenchmarkDataset):
+    """Fixed-pool multimodal dataset for encoder-cache policy evaluation.
+
+    Unlike :class:`RandomMultiModalDataset` which generates fresh random
+    pixels per request (so every mm_hash differs and the encoder cache
+    hit rate is zero), this dataset draws each image independently from
+    a finite pool of K pre-generated PNG files. Cache-hit behavior is
+    determined entirely by the chosen frequency distribution ``p_i``.
+
+    Expected pool layout (produced by ``tools/precompute_mm_pool.py``)::
+
+        pool_dir/
+        ├── pool_spec.json
+        └── images/
+            ├── 000.png
+            └── ...
+
+    ``pool_spec.json`` schema::
+
+        {
+          "version": 1,
+          "seed": <int>,
+          "distribution": {"kind": "uniform" | "zipf" | "geom" | "custom",
+                            "param": <float>?,
+                            "probs": [<float>, ...]?},
+          "images_dir": "images",
+          "types": [
+            {"idx": <int>, "height": <int>, "width": <int>,
+             "filename": "000.png", "p": <float>,
+             "m_tokens": <int>, "c_seconds": <float>,
+             "mm_hash": "<hex>"},
+            ...
+          ]
+        }
+
+    Per-request multimodal layout obeys the same ``base_items_per_request``
+    / ``num_mm_items_range_ratio`` flags as :class:`RandomMultiModalDataset`.
+    Each image within a request is sampled independently from the
+    distribution given in ``pool_spec.json``.
+
+    Optional ``novelty_rate`` (in [0, 1]) injects one-shot novel images
+    into the stream: with probability ``novelty_rate`` each image slot
+    is replaced by freshly-generated random pixels (resolution drawn
+    uniformly from the resolutions present in the pool). These novel
+    images have unique mm_hashes and never repeat, simulating the
+    "long-tail" of one-off queries that surround the structured hot
+    set. They are the workload component on which the offline
+    Lagrangian policy is expected to shine, because it knows their
+    mm_hashes are not in the pool and therefore never pins them.
+    """
+
+    IS_MULTIMODAL = True
+    DEFAULT_LIMIT_MM_PER_PROMPT = {"image": 255}
+    DEFAULT_BASE_ITEMS_PER_REQUEST = 1
+    DEFAULT_NUM_MM_ITEMS_RANGE_RATIO = 0.0
+    DEFAULT_NOVELTY_RATE = 0.0
+
+    def __init__(
+        self,
+        pool_dir: str,
+        random_seed: int = BenchmarkDataset.DEFAULT_SEED,
+        disable_shuffle: bool = False,
+        novelty_rate: float = DEFAULT_NOVELTY_RATE,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            dataset_path=pool_dir,
+            random_seed=random_seed,
+            disable_shuffle=disable_shuffle,
+            **kwargs,
+        )
+        if not (0.0 <= float(novelty_rate) <= 1.0):
+            raise ValueError(
+                f"novelty_rate must be in [0, 1], got {novelty_rate}"
+            )
+        self.novelty_rate = float(novelty_rate)
+        self.pool_dir = pool_dir
+        self._rng = np.random.default_rng(self.random_seed)
+        self._load_pool()
+        # Resolutions to draw novel-image dimensions from. Defaulting to
+        # the set of resolutions present in the pool keeps the novelty
+        # stream comparable in encoder cost to the structured stream.
+        self._novel_shapes = sorted(
+            {(int(t["height"]), int(t["width"])) for t in self._spec["types"]}
+        )
+
+    def _load_pool(self) -> None:
+        import os
+
+        spec_path = os.path.join(self.pool_dir, "pool_spec.json")
+        if not os.path.isfile(spec_path):
+            raise FileNotFoundError(
+                f"MMFixedPoolDataset: missing pool_spec.json at {spec_path}. "
+                "Run tools/precompute_mm_pool.py to generate the pool."
+            )
+        with open(spec_path, "r", encoding="utf-8") as f:
+            spec = json.load(f)
+        types = spec["types"]
+        if not types:
+            raise ValueError(f"MMFixedPoolDataset: empty pool at {spec_path}")
+        probs = np.array([float(t["p"]) for t in types], dtype=np.float64)
+        if not np.isclose(probs.sum(), 1.0, atol=1e-6):
+            probs = probs / probs.sum()
+        self._probs = probs
+        self._spec = spec
+
+        images_dir = os.path.join(self.pool_dir, spec.get("images_dir", "images"))
+        self._images: list[Image.Image] = []
+        for t in types:
+            img_path = os.path.join(images_dir, t["filename"])
+            with Image.open(img_path) as im:
+                # Force a full decode so subsequent saves are deterministic.
+                im.load()
+                self._images.append(convert_image_mode(im, "RGB"))
+        logger.info(
+            "MMFixedPoolDataset: loaded %d image types from %s "
+            "(p_min=%.4f, p_max=%.4f)",
+            len(self._images),
+            self.pool_dir,
+            float(probs.min()),
+            float(probs.max()),
+        )
+
+    def _sample_num_items(
+        self,
+        base_items_per_request: int,
+        num_mm_items_range_ratio: float,
+        max_per_request: int,
+    ) -> int:
+        if not (0.0 <= num_mm_items_range_ratio <= 1.0):
+            raise ValueError("num_mm_items_range_ratio must be in [0, 1].")
+        hi = min(
+            max_per_request,
+            math.ceil(base_items_per_request * (1 + num_mm_items_range_ratio)),
+        )
+        lo = max(0, math.floor(base_items_per_request * (1 - num_mm_items_range_ratio)))
+        if lo > hi:
+            raise ValueError(f"Invalid mm-item count range [{lo}, {hi}]")
+        return int(self._rng.integers(lo, hi + 1))
+
+    def _generate_novel_image(self) -> Image.Image:
+        """Generate a one-shot random image with a unique mm_hash.
+
+        Resolution is drawn uniformly from the set of resolutions
+        present in the pool so the encoder cost distribution of the
+        novelty stream is comparable to the structured stream.
+        """
+        shape_idx = int(self._rng.integers(len(self._novel_shapes)))
+        h, w = self._novel_shapes[shape_idx]
+        pixels = self._rng.integers(0, 256, size=(h, w, 3), dtype=np.uint8)
+        return Image.fromarray(pixels, mode="RGB")
+
+    def sample(
+        self,
+        tokenizer: TokenizerLike,
+        num_requests: int,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
+        prefix_len: int = 0,
+        range_ratio: float = 0.0,
+        input_len: int = 1024,
+        output_len: int = 128,
+        limit_mm_per_prompt: dict[str, int] | None = None,
+        base_items_per_request: int = DEFAULT_BASE_ITEMS_PER_REQUEST,
+        num_mm_items_range_ratio: float = DEFAULT_NUM_MM_ITEMS_RANGE_RATIO,
+        enable_multimodal_chat: bool = False,
+        **kwargs,
+    ) -> list[SampleRequest]:
+        del kwargs  # unused; bucket_config is not applicable for fixed pool
+        if limit_mm_per_prompt is None:
+            limit_mm_per_prompt = self.DEFAULT_LIMIT_MM_PER_PROMPT
+        max_images = limit_mm_per_prompt.get("image", 255)
+
+        # Reuse RandomDataset's prompt generator via a thin helper instance.
+        random_ds = RandomDataset(random_seed=self.random_seed)
+        # RandomDataset.sample handles input_len/output_len/range_ratio.
+        # We only need its tokens; multimodal content is overridden below.
+        text_requests = random_ds.sample(
+            tokenizer=tokenizer,
+            num_requests=num_requests,
+            request_id_prefix=request_id_prefix,
+            no_oversample=True,
+            prefix_len=prefix_len,
+            range_ratio=range_ratio,
+            input_len=input_len,
+            output_len=output_len,
+        )
+
+        out: list[SampleRequest] = []
+        for i, base in enumerate(text_requests):
+            n_imgs = self._sample_num_items(
+                base_items_per_request,
+                num_mm_items_range_ratio,
+                max_images,
+            )
+            type_indices: list[int] = []
+            if n_imgs > 0:
+                type_indices = self._rng.choice(
+                    len(self._images),
+                    size=n_imgs,
+                    p=self._probs,
+                    replace=True,
+                ).tolist()
+            mm_content = []
+            for idx in type_indices:
+                if (
+                    self.novelty_rate > 0.0
+                    and float(self._rng.random()) < self.novelty_rate
+                ):
+                    img = self._generate_novel_image()
+                else:
+                    img = self._images[idx]
+                mm_content.append(_process_image_png(img))
+            if enable_multimodal_chat:
+                prompt = self.apply_multimodal_chat_transformation(
+                    base.prompt, mm_content
+                )
+                out.append(
+                    SampleRequest(
+                        prompt=prompt,
+                        prompt_len=base.prompt_len,
+                        expected_output_len=base.expected_output_len,
+                        multi_modal_data=None,
+                        request_id=request_id_prefix + str(i),
+                    )
+                )
+            else:
+                out.append(
+                    SampleRequest(
+                        prompt=base.prompt,
+                        prompt_len=base.prompt_len,
+                        expected_output_len=base.expected_output_len,
+                        multi_modal_data=mm_content,
+                        request_id=request_id_prefix + str(i),
+                    )
+                )
+        return out
+
+
+# -----------------------------------------------------------------------------
 # ShareGPT Dataset Implementation
 # -----------------------------------------------------------------------------
 
@@ -1422,6 +1684,7 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
             "sonnet",
             "random",
             "random-mm",
+            "mm-fixed-pool",
             "random-rerank",
             "hf",
             "custom",
@@ -1789,6 +2052,31 @@ def add_random_multimodal_dataset_args(
         raise ValueError("Unsupported value for --random-mm-bucket-config.")
 
     parser_or_group.add_argument(
+        "--mm-pool-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory produced by tools/precompute_mm_pool.py for the "
+            "'mm-fixed-pool' dataset. Must contain pool_spec.json and "
+            "images/<id>.png. Required when --dataset-name=mm-fixed-pool."
+        ),
+    )
+
+    parser_or_group.add_argument(
+        "--mm-novelty-rate",
+        type=float,
+        default=0.0,
+        help=(
+            "For --dataset-name=mm-fixed-pool: probability in [0, 1] that "
+            "each image slot is replaced by a freshly-generated one-shot "
+            "novel image (unique mm_hash, never repeats). Resolution is "
+            "sampled uniformly from the resolutions present in the pool. "
+            "Used to evaluate cache-policy robustness against long-tail "
+            "queries. Default 0.0 (pure pool sampling)."
+        ),
+    )
+
+    parser_or_group.add_argument(
         "--random-mm-bucket-config",
         type=_parse_mm_bucket_config,
         default=RandomMultiModalDataset.DEFAULT_MM_ITEM_BUCKET_CONFIG,
@@ -2122,6 +2410,25 @@ def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
                 request_id_prefix=args.request_id_prefix,
                 no_oversample=args.no_oversample,
             ),
+            "mm-fixed-pool": lambda: MMFixedPoolDataset(
+                pool_dir=args.mm_pool_dir,
+                random_seed=args.seed,
+                disable_shuffle=args.disable_shuffle,
+                novelty_rate=getattr(args, "mm_novelty_rate", 0.0),
+            ).sample(
+                tokenizer=tokenizer,
+                num_requests=args.num_prompts,
+                prefix_len=args.random_prefix_len,
+                range_ratio=args.random_range_ratio,
+                input_len=args.random_input_len,
+                output_len=args.random_output_len,
+                base_items_per_request=args.random_mm_base_items_per_request,
+                limit_mm_per_prompt=args.random_mm_limit_mm_per_prompt,
+                num_mm_items_range_ratio=args.random_mm_num_mm_items_range_ratio,
+                enable_multimodal_chat=args.enable_multimodal_chat,
+                request_id_prefix=args.request_id_prefix,
+                no_oversample=args.no_oversample,
+            ),
             "random-rerank": lambda: RandomDatasetForReranking(
                 random_seed=args.seed,
                 dataset_path=args.dataset_path,
@@ -2166,7 +2473,10 @@ def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
 
         try:
             # Enforce endpoint compatibility for multimodal datasets.
-            if args.dataset_name == "random-mm" and args.backend not in ["openai-chat"]:
+            if args.dataset_name in (
+                "random-mm",
+                "mm-fixed-pool",
+            ) and args.backend not in ["openai-chat"]:
                 raise ValueError(
                     "Multi-modal content (images) is only supported on "
                     "'openai-chat' backend."

@@ -73,6 +73,36 @@ def extract_mm_items(request_data: dict) -> list[dict]:
     return items
 
 
+# [research] skip-E on bounded L3 cache. 判重依据 = 真实 L3 store 文件是否存在
+# (而非老版的 proxy 内存 seen-set). proxy 给每张图注入 uuid=sha1(url), 该 uuid 经
+# vLLM mm_uuid 机制成为全链路 identifier -> E 把 embedding 存 <store>/<sha1>/... ,
+# PD 用同 uuid 从 L3 取. L3 淘汰即删文件 -> proxy 查即为 False -> 不再跳 -> 消除反噬.
+def _url_sha1(item: dict) -> str:
+    import hashlib as _hl
+
+    u = (item.get("image_url") or item.get("video_url") or {}).get("url", "")
+    return _hl.sha1(u.encode("utf-8")).hexdigest()
+
+
+def _ec_store_dir() -> str:
+    return os.environ.get("EC_STORE", "/tmp/ec_cache_policy")
+
+
+def _l3_has(url_sha1: str) -> bool:
+    """判重: 该 url_sha1 的 embedding 是否已在 L3 store(真实文件, 反映淘汰)."""
+    fp = os.path.join(_ec_store_dir(), url_sha1, "encoder_cache.safetensors")
+    return os.path.exists(fp)
+
+
+def inject_mm_uuids(request_data: dict) -> None:
+    """给每个 image/audio item 注入 uuid=sha1(url), 使全链路(L1/L2/L3)按 url_sha1 键控.
+    就地修改; 对发往 E 和发往 PD 的同一份 item 都生效(extract 返回的是引用)."""
+    if os.environ.get("SKIP_E", "0") == "0":
+        return
+    for it in extract_mm_items(request_data):
+        it["uuid"] = _url_sha1(it)
+
+
 async def fanout_encoder_primer(
     orig_request: dict,
     e_urls: list[str],
@@ -92,10 +122,86 @@ async def fanout_encoder_primer(
 
     logger.info("[%s] got %d multimodal items...", req_id, len(mm_items))
 
+    # [research] SKIP_E=1: 命中(embedding 已在 L3, 按真实文件判)的图不发 E;
+    # 只把 miss 的新图发 E; 全命中则完全跳过 E. 判重查 L3 store 文件 -> 反映淘汰, 不反噬.
+    if os.environ.get("SKIP_E", "0") != "0":
+        _unseen = []
+        _n_hit = 0
+        for _it in mm_items:
+            if _l3_has(_url_sha1(_it)):
+                _n_hit += 1
+            else:
+                _unseen.append(_it)
+        logger.info(
+            "[SkipE] %s items=%d hit(skip)=%d encode=%d",
+            req_id, len(mm_items), _n_hit, len(_unseen),
+        )
+        mm_items = _unseen
+        if not mm_items:
+            return  # 全部命中 -> 完全跳过 E(不发编码请求)
+
+    # Default: send ALL mm items in ONE request to a single encode server, so E
+    # pays the per-request overhead (HTTP + schedule + EC finished handshake)
+    # ONCE instead of once per image. Each item keeps its own uuid -> mm_hash,
+    # so the encoder-cache keying is unchanged. Set EC_MERGE_ENCODE=0 for the
+    # legacy one-request-per-image fan-out (for A/B).
+    if os.environ.get("EC_MERGE_ENCODE", "1") != "0":
+        import time as _t
+
+        target_url = random.choice(e_urls)
+        headers = {"x-request-id": f"{req_id}:enc"}
+        encoder_req = {
+            "model": orig_request.get("model"),
+            "messages": [{"role": "user", "content": list(mm_items)}],
+            "max_tokens": 1,
+            "stream": False,
+        }
+        _t0 = _t.perf_counter()
+        resp = await encode_session.post(
+            f"{target_url}/v1/chat/completions",
+            json=encoder_req,
+            headers=headers,
+        )
+        logger.info(
+            "[EncReqTiming] %s merged_items=%d ms=%.1f status=%s",
+            req_id,
+            len(mm_items),
+            (_t.perf_counter() - _t0) * 1000.0,
+            resp.status,
+        )
+        if resp.status != 200:
+            try:
+                detail = await resp.text()
+            except Exception:
+                detail = "<unable to read body>"
+            raise HTTPException(
+                status_code=resp.status,
+                detail=f"Encoder request failed: {detail}",
+            )
+        return
+
     tasks = []
 
     # Round-robin over encode servers to distribute load a bit
     url_cycle = (e_urls[i % len(e_urls)] for i in range(len(mm_items)))
+
+    async def _timed_encode_post(idx, target_url, encoder_req, headers):
+        # Per-child-request latency. Lets us tell whether E runs the fan-out
+        # concurrently (every child ~= the whole fan-out) or serializes it
+        # (children stagger; their latencies roughly sum to the fan-out), and
+        # how big the per-request floor is vs the encode compute.
+        import time as _t
+        _t0 = _t.perf_counter()
+        resp = await encode_session.post(
+            f"{target_url}/v1/chat/completions",
+            json=encoder_req,
+            headers=headers,
+        )
+        logger.info(
+            "[EncReqTiming] %s child=%d ms=%.1f status=%s",
+            req_id, idx, (_t.perf_counter() - _t0) * 1000.0, resp.status,
+        )
+        return resp
 
     for idx, (item, target_url) in enumerate(zip(mm_items, url_cycle)):
         # Derive a *child* request id:  <parent>:<index>:<random-short>
@@ -112,13 +218,7 @@ async def fanout_encoder_primer(
             "max_tokens": 1,
             "stream": False,
         }
-        tasks.append(
-            encode_session.post(
-                f"{target_url}/v1/chat/completions",
-                json=encoder_req,
-                headers=headers,
-            )
-        )
+        tasks.append(_timed_encode_post(idx, target_url, encoder_req, headers))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -319,6 +419,8 @@ async def forward_non_stream(
     req_data: dict, req_id: str, e_urls: list[str], p_url: str, d_url: str
 ) -> dict:
     try:
+        # [research] skip-E: 注入 uuid=sha1(url) 到每张图(发 E 和发 PD 前), 全链路按 url 键控
+        inject_mm_uuids(req_data)
         # Step 1: Process through Encoder instance (if has MM input)
         await fanout_encoder_primer(req_data, e_urls, req_id)
 
@@ -346,18 +448,29 @@ async def forward_non_stream(
 async def forward_stream(
     req_data: dict, req_id: str, e_urls: list[str], p_url: str, d_url: str
 ) -> AsyncIterator[str]:
+    import time
     try:
+        t0 = time.perf_counter()
+        # [research] skip-E: 注入 uuid=sha1(url) 到每张图(发 E 和发 PD 前)
+        inject_mm_uuids(req_data)
         # Step 1: Process through Encoder instance (if has MM input)
         await fanout_encoder_primer(req_data, e_urls, req_id)
+        t_enc = time.perf_counter()
 
         # Step 2: Process through Prefill instance
         req_data = await maybe_prefill(req_data, p_url, req_id)
+        t_pf = time.perf_counter()
 
         # Step 3: Process through Decode instance
         logger.info("[%s] Starting streaming from decode: %s", req_id, d_url)
         headers = {"x-request-id": req_id}
 
-        # Streaming response
+        # Streaming response. On the first chunk, log how the proxy's wall-clock
+        # TTFT splits across stages so we can see where it actually goes:
+        #   encoder_ms      = E fan-out (awaited before PD is even contacted)
+        #   prefill_ms      = optional E->P stage (disabled in E+PD mode -> ~0)
+        #   pd_first_chunk  = PD POST -> first streamed token (PD queue+prefill)
+        first = True
         async with decode_session.post(
             f"{d_url}/v1/chat/completions",
             json=req_data,
@@ -366,6 +479,18 @@ async def forward_stream(
             resp.raise_for_status()
             async for chunk in resp.content.iter_chunked(1024):
                 if chunk:
+                    if first:
+                        t_first = time.perf_counter()
+                        logger.info(
+                            "[ProxyStageTiming] %s encoder_ms=%.1f prefill_ms=%.1f "
+                            "pd_first_chunk_ms=%.1f total_ms=%.1f",
+                            req_id,
+                            (t_enc - t0) * 1000.0,
+                            (t_pf - t_enc) * 1000.0,
+                            (t_first - t_pf) * 1000.0,
+                            (t_first - t0) * 1000.0,
+                        )
+                        first = False
                     yield chunk.decode("utf-8", errors="ignore")
 
         logger.info("[%s] Streaming completed", req_id)
