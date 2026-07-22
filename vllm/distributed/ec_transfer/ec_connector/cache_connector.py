@@ -197,11 +197,29 @@ class ECCacheConnector(ECConnectorBase):
             return self._evict_candidate_value_density()
         return self._evict_candidate_lru()
 
+    def _evictable(self, mm_hash: str, e: "_Entry", wall_now: float) -> bool:
+        """Safety filter shared by all policies. An entry may be evicted only if
+        it is unreferenced (ref==0) AND its FILE mtime is older than the grace
+        window. Using the file's mtime (not the per-process in-memory
+        last_access) is what makes eviction safe ACROSS PROCESSES: a consumer
+        that commits to a load bumps the mtime in has_cache_item(), so the
+        producer — a different process even in 1E1PD — sees it as recently used
+        and won't evict it out from under the in-flight load (the TOCTOU that
+        crashed _gather_mm_embeddings with grace=0)."""
+        if e.ref != 0:
+            return False
+        try:
+            mtime = os.path.getmtime(self._filename(mm_hash))
+        except OSError:
+            return True  # file already gone -> stale index entry, safe to drop
+        return (wall_now - mtime) >= self._grace_sec
+
     def _evict_candidate_lru(self) -> str | None:
-        """LRU: oldest entry with ref==0 and past the grace window."""
-        now = time.monotonic()
+        """LRU: oldest (by in-memory order) entry that passes the evictable
+        safety filter (ref==0 + file-mtime past grace)."""
+        wall_now = time.time()
         for mm_hash, e in self._index.items():  # LRU order, oldest first
-            if e.ref == 0 and (now - e.last_access) >= self._grace_sec:
+            if self._evictable(mm_hash, e, wall_now):
                 return mm_hash
         return None
 
@@ -212,11 +230,11 @@ class ECCacheConnector(ECConnectorBase):
         m = size in MB; C0 = size-independent front-end benefit; k = per-MB
         encode benefit. Small + frequently-reused entries score highest → kept;
         large one-shot entries score lowest → evicted first."""
-        now = time.monotonic()
+        wall_now = time.time()
         victim: str | None = None
         victim_pri = float("inf")
         for mm_hash, e in self._index.items():
-            if e.ref != 0 or (now - e.last_access) < self._grace_sec:
+            if not self._evictable(mm_hash, e, wall_now):
                 continue
             size_mb = max(e.size_bytes / 1e6, 1e-6)
             freq = e.hits + 1  # initial store counts as one access
@@ -299,7 +317,18 @@ class ECCacheConnector(ECConnectorBase):
 
     def has_cache_item(self, identifier: str) -> bool:
         # Filesystem is the cross-process source of truth (index is per-process).
-        return os.path.exists(self._filename(identifier))
+        fn = self._filename(identifier)
+        if not os.path.exists(fn):
+            return False
+        # Committing to a load: bump mtime so the producer's grace window (which
+        # keys on file mtime, see _evictable) protects this file through the
+        # schedule->load gap. This is the cross-process reservation that keeps a
+        # separate producer process from evicting an item mid-load.
+        try:
+            os.utime(fn, None)
+        except OSError:
+            pass  # racing delete -> load will miss-recover, never crash
+        return True
 
     # ==============================
     # Helpers
