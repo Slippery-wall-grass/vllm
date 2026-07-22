@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -704,6 +705,15 @@ class GPUModelRunner(
         # Encoder timing registry for observability
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
         self._encoder_timing_lock = threading.Lock()
+
+        # EPD evidence: env-gated encode-forward timing (the "processing time"
+        # that L2/L3 content-hits and skip-E save). Independent of the upstream
+        # mm_processor_stats path (which needs an RPC the disagg harness lacks).
+        # Off by default -> zero overhead (no cuda sync); set EPD_ENCODE_TIMING=1.
+        self._epd_enc_timing = os.environ.get("EPD_ENCODE_TIMING", "0") != "0"
+        self._epd_enc_secs = 0.0
+        self._epd_enc_items = 0
+        self._epd_enc_tokens = 0
 
         # Persistent buffers for CUDA graphs.
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
@@ -2900,6 +2910,12 @@ class GPUModelRunner(
             and scheduler_output.scheduled_encoder_inputs
         )
 
+        # EPD evidence: time the encoder forward for this batch (cuda-synced).
+        _epd_t0 = None
+        if self._epd_enc_timing:
+            torch.accelerator.synchronize()
+            _epd_t0 = time.perf_counter()
+
         # Batch mm inputs as much as we can: if a request in the batch has
         # multiple modalities or a different modality than the previous one,
         # we process it separately to preserve item order.
@@ -3059,6 +3075,26 @@ class GPUModelRunner(
             encoder_outputs.extend(batch_outputs)
 
             current_item_idx += num_items
+
+        # EPD evidence: accumulate encode-forward time + token count, log avg
+        # every 10 items. This is the "processing time" that a content-hash L2/L3
+        # hit (skips encode) or a skip-E hit (skips the whole E) removes.
+        if _epd_t0 is not None:
+            torch.accelerator.synchronize()
+            _epd_dt = time.perf_counter() - _epd_t0
+            _n = len(encoder_outputs)
+            self._epd_enc_secs += _epd_dt
+            self._epd_enc_items += _n
+            self._epd_enc_tokens += sum(
+                (o.shape[0] if o.ndim >= 1 else 0) for o in encoder_outputs
+            )
+            if self._epd_enc_items and self._epd_enc_items % 10 < _n:
+                logger.info(
+                    "[E encode] items=%d avg=%.1fms/item avg_tokens=%.0f",
+                    self._epd_enc_items,
+                    self._epd_enc_secs / self._epd_enc_items * 1e3,
+                    self._epd_enc_tokens / self._epd_enc_items,
+                )
 
         # Cache the encoder outputs by mm_hash
         for mm_hash, output in zip(mm_hashes, encoder_outputs):

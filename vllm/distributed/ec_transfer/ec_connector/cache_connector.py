@@ -12,8 +12,19 @@ Design invariants (see docs/L3_cache_改造spec.md):
     read. Cross-process read/delete safety = atomic write (.tmp->replace),
     an eviction grace window, and miss-is-recoverable loads (a consumer that
     loses the race just recomputes locally, never crashes).
-  * Eviction ordering is delegated to `_evict_candidate()` — LRU here, a
-    value-density (p*c/m) policy can drop in later without touching the rest.
+  * Eviction ordering is delegated to `_evict_candidate()`. Two policies:
+      - "lru"           : oldest unreferenced, out-of-grace entry (P1 default).
+      - "value_density" : GDSF — evict min priority = L + f*(C0/m + k), where
+        f=reuse count, m=size, C0=size-INDEPENDENT skip-E benefit (the whole E
+        front-end: fetch+preprocess+orch+net), k=per-byte encode benefit.
+        Rationale: with skip-E a hit saves the front-end C0 (NOT just encode),
+        so benefit/byte = p*(C0/m + k) makes SIZE matter again — small
+        embeddings are cheap to keep yet save the same big C0 → value-density
+        prefers keeping many small hot images over few large ones, which plain
+        LRU/LFU cannot express. (Old encode-only regime had c∝m so c/m≈const →
+        value-density collapsed to LFU; skip-E is what revives it.)
+        `L` is the classic GDSF aging clock (= priority of last victim) so a
+        once-popular item cannot squat forever.
 """
 import os
 import threading
@@ -41,6 +52,14 @@ logger = init_logger(__name__)
 _DEFAULT_STORAGE = "/dev/shm/ec_cache"
 _DEFAULT_MAX_BYTES = 4 * 1024**3  # 4 GiB
 _DEFAULT_GRACE_SEC = 10.0
+_DEFAULT_EVICT_POLICY = "lru"  # "lru" | "value_density"
+# GDSF cost model (only used by value_density). Units are relative "ms-like"
+# benefit; absolute scale is irrelevant, only the ratio C0 : k*size matters.
+# Grounded in the measured E-fanout breakdown (see epd-experiments-results):
+# front-end (fetch~230+preprocess~140+orch~175+net~280) ~= 650ms, size-indep;
+# encode ~100ms over a ~16MB avg embedding -> ~6 ms/MB.
+_DEFAULT_FRONTEND_COST = 650.0     # C0: size-independent skip-E benefit (ms)
+_DEFAULT_ENCODE_COST_PER_MB = 6.0  # k : per-MB encode benefit (ms/MB)
 
 
 @dataclass
@@ -82,6 +101,18 @@ class ECCacheConnector(ECConnectorBase):
         self._grace_sec = float(
             cfg.get_from_extra_config("ec_cache_evict_grace_sec", _DEFAULT_GRACE_SEC)
         )
+        self._evict_policy = str(
+            cfg.get_from_extra_config("ec_cache_evict_policy", _DEFAULT_EVICT_POLICY)
+        ).lower()
+        self._c0 = float(
+            cfg.get_from_extra_config("ec_cache_frontend_cost", _DEFAULT_FRONTEND_COST)
+        )
+        self._k_per_mb = float(
+            cfg.get_from_extra_config(
+                "ec_cache_encode_cost_per_mb", _DEFAULT_ENCODE_COST_PER_MB
+            )
+        )
+        self._aging_L = 0.0  # GDSF aging clock (priority of last evicted victim)
         os.makedirs(self._storage_path, exist_ok=True)
 
         # Producer-side cache index (writer/evictor owns capacity accounting).
@@ -97,13 +128,23 @@ class ECCacheConnector(ECConnectorBase):
         self._n_evict = 0
         self._n_hit = 0
         self._n_miss = 0
+        # L3 transfer-time evidence: how long a hit's load(safetensors) actually
+        # takes vs the encode it replaces. Sum + count -> avg; also track max.
+        self._load_time_sum = 0.0
+        self._load_time_max = 0.0
+        self._load_bytes_sum = 0
+        self._save_time_sum = 0.0
 
         logger.info(
-            "ECCacheConnector role=%s path=%s cap=%.2fGiB grace=%.1fs",
+            "ECCacheConnector role=%s path=%s cap=%.2fGiB grace=%.1fs "
+            "policy=%s%s",
             role,
             self._storage_path,
             self._capacity_bytes / 1024**3,
             self._grace_sec,
+            self._evict_policy,
+            (f" (C0={self._c0} k={self._k_per_mb}/MB)"
+             if self._evict_policy == "value_density" else ""),
         )
 
     # ==============================
@@ -121,15 +162,19 @@ class ECCacheConnector(ECConnectorBase):
                 self._touch(mm_hash)
                 return
             self._ensure_capacity(size)
+            _t0 = time.monotonic()
             self._atomic_write(mm_hash, tensors)
+            self._save_time_sum += time.monotonic() - _t0
             self._index[mm_hash] = _Entry(size_bytes=size, last_access=time.monotonic())
             self._used_bytes += size
             self._n_save += 1
         if self._n_save % 10 == 0:
             logger.info(
-                "[L3 stats] save=%d evict=%d hit=%d miss=%d used=%.0fMB/%.0fMB entries=%d",
+                "[L3 stats] save=%d evict=%d hit=%d miss=%d used=%.0fMB/%.0fMB "
+                "entries=%d save_avg=%.2fms",
                 self._n_save, self._n_evict, self._n_hit, self._n_miss,
-                self._used_bytes / 1e6, self._capacity_bytes / 1e6, len(self._index))
+                self._used_bytes / 1e6, self._capacity_bytes / 1e6, len(self._index),
+                self._save_time_sum / self._n_save * 1e3)
 
     def _ensure_capacity(self, incoming: int) -> None:
         """Evict LRU, unreferenced, out-of-grace entries until `incoming` fits.
@@ -145,13 +190,43 @@ class ECCacheConnector(ECConnectorBase):
             self._delete_entry(victim)
 
     def _evict_candidate(self) -> str | None:
-        """Pluggable eviction choice. P1 = LRU: oldest entry with ref==0 and
-        past the grace window. (Swap this body for value-density p*c/m later.)"""
+        """Pluggable eviction choice; dispatch on configured policy.
+        Both policies only ever consider entries that are unreferenced (ref==0)
+        and past the grace window — that safety filter is policy-independent."""
+        if self._evict_policy == "value_density":
+            return self._evict_candidate_value_density()
+        return self._evict_candidate_lru()
+
+    def _evict_candidate_lru(self) -> str | None:
+        """LRU: oldest entry with ref==0 and past the grace window."""
         now = time.monotonic()
         for mm_hash, e in self._index.items():  # LRU order, oldest first
             if e.ref == 0 and (now - e.last_access) >= self._grace_sec:
                 return mm_hash
         return None
+
+    def _evict_candidate_value_density(self) -> str | None:
+        """GDSF value-density: evict the entry with the LOWEST priority
+        P = L + f * (C0/m + k), advancing the aging clock L to the victim's P.
+        f = reuse count (>=1 so a never-reused item still has a benefit term);
+        m = size in MB; C0 = size-independent front-end benefit; k = per-MB
+        encode benefit. Small + frequently-reused entries score highest → kept;
+        large one-shot entries score lowest → evicted first."""
+        now = time.monotonic()
+        victim: str | None = None
+        victim_pri = float("inf")
+        for mm_hash, e in self._index.items():
+            if e.ref != 0 or (now - e.last_access) < self._grace_sec:
+                continue
+            size_mb = max(e.size_bytes / 1e6, 1e-6)
+            freq = e.hits + 1  # initial store counts as one access
+            pri = self._aging_L + freq * (self._c0 / size_mb + self._k_per_mb)
+            if pri < victim_pri:
+                victim_pri = pri
+                victim = mm_hash
+        if victim is not None:
+            self._aging_L = victim_pri  # aging: future items must beat this floor
+        return victim
 
     def _delete_entry(self, mm_hash: str) -> None:
         try:
@@ -196,19 +271,30 @@ class ECCacheConnector(ECConnectorBase):
                 continue
             fn = self._filename(mm.mm_hash)
             try:
-                ec = safetensors.torch.load_file(
+                _t0 = time.monotonic()
+                loaded = safetensors.torch.load_file(
                     fn, device=current_platform.device_type
                 )["ec_cache"]
+                _dt = time.monotonic() - _t0
             except (FileNotFoundError, OSError) as ex:
                 # Recoverable miss: evicted/torn between check and load.
                 # Leave it absent -> PD re-encodes locally. Never crash.
                 self._n_miss += 1
                 logger.debug("L3 miss for %s (%s) -> local recompute", mm.mm_hash, ex)
                 continue
-            encoder_cache[mm.mm_hash] = ec
+            encoder_cache[mm.mm_hash] = loaded
             self._n_hit += 1
+            self._load_time_sum += _dt
+            self._load_time_max = max(self._load_time_max, _dt)
+            self._load_bytes_sum += loaded.numel() * loaded.element_size()
             if self._n_hit % 10 == 0:
-                logger.info("[L3 stats] load-hit=%d miss=%d", self._n_hit, self._n_miss)
+                logger.info(
+                    "[L3 stats] load-hit=%d miss=%d load_avg=%.2fms load_max=%.2fms "
+                    "avg_MB=%.2f",
+                    self._n_hit, self._n_miss,
+                    self._load_time_sum / self._n_hit * 1e3,
+                    self._load_time_max * 1e3,
+                    self._load_bytes_sum / self._n_hit / 1e6)
             self._on_hit(mm.mm_hash)
 
     def has_cache_item(self, identifier: str) -> bool:

@@ -118,6 +118,10 @@ EC_CONNECTOR="${EC_CONNECTOR:-ECExampleConnector}"
 EC_EXTRA="{\"shared_storage_path\":\"$EC_STORE\""
 [ -n "${EC_CACHE_MAX_BYTES:-}" ] && EC_EXTRA="$EC_EXTRA,\"ec_cache_max_bytes\":$EC_CACHE_MAX_BYTES"
 [ -n "${EC_CACHE_GRACE:-}" ] && EC_EXTRA="$EC_EXTRA,\"ec_cache_evict_grace_sec\":$EC_CACHE_GRACE"
+# Phase B: eviction policy (lru | value_density) + GDSF cost model (optional).
+[ -n "${EC_CACHE_EVICT_POLICY:-}" ] && EC_EXTRA="$EC_EXTRA,\"ec_cache_evict_policy\":\"$EC_CACHE_EVICT_POLICY\""
+[ -n "${EC_CACHE_FRONTEND_COST:-}" ] && EC_EXTRA="$EC_EXTRA,\"ec_cache_frontend_cost\":$EC_CACHE_FRONTEND_COST"
+[ -n "${EC_CACHE_ENCODE_COST_PER_MB:-}" ] && EC_EXTRA="$EC_EXTRA,\"ec_cache_encode_cost_per_mb\":$EC_CACHE_ENCODE_COST_PER_MB"
 EC_EXTRA="$EC_EXTRA}"
 ENCODE_MAX_NUM_SEQS="${ENCODE_MAX_NUM_SEQS:-16}"  # throttle encode -> bottleneck
 PD_MAX_NUM_SEQS="${PD_MAX_NUM_SEQS:-128}"
@@ -305,6 +309,7 @@ start_disagg() {
       VLLM_ENCODER_CACHE_STATS_INTERVAL_SEC="$STATS_INTERVAL" \
       VLLM_TRACK_ENCODER_FORWARD_TIME=1 \
       VLLM_ENCODER_FORWARD_LOG_INTERVAL_SEC="$STATS_INTERVAL" \
+      EPD_ENCODE_TIMING="${EPD_ENCODE_TIMING:-0}" \
       $enc_ec_env $offline_env \
       vllm serve "$MODEL" \
         --host "$HOST" --port "$ENCODE_PORT" \
@@ -507,6 +512,19 @@ if [ -f "$PHASE" ]; then
          cat "$RESULT_DIR/phase_breakdown.md"; \
          echo "===================================================="; } \
     || log "WARN: phase_breakdown failed (non-fatal)"
+fi
+
+# ── Hit rates (clean-tree L3): skip-E / L3-read / MM-content + occupancy ─────
+# aggregate.py's fork L2 "hit_rate=" line is absent in the clean tree, so parse
+# the signals that DO exist ([SkipE] / [L3 stats] / MM cache hit rate).
+HITR="$GIT_ROOT/benchmarks/encoder_cache_eval/hit_rate.py"
+if [ -f "$HITR" ]; then
+  log "hit-rate summary -> hit_rate.md"
+  for POL in $POLICIES; do
+    python "$HITR" --result-dir "$RESULT_DIR" --policy "$POL" \
+      --output-md "$RESULT_DIR/hit_rate.md" \
+      || log "WARN: hit_rate failed (non-fatal)"
+  done
 fi
 
 # ── Bottleneck: which stage (E vs PD) starts queuing first ───────────────────
