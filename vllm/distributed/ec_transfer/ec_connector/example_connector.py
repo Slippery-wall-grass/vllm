@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -90,6 +91,29 @@ class ECExampleConnector(ECConnectorBase):
             logger.debug("Shared storage path is %s", self._storage_path)
         else:
             raise ValueError("ec_transfer_config must be set for ECConnectorBase")
+
+        # Bounded-L3: give the shared store its OWN byte capacity + eviction,
+        # independent of the L2 (encoder_cache_manager) policy cascade. 0 = the
+        # legacy append-only behaviour (unbounded), so existing runs are
+        # unaffected. The producer (E) is the single writer + single evictor;
+        # eviction reuses the deferred-delete grace machinery (_pending_deletes)
+        # so an in-flight consumer read of a just-evicted hash still finds the
+        # physical file, and the worker's inline fallback re-encode covers the
+        # case where the grace window has already elapsed.
+        #   * unit = bytes of the cpu safetensors payload.
+        #   * order = LRU by producer write/re-encode recency. NOTE: consumer
+        #     (PD) reads happen in a different process and CANNOT refresh this
+        #     order, so a hot item read only by PD may still age out on E. This
+        #     is the pluggable victim-selection point for a value-density
+        #     (p*c/m) policy later; today it is LRU.
+        self._cap_bytes: int = int(
+            transfer_config.get_from_extra_config(
+                "ec_cache_max_bytes", os.environ.get("EC_STORE_MAX_BYTES", "0")
+            )
+        )
+        # mm_hash -> payload bytes; front = least-recently-written (LRU victim).
+        self._lru: OrderedDict[str, int] = OrderedDict()
+        self._used_bytes: int = 0
 
     def start_load_caches(self, encoder_cache, **kwargs) -> None:
         """
@@ -190,6 +214,9 @@ class ECExampleConnector(ECConnectorBase):
         self._pending_deletes.pop(mm_hash, None)
         ec_cache = encoder_cache[mm_hash]
         tensors = {"ec_cache": ec_cache.detach().cpu()}
+        # Bounded-L3: make room before writing (skips entirely when cap == 0).
+        size_bytes = tensors["ec_cache"].numel() * tensors["ec_cache"].element_size()
+        self._evict_to_fit(size_bytes, keep=mm_hash)
         # A consumer doing consume-on-load can unlink this entry concurrently,
         # racing our directory (re)creation. Retry once after re-ensuring the
         # dir, and NEVER let a transient store I/O error propagate — it would
@@ -200,6 +227,12 @@ class ECExampleConnector(ECConnectorBase):
                 filename = self._generate_filename_debug(mm_hash)  # re-makedirs
                 safetensors.torch.save_file(tensors, filename)
                 logger.debug("Save cache successful for mm_hash %s", mm_hash)
+                # Record/refresh LRU accounting only after the write succeeds.
+                prev = self._lru.pop(mm_hash, None)
+                if prev is not None:
+                    self._used_bytes -= prev
+                self._lru[mm_hash] = size_bytes  # most-recent at the back
+                self._used_bytes += size_bytes
                 break
             except Exception as e:  # noqa: BLE001 - save is best-effort
                 if _attempt == 1:
@@ -243,6 +276,33 @@ class ECExampleConnector(ECConnectorBase):
         now = time.monotonic()
         for mm_hash in mm_hashes:
             self._pending_deletes.setdefault(mm_hash, now)
+            # Keep the byte-cap accounting consistent if the L2->L3 cascade
+            # removes an entry the bounded store was also tracking.
+            prev = self._lru.pop(mm_hash, None)
+            if prev is not None:
+                self._used_bytes -= prev
+        self._flush_pending_deletes()
+
+    def _evict_to_fit(self, incoming_bytes: int, keep: str) -> None:
+        """Evict LRU entries until `incoming_bytes` fits under the byte cap.
+
+        Producer-only, single-evictor. Victims are queued into _pending_deletes
+        (the same grace-window machinery delete_caches uses): they become
+        logically absent to has_cache_item() immediately, so the scheduler will
+        re-encode them, while the physical file lingers for the grace window so
+        an in-flight consumer read completes. If nothing but `keep` is left we
+        allow a transient over-fill rather than block the encoder.
+        """
+        if self._cap_bytes <= 0:
+            return
+        now = time.monotonic()
+        while self._used_bytes + incoming_bytes > self._cap_bytes and self._lru:
+            victim, victim_bytes = next(iter(self._lru.items()))  # LRU front
+            if victim == keep:
+                break  # don't evict the entry we are about to (re)write
+            self._lru.pop(victim, None)
+            self._used_bytes -= victim_bytes
+            self._pending_deletes.setdefault(victim, now)
         self._flush_pending_deletes()
 
     def _flush_pending_deletes(self) -> None:

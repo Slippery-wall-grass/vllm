@@ -3129,6 +3129,47 @@ class GPUModelRunner(
 
         return encoder_outputs
 
+    def _fallback_encode_missing(
+        self, mm_hash: str, mm_feature: "MultiModalFeatureSpec"
+    ) -> torch.Tensor:
+        """Re-encode one multimodal item whose L3 load missed (eviction race).
+
+        Recovers from a bounded-L3 eviction that removed an embedding between
+        the scheduler's has_cache_item() check and this step's load, which would
+        otherwise trip the ``Encoder cache miss`` assert and kill the engine.
+
+        The item's pixel data is available in ``mm_feature.data`` (shipped in
+        NewRequestData.mm_features regardless of the load-vs-encode decision),
+        so we run the vision encoder on just this item and repopulate both the
+        in-GPU cache and the store. This is a minimal single-item encode: it
+        does NOT apply tower/connector LoRA adapters or the cudagraph/video
+        batching paths that ``_execute_mm_encoder`` uses — acceptable because
+        this is a rare recovery path and the encoder-cache experiments run
+        without LoRA. It also bypasses the encoder compute budget by design
+        (correctness over strict budget for a miss).
+        """
+        assert mm_feature.data is not None, (
+            f"Encoder cache miss for {mm_hash} and no pixel data to re-encode "
+            f"(mm_feature.data is None)"
+        )
+        model = cast(SupportsMultiModal, self.model)
+        outputs: list[torch.Tensor] = []
+        for _modality, _num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
+            [(mm_feature.modality, mm_feature.data)],
+            device=self.device,
+            pin_memory=self.pin_memory,
+        ):
+            outputs.extend(model.embed_multimodal(**mm_kwargs_batch))
+        encoder_output = outputs[0]
+        self.encoder_cache[mm_hash] = encoder_output
+        # Repopulate the store so subsequent requests hit again.
+        self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
+        logger.warning(
+            "Encoder cache miss for %s; re-encoded inline (L3 eviction race)",
+            mm_hash,
+        )
+        return encoder_output
+
     def _gather_mm_embeddings(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3185,7 +3226,18 @@ class GPUModelRunner(
 
                 mm_hash = mm_feature.identifier
                 encoder_output = self.encoder_cache.get(mm_hash, None)
-                assert encoder_output is not None, f"Encoder cache miss for {mm_hash}."
+                if encoder_output is None:
+                    # L3 eviction race: has_cache_item() was True at schedule
+                    # time (external_load), but the entry is now in neither L2
+                    # nor L3 (the bounded store evicted it, or its grace-window
+                    # unlink fired, between the scheduler check and this load).
+                    # Upstream asserts here and crashes the engine; instead we
+                    # recover by re-encoding this single item inline from its
+                    # pixel data (carried in mm_feature.data). Correctness over
+                    # the encoder compute budget: this is a rare recovery path.
+                    encoder_output = self._fallback_encode_missing(
+                        mm_hash, mm_feature
+                    )
 
                 if (is_embed := pos_info.is_embed) is not None:
                     is_embed = is_embed[start_idx:end_idx]
